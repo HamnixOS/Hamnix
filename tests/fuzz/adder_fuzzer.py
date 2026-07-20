@@ -670,6 +670,18 @@ class Program:
         self._gen_region_callsplit_traffic(env)  # per-region caller-saved regalloc (--opt)
         self._gen_dce_keep_bait(env)      # DCE in main(): fire + must-KEEP probes
 
+        # ---- KERNEL-SHAPE features (FUZZ_FEATURES) --------------------------
+        # Appended AFTER all base generation so a given seed's existing draw
+        # stream is unchanged; each is gated so a disabled feature draws no rng.
+        if "callgraph" in FUZZ_FEATURES:
+            self._gen_callgraph_traffic(env)
+        if "fnptr" in FUZZ_FEATURES:
+            self._gen_fnptr_traffic(env)
+        if "loopcond" in FUZZ_FEATURES:
+            self._gen_loopcond_traffic(env)
+        if "manyglobals" in FUZZ_FEATURES:
+            self._gen_manyglobals_traffic(env)
+
         # Fold the must-KEEP global LAST so its accumulated side effect is part of
         # the checksum: any wrongly-deleted side-effecting / address-taken store
         # makes this value (and thus g_accum) diverge from the oracle.
@@ -2715,6 +2727,278 @@ class Program:
         self._acc_add(py_u64)
 
     # ======================================================================
+    # KERNEL-SHAPE generators (FUZZ_FEATURES). Each emits its top-level decls
+    # via emit_top (so a helper's global is declared before the helper that
+    # uses it, matching the existing ss_fib/g_ssacc pattern) and its call/fold
+    # traffic into main() via emit + _fold_value. Every result is modelled
+    # EXACTLY in Python and folded into g_accum, so a miscompile DIVERGES.
+    # ======================================================================
+
+    # ---- (1) global function pointers + indirect calls -----------------------
+    #
+    # Mirrors drivers/block/loop.ad's loop_set_live_root_hook: a module-global
+    # Fn[...] set by a SETTER function, NULL-checked, then called INDIRECTLY with
+    # the result feeding the oracle. This is the exact shape of the blank-desktop
+    # class (a dropped/stale function-pointer store or a mis-lowered indirect
+    # call). Variations: assigned in a DIFFERENT function, copied to a LOCAL
+    # first, called in a LOOP, and a genuinely-NULL hook whose call is skipped.
+    def _gen_fnptr_traffic(self, env):
+        rng = self.rng
+        M = (1 << 64) - 1
+
+        def w64(v):
+            v &= M
+            return v - (1 << 64) if (v >> 63) else v
+
+        # Three pure int64->int64 targets with known Python equivalents.
+        k_add = rng.randint(1, 500)
+        k_mul = rng.randint(2, 9)
+        k_sub = rng.randint(1, 500)
+        targets = [
+            ("fp_add", lambda x: w64(x + k_add)),
+            ("fp_mul", lambda x: w64(x * k_mul)),
+            ("fp_sub", lambda x: w64(x - k_sub)),
+        ]
+        self.emit_top("g_fp_hook: Fn[int64, int64]")
+        self.emit_top("g_fp_null: Fn[int64, int64]")   # never assigned -> stays 0
+        self.emit_top("")
+        self.emit_top(f"def fp_add(x: int64) -> int64:")
+        self.emit_top(f"    return x + cast[int64]({k_add})")
+        self.emit_top(f"def fp_mul(x: int64) -> int64:")
+        self.emit_top(f"    return x * cast[int64]({k_mul})")
+        self.emit_top(f"def fp_sub(x: int64) -> int64:")
+        self.emit_top(f"    return x - cast[int64]({k_sub})")
+        # Setter in a DIFFERENT function (the store must survive DSE + reach main).
+        self.emit_top("def fp_set(f: Fn[int64, int64]):")
+        self.emit_top("    g_fp_hook = f")
+        self.emit_top("")
+
+        # (a) set-in-other-function + null-checked indirect call.
+        name, pyfn = rng.choice(targets)
+        arg = rng.randint(-1000, 1000)
+        self.emit(f"    fp_set({name})")
+        self.emit("    fph: Fn[int64, int64] = g_fp_hook")
+        self.emit("    fpr: int64 = 0")
+        self.emit("    if fph != cast[Fn[int64, int64]](0):")
+        self.emit(f"        fpr = fph(cast[int64]({self._i64_lit(arg)}))")
+        self._fold_value("cast[uint64](fpr)", U64.wrap(pyfn(arg)))
+
+        # (b) copied-to-a-local hook, called directly through the local.
+        name2, pyfn2 = rng.choice(targets)
+        arg2 = rng.randint(-1000, 1000)
+        self.emit(f"    fp_set({name2})")
+        self.emit("    fpl: Fn[int64, int64] = g_fp_hook")
+        self.emit("    fpr2: int64 = 0")
+        self.emit("    if fpl != cast[Fn[int64, int64]](0):")
+        self.emit(f"        fpr2 = fpl(cast[int64]({self._i64_lit(arg2)}))")
+        self._fold_value("cast[uint64](fpr2)", U64.wrap(pyfn2(arg2)))
+
+        # (c) indirect call in a LOOP: sum hook(i) for i in [0, n).
+        name3, pyfn3 = rng.choice(targets)
+        n = rng.randint(3, 8)
+        self.emit(f"    fp_set({name3})")
+        self.emit("    fpi: int64 = 0")
+        self.emit("    fpsum: int64 = 0")
+        self.emit(f"    while fpi < cast[int64]({n}):")
+        self.emit("        fpsum = fpsum + g_fp_hook(fpi)")
+        self.emit("        fpi = fpi + 1")
+        loop_sum = 0
+        for i in range(n):
+            loop_sum = w64(loop_sum + pyfn3(i))
+        self._fold_value("cast[uint64](fpsum)", U64.wrap(loop_sum))
+
+        # (d) genuinely-NULL hook: the null-check must skip the call (result 0).
+        self.emit("    fpn: Fn[int64, int64] = g_fp_null")
+        self.emit("    fprn: int64 = 7")
+        self.emit("    if fpn != cast[Fn[int64, int64]](0):")
+        self.emit("        fprn = fpn(cast[int64](1))")
+        self._fold_value("cast[uint64](fprn)", U64.wrap(7))
+
+    # ---- (2) many top-level globals + observable store/read ------------------
+    #
+    # Scales top-level globals HIGH (FUZZ_MANYGLOBALS_N). One TARGET global is
+    # declared LAST (so at count>8192 it lands past opt.ad's OPT_GNAME_MAX=8192
+    # cap); a setter STORES a known value into it and RETURNS with no local read,
+    # so a DSE that fails to recognise the target as a global drops the store.
+    # main() reads the target back and folds it: a dropped store makes g_accum
+    # diverge. A handful of the pad globals are also written+read so the DSE
+    # global-protection path is exercised across the whole set.
+    def _gen_manyglobals_traffic(self, env):
+        rng = self.rng
+        n = FUZZ_MANYGLOBALS_N
+        if n < 1:
+            return
+        # Pad globals (int64, BSS). Declared BEFORE the setter/target so the
+        # target is the LAST-declared global in the whole program.
+        for i in range(n):
+            self.emit_top(f"g_mgpad_{i}: int64")
+        self.emit_top("g_mgtgt: int64")            # last -> past-cap at n>8192
+        self.emit_top("")
+        # Setter with a store-then-return (no subsequent read in-function): the
+        # store is the DSE bait. It MUST survive because g_mgtgt is a global.
+        self.emit_top("def mg_set_target(v: int64):")
+        self.emit_top("    g_mgtgt = v")
+        self.emit_top("")
+        # A second setter that writes a couple of low-index pads (well within any
+        # cap) so the DSE global-protection path fires on the ordinary set too.
+        self.emit_top("def mg_set_pads(a: int64, b: int64):")
+        self.emit_top("    g_mgpad_0 = a")
+        self.emit_top("    g_mgpad_1 = b")
+        self.emit_top("")
+
+        tv = rng.randint(1, 1_000_000)
+        self.emit(f"    mg_set_target(cast[int64]({tv}))")
+        self.emit("    mgr: int64 = g_mgtgt")
+        self._fold_value("cast[uint64](mgr)", U64.wrap(tv))
+
+        pa = rng.randint(1, 1_000_000)
+        pb = rng.randint(1, 1_000_000)
+        self.emit(f"    mg_set_pads(cast[int64]({pa}), cast[int64]({pb}))")
+        self.emit("    mgpa: int64 = g_mgpad_0")
+        self.emit("    mgpb: int64 = g_mgpad_1")
+        self._fold_value("cast[uint64](mgpa)", U64.wrap(pa))
+        self._fold_value("cast[uint64](mgpb)", U64.wrap(pb))
+
+    # ---- (3) body-mutated loop conditions ------------------------------------
+    #
+    # The shape that broke loop-condition CSE (fa494cdf): a while whose CONDITION
+    # references a subexpression `start + blen` TWICE while the body increments
+    # `blen`. A local-CSE that hoists `start + blen` into the preheader freezes it
+    # -> the condition never changes -> INFINITE LOOP. The oracle models the exact
+    # iteration count; a re-introduced bug makes the --opt build spin (surfaced by
+    # the ADDER_OPT lane as a run TIMEOUT, escalated to a differential miscompile
+    # because the oracle always terminates). Two variants: a NUL/`/`-terminated
+    # scan and a compound bound+content condition (both re-read `start + blen`).
+    def _gen_loopcond_traffic(self, env):
+        rng = self.rng
+        DIM = 64
+        self.emit_top(f"g_lc_arr: Array[{DIM}, int64]")
+        self.emit_top("")
+        # Variant A: scan to the next 0-or-47 terminator (the basename-scan shape).
+        self.emit_top("def lc_scan(start: int64) -> int64:")
+        self.emit_top("    blen: int64 = 0")
+        self.emit_top("    while g_lc_arr[start + blen] != cast[int64](0) and "
+                      "g_lc_arr[start + blen] != cast[int64](47):")
+        self.emit_top("        blen = blen + 1")
+        self.emit_top("    return blen")
+        self.emit_top("")
+        # Variant B: compound BOUND + content, both re-reading `start + blen`.
+        self.emit_top("def lc_scan2(start: int64, hi: int64) -> int64:")
+        self.emit_top("    blen: int64 = 0")
+        self.emit_top("    while (start + blen) < hi and "
+                      "g_lc_arr[start + blen] != cast[int64](0):")
+        self.emit_top("        blen = blen + 1")
+        self.emit_top("    return blen")
+        self.emit_top("")
+
+        # --- variant A traffic: fill 1s, drop a terminator, scan from `start`. ---
+        start = rng.randint(0, 4)
+        stop = rng.randint(start + 1, DIM - 2)     # in-range terminator index
+        term = rng.choice([0, 47])
+        self.emit("    lci: int64 = 0")
+        self.emit(f"    while lci < cast[int64]({DIM}):")
+        self.emit("        g_lc_arr[lci] = cast[int64](1)")
+        self.emit("        lci = lci + 1")
+        self.emit(f"    g_lc_arr[cast[int64]({stop})] = cast[int64]({term})")
+        self.emit(f"    lcr: int64 = lc_scan(cast[int64]({start}))")
+        self._fold_value("cast[uint64](lcr)", U64.wrap(stop - start))
+
+        # --- variant B traffic: bound `hi`, terminator at `zpos`, stop = min. ---
+        start2 = rng.randint(0, 4)
+        hi = rng.randint(start2 + 2, DIM)          # loop upper bound
+        zpos = rng.randint(start2 + 1, DIM - 1)    # 0-terminator index
+        self.emit("    lcj: int64 = 0")
+        self.emit(f"    while lcj < cast[int64]({DIM}):")
+        self.emit("        g_lc_arr[lcj] = cast[int64](1)")
+        self.emit("        lcj = lcj + 1")
+        self.emit(f"    g_lc_arr[cast[int64]({zpos})] = cast[int64](0)")
+        self.emit(f"    lcr2: int64 = lc_scan2(cast[int64]({start2}), "
+                  f"cast[int64]({hi}))")
+        self._fold_value("cast[uint64](lcr2)", U64.wrap(min(hi, zpos) - start2))
+
+    # ---- (4) multi-function call graph ---------------------------------------
+    #
+    # Several functions calling each other with params/returns/recursion (not a
+    # single main), so inter-procedural + per-function optimizer passes run at
+    # scale. cg_fact is self-recursive; cg_is_even/cg_is_odd are MUTUALLY
+    # recursive (forward reference); cg_leaf<-cg_mid<-cg_top form a call chain.
+    def _gen_callgraph_traffic(self, env):
+        rng = self.rng
+        M = (1 << 64) - 1
+
+        def w64(v):
+            v &= M
+            return v - (1 << 64) if (v >> 63) else v
+
+        c_leaf = rng.randint(1, 100)
+        self.emit_top("def cg_fact(n: int64) -> int64:")
+        self.emit_top("    if n <= cast[int64](1):")
+        self.emit_top("        return cast[int64](1)")
+        self.emit_top("    return n * cg_fact(n - cast[int64](1))")
+        self.emit_top("")
+        self.emit_top("def cg_is_even(n: int64) -> int64:")
+        self.emit_top("    if n == cast[int64](0):")
+        self.emit_top("        return cast[int64](1)")
+        self.emit_top("    return cg_is_odd(n - cast[int64](1))")
+        self.emit_top("")
+        self.emit_top("def cg_is_odd(n: int64) -> int64:")
+        self.emit_top("    if n == cast[int64](0):")
+        self.emit_top("        return cast[int64](0)")
+        self.emit_top("    return cg_is_even(n - cast[int64](1))")
+        self.emit_top("")
+        self.emit_top("def cg_leaf(a: int64, b: int64) -> int64:")
+        self.emit_top(f"    return a * b + cast[int64]({c_leaf})")
+        self.emit_top("")
+        self.emit_top("def cg_mid(a: int64, b: int64) -> int64:")
+        self.emit_top("    return cg_leaf(a + cast[int64](1), b) - "
+                      "cg_leaf(a, b + cast[int64](1))")
+        self.emit_top("")
+        self.emit_top("def cg_top(a: int64, b: int64, c: int64) -> int64:")
+        self.emit_top("    return cg_mid(a, b) + cg_mid(b, c) + cg_leaf(a, c)")
+        self.emit_top("")
+
+        def py_leaf(a, b):
+            return w64(w64(a * b) + c_leaf)
+
+        def py_mid(a, b):
+            return w64(py_leaf(w64(a + 1), b) - py_leaf(a, w64(b + 1)))
+
+        def py_top(a, b, c):
+            return w64(w64(py_mid(a, b) + py_mid(b, c)) + py_leaf(a, c))
+
+        def py_fact(n):
+            r = 1
+            for i in range(2, n + 1):
+                r = w64(r * i)
+            return r
+
+        # cg_top over a random triple.
+        a = rng.randint(-50, 50)
+        b = rng.randint(-50, 50)
+        c = rng.randint(-50, 50)
+        self.emit(f"    cgt: int64 = cg_top(cast[int64]({self._i64_lit(a)}), "
+                  f"cast[int64]({self._i64_lit(b)}), "
+                  f"cast[int64]({self._i64_lit(c)}))")
+        self._fold_value("cast[uint64](cgt)", U64.wrap(py_top(a, b, c)))
+
+        # cg_fact of a small n.
+        fn = rng.randint(1, 18)
+        self.emit(f"    cgf: int64 = cg_fact(cast[int64]({fn}))")
+        self._fold_value("cast[uint64](cgf)", U64.wrap(py_fact(fn)))
+
+        # mutual recursion parity of even/odd.
+        m = rng.randint(0, 30)
+        self.emit(f"    cge: int64 = cg_is_even(cast[int64]({m}))")
+        self.emit(f"    cgo: int64 = cg_is_odd(cast[int64]({m}))")
+        self._fold_value("cast[uint64](cge)", U64.wrap(1 if m % 2 == 0 else 0))
+        self._fold_value("cast[uint64](cgo)", U64.wrap(1 if m % 2 == 1 else 0))
+
+    @staticmethod
+    def _i64_lit(v):
+        """Source text for a possibly-negative int64 literal (UNOP_NEG form)."""
+        return f"0 - {(-v)}" if v < 0 else f"{v}"
+
+    # ======================================================================
     # Track-3 self-hosting parity constructs: structs, classes/methods,
     # for-loops (range + array), do-while. Each is generated in BOTH subset
     # and default mode (byte-identical rng stream) and folded into g_accum so
@@ -3422,6 +3706,56 @@ ADDER_OPT = os.environ.get("ADDER_OPT", "0") not in ("", "0", "off", "false")
 # exercise the isel-path checks the seed's opt-0 gate cannot reach.
 ADDER_CHECK_BOUNDS = os.environ.get("ADDER_CHECK_BOUNDS", "0") \
     not in ("", "0", "off", "false")
+
+# --------------------------------------------------------------------------
+# KERNEL-SHAPE FEATURE GATES (FUZZ_FEATURES). The base generator is strong on
+# single-function arithmetic/pointer/array correctness but never emitted the
+# kernel-like shapes that produced three real --opt miscompiles this cycle:
+#   * fnptr      — a module-global Fn[...] set by a setter + a NULL-checked
+#                  INDIRECT CALL whose result feeds the oracle (the exact shape
+#                  of loop.ad's loop_set_live_root_hook / the blank-desktop bug).
+#   * manyglobals— MANY top-level globals with a store-then-read observable, so a
+#                  dropped store is caught. FUZZ_MANYGLOBALS_N scales the count;
+#                  a value >8192 reproduces the DSE global-name-cap class (opt.ad
+#                  OPT_GNAME_MAX=8192) where a global declared past the cap had
+#                  its externally-visible store dead-store-eliminated under --opt.
+#                  NOTE: the self-hosted codegen.ad HOST backend caps globals at
+#                  MAX_GLOBALS (1024), so a >8192 program is reported "unsupported"
+#                  by the codegen.ad lane on the stock host — the generator+oracle
+#                  are nonetheless ready for a raised-cap / on-device run (they DO
+#                  reproduce the real bug when codegen.ad's cap is lifted).
+#   * loopcond   — a while whose CONDITION reads a body-mutated subexpression
+#                  twice (`arr[start+blen] != 0 and arr[start+blen] != 47`), the
+#                  shape that broke loop-condition CSE (fa494cdf). The oracle
+#                  models the exact iteration count; under a re-introduced bug the
+#                  --opt build spins (caught as a lane timeout -> differential).
+#   * callgraph  — several mutually-/chain-calling functions with params, returns
+#                  and recursion, so inter-procedural + per-function passes run.
+# Each is deterministic per seed. Gate: FUZZ_FEATURES=fnptr,loopcond,... (a
+# comma list); "all"/unset = every feature; "none"/"" = base generator only
+# (byte-identical to the pre-hardening stream — no new rng is drawn when a
+# feature is off). Weights are per-feature counts drawn INSIDE the feature block
+# so a disabled feature perturbs nothing downstream.
+_ALL_FUZZ_FEATURES = ("fnptr", "manyglobals", "loopcond", "callgraph")
+
+
+def _parse_fuzz_features():
+    raw = os.environ.get("FUZZ_FEATURES")
+    if raw is None:
+        return set(_ALL_FUZZ_FEATURES)
+    r = raw.strip().lower()
+    if r in ("all", "*"):
+        return set(_ALL_FUZZ_FEATURES)
+    if r in ("", "none", "off", "0"):
+        return set()
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
+FUZZ_FEATURES = _parse_fuzz_features()
+# Per-program top-level global count injected by the `manyglobals` feature.
+# Default 64 stays well under codegen.ad's MAX_GLOBALS (1024) so the standard
+# host lane accepts it. Set >8192 to soak the DSE global-name-cap class.
+FUZZ_MANYGLOBALS_N = int(os.environ.get("FUZZ_MANYGLOBALS_N", "64"))
 _AD_OPT_FOLDS_TOTAL = 0   # running fold count across the ADDER_OPT=1 lane
 _AD_OPT_PROGS_FOLDED = 0  # programs in which >=1 fold fired
 _AD_OPT_CSE_TOTAL = 0     # running CSE-elimination count across the lane
@@ -3608,6 +3942,18 @@ def check_one_ad_codegen(seed):
     if ad[0] == "unsupported":
         return ("unsupported", seed, ad[1], body)
     if ad[0] == "__ad_error__":
+        # NON-TERMINATION under --opt is a MISCOMPILE. Every fuzzer program
+        # terminates by construction (the oracle has a finite expected value),
+        # so a codegen.ad RUN TIMEOUT in the ADDER_OPT lane means the optimizer
+        # introduced an infinite loop — exactly the loop-condition-CSE class
+        # (fa494cdf): a body-mutated loop-condition subexpression hoisted into
+        # the preheader goes stale and the loop never terminates. Escalate it to
+        # a differential miscompile (the un-optimized/oracle path terminates).
+        if ADDER_OPT and ad[1] == "runfail" and "timeout" in (ad[2] or ""):
+            return ("differential", seed,
+                    f"codegen.ad --opt RUN TIMEOUT (non-termination) "
+                    f"oracle=({p.expected_stdout},{p.expected_exit}) -- "
+                    f"optimizer introduced an infinite loop", body)
         return ("ad-error", seed, f"{ad[1]}: {ad[2]}", body)
     ad_stdout, ad_exit = ad[1], ad[2]
     if (ad_stdout, ad_exit) != (p.expected_stdout, p.expected_exit):
