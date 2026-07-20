@@ -508,15 +508,27 @@ round-12 agent, roughly by real-world value — the browser is now broad but NOT
    `<meter>`, applying the author BACKGROUND to an appearance:none void `<input>` (the transient `_img_cascade` m_bg/d_bg
    winners are unreliable across void controls — chrome is suppressed but the author bg is not yet re-painted),
    focus-ring / `:checked` pseudo-styling, and interactive click-to-toggle (a DOM/event-layer concern).
-5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction — box tree ALREADY spec-correct (LOCKED
-   round-10, gate `adoption`).** Verified: the engine models inline emphasis as INDEPENDENT ORTHOGONAL style counters
-   (`g_bold_n`/`g_italic_n`) and does NOT reset a formatting counter on a block boundary — which reproduces the WHATWG
-   adoption-agency + reconstruct-the-active-formatting-elements VISUAL result exactly. `<b>A<i>B</b>C</i>` paints A=bold,
-   B=bold+italic, C=italic (the reconstructed `<i>` keeps C italic, NOT bold); a `<b>` left open across `</p><p>` is
-   reconstructed so the next block stays bold. The new `adoption` gate asserts the per-run `SEGFLAGS` as a regression
-   guard. The only NON-spec residue is DOM STRUCTURE: the span-overlay tree in `lib/web/dom/domtree.ad` uses
-   span-containment (not adoption reparenting), observable only via `querySelector`/`getComputedStyle` traversal — a
-   separate, large concern with no rendering effect in the flag-based box model.
+5. **[html5-parsing] adoption-agency / active-formatting-list reconstruction — box tree AND DOM tree spec-correct
+   (VISUAL locked round-10 gate `adoption`; DOM tree locked gate `adoptdom`). DONE.** Two layers:
+   (a) VISUAL: the engine models inline emphasis as INDEPENDENT ORTHOGONAL style counters (`g_bold_n`/`g_italic_n`) and
+   does NOT reset a formatting counter on a block boundary — reproducing the WHATWG adoption-agency +
+   reconstruct-the-active-formatting-elements VISUAL result exactly. `<b>A<i>B</b>C</i>` paints A=bold, B=bold+italic,
+   C=italic (the reconstructed `<i>` keeps C italic, NOT bold); a `<b>` left open across `</p><p>` is reconstructed so
+   the next block stays bold. Gate `adoption` asserts the per-run `SEGFLAGS`.
+   (b) DOM TREE: `lib/web/dom/domtree.ad` `_adoption_fixup()` (run at the end of `_dom_build_tree_index`) now makes the
+   span-overlay tree match the spec node tree. It detects the adoption signature — a FORMATTING element
+   (`_tx_is_formatting`: a/b/big/code/em/font/i/nobr/s/small/strike/strong/tt/u + mark/sub/sup) whose content span
+   extends PAST its recorded parent's close (`tx_ce[child] > tx_ce[parent]`) — CLAMPS the inner element to the parent's
+   close and SPLICES a RECONSTRUCTED same-tag element (holding the stuck-out remainder) in as a SIBLING of the parent,
+   in document order (`_tx_insert`). So `<b>A<i>B</b>C</i>` yields the spec DOM `<b>A<i>B</i></b><i>C</i>`: DOM
+   traversal sees "C" in a reconstructed `<i>` that is `<b>`.nextElementSibling (same `parentNode`), NOT a child. The
+   rescan lifts multi-level nests one ancestor per pass and terminates (each fix clamps the child's ce). Gate
+   `adoptdom` asserts the node tree (childNodes/nextElementSibling/parentNode) for the b/i and em/strong overlaps plus
+   a well-nested regression. Behavior-preserving: well-nested pages never trigger the fixup, so the tree is byte-
+   identical for them. DEFERRED (first-cut, low value): full Noah's-Ark dedupe of the active-formatting list;
+   reparenting NON-formatting content nested inside the stuck-out region; unterminated-formatting reconstruction
+   (`<p><b>x</p>` with no `</b>`); and `querySelectorAll` matching the synthetic node (it re-scans source text, so
+   reconstructed nodes are reachable via traversal/combinators but not by a source-text tag scan).
 6. **[dom] live `MediaQueryList` change events + `window.dispatchEvent` of a synthetic event + `scroll`/`resize`
    sourcing** — all no-ops in the headless single-layout model. Low value without a live event loop.
 7. **[css-backgrounds-borders] rounded per-side borders** — a per-side-bordered box paints SQUARE corners (arc-segment
@@ -900,7 +912,7 @@ Disjoint dispatch clusters (no write-collision): **JS** (`js/*` only: #13,#14) �
 
 - **[html5-parsing] Quote-aware tag tokenization ('>' inside an attribute value)** (buggy) — `lib/htmlengine.ad: _layout tag scan (7391-7394), _scan_start_tag (7913), _find_close (7860), _parse_fragment (10462)` — Every tag-boundary scan naively advances to the first '>' byte with no awareness of quoted attribute values. Markup like <a title="a>b">, <div data-x="if(x>1)">, onclick="if(a>b)...", or inline SVG pa
 - **[html5-parsing] Optional / implied end tags (general)** (partial) — `lib/htmlengine.ad: _handle_tag block branches (~6700-7050); only <li> (4945/6779) and table cell (6984) auto-close exist` — There is no general implied-end-tag algorithm. <p> is never auto-closed by a following block (<p>a<div>...), and <dt>/<dd>, <option>/<optgroup>, <thead>/<tbody>/<tfoot>/<tr>/<td>/<th>, <colgroup>, <rp
-- **[html5-parsing] Adoption agency / misnested formatting recovery** (missing) — `lib/htmlengine.ad: _find_close (7850) + scope stacks; no active-formatting list anywhere` — No list of active formatting elements, no reconstruction, no adoption agency algorithm. Overlapping inline formatting such as <b><i>x</b>y</i> or <a>..<p>..</a> is matched by same-name depth counting 
+- **[html5-parsing] Adoption agency / misnested formatting recovery** (DONE — see item 5 above; gates `adoption` VISUAL + `adoptdom` DOM tree) — VISUAL result via orthogonal `g_bold_n`/`g_italic_n` counters (`lib/web/dom/forms.ad`); DOM node tree via `lib/web/dom/domtree.ad` `_adoption_fixup()`/`_tx_insert`/`_tx_is_formatting` (list of active-formatting elements + reconstruct + reparent). `<b><i>x</b>y</i>` now yields the spec DOM `<b><i>x</i></b><i>y</i>` — the reconstructed `<i>` is a SIBLING of `<b>` in `childNodes`/`nextElementSibling`, not a child. Deferred first-cut edges documented in item 5. (The doc citation `lib/htmlengine.ad _find_close (7850)` was STALE: the live engine is the modular `lib/web/` tree; the real `_find_close` is `lib/web/dom/bindings.ad:571`.)
 - **[css-selectors] Attribute selectors in the CSS cascade** (missing) — `lib/htmlengine.ad _parse_compound` — cascade skips brackets
 - **[css-box-model] overflow / overflow-x / overflow-y** (DONE 2026-07-17, gate `overflow`) — `lib/web/css/cascade.ad _box_decl + _overflow_value + m_ovfx/m_ovfy + r_ovfx/r_ovfy cascade; lib/web/layout/box.ad _apply_overflow_clip at _block_box_close (captures seg/bfill/bbox high-water at _block_box_open)`. `overflow`/`overflow-x`/`overflow-y: hidden|scroll|auto|clip` are parsed and cascade per axis. A non-visible overflow box establishes a clip rect at its padding edge; descendant segments (text/images/marker/field), background fills, and border rectangles that fall outside are removed — a child taller than the box is clamped to the box bottom, a nowrap line wider than the box is truncated at its right edge, and an overflow:visible control keeps its full-height child. REMAINING (deferred + documented): interactive scroll OFFSET and scrollbars for auto|scroll (this is the static first paint — the clip, which is the high-value part), and clip on non-block (inline/table) containers.
 - **[css-overflow] text-overflow (clip | ellipsis)** (DONE 2026-07-17, gate `ellipsis`) — `lib/web/css/cascade.ad text-overflow decl (_box_decl) + m_txtovf/d_txtovf/r_txtovf cascade; lib/web/layout/box.ad box_txtovf_stack (captured at _block_box_open), ellipsis branch in _apply_overflow_clip`. For the canonical single-line `overflow:hidden;white-space:nowrap;text-overflow:ellipsis` idiom whose inline content is wider than the content box, the overflow-x clip's right-edge truncation overwrites the last (up to 3) visible cells of the straddling text run with "..." (a `…` fallback — the bundled monospace/BDF+TTF glyph set is one byte per cell with no U+2026), so the visible text is pulled back to leave room and text+ellipsis fits the box. `clip` (the default, and unspecified) hard-cuts with no ellipsis; content that does not overflow is untouched. Only plain text runs are ellipsized (image/field/marker/box-art runs are left as a hard clip). REMAINING (deferred + documented): multi-line `-webkit-line-clamp`, the `<string>`/left/`fade` text-overflow variants (out of scope — the single-line ellipsis is the vast majority of real usage), and the rare case where the truncation boundary falls exactly between two segments rather than through a text run (no run straddles the edge, so no ellipsis is placed).
