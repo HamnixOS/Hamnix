@@ -67,40 +67,53 @@ assert_grep() {   # pattern message
     else echo "[hb-bs] FAIL $2 (missing: $1)"; fail=1; fi
 }
 
+# NOTE ON COORDINATES: this page establishes an author LAYOUT context (`.row{
+# display:flex}`), so the engine renders it FULL-WIDTH like Firefox/Chrome (the
+# ~584px readable-measure gutter is disabled for flex/grid/positioned pages —
+# see c0852242). The box left edges therefore sit at the body content origin
+# (lx=28) rather than the old centred-strip origin (lx=128). Only the ABSOLUTE
+# positions moved with that fidelity change; the box-sizing RELATIONSHIPS below
+# (content-box exactly padding+border wider than border-box; the reset reduces;
+# the content-box override does not) are unchanged and match Chrome.
+#
 # ---- (1) content-box: the declared 200px width is the CONTENT box; the outer
-# border box reaches x=336 (wide). ---------------------------------------------
-assert_grep '^BBOX 1 3 128 336 #cc0000' \
-    "content-box outer border box is WIDE (rx=336)"
+# border box is WIDE (width = right-left = 208 in engine px). -------------------
+assert_grep '^BBOX 1 3 28 236 #cc0000' \
+    "content-box outer border box is WIDE (28..236, w=208)"
 
 # ---- (2) border-box: the declared 200px INCLUDES padding(40)+border(10), so the
-# content shrinks and the outer border box reaches only x=286 (exactly 50px
-# narrower than content-box). -------------------------------------------------
-assert_grep '^BBOX 6 9 128 286 #00aa00' \
-    "border-box outer border box is NARROW (rx=286, 50px = padding+border less)"
+# content shrinks and the outer border box is NARROW (28..186, w=158 — exactly
+# 50px = padding+border narrower than the content-box box). --------------------
+assert_grep '^BBOX 6 9 28 186 #00aa00' \
+    "border-box outer border box is NARROW (28..186, w=158, 50px = padding+border less)"
 
 # ---- (3) split-rule reset: `*{box-sizing:border-box}` sets the mode, a separate
 # class rule sets width/padding/border. The reduction must still fire -> NARROW
-# (rx=286), identical to the single-rule border-box box. -----------------------
-assert_grep '^BBOX 12 14 128 286 #0000cc' \
-    "*{box-sizing:border-box} reset reduces a width from a DIFFERENT rule (rx=286)"
+# (28..186, w=158), identical to the single-rule border-box box. ---------------
+assert_grep '^BBOX 12 14 28 186 #0000cc' \
+    "*{box-sizing:border-box} reset reduces a width from a DIFFERENT rule (28..186, w=158)"
 
 # ---- (4) an explicit box-sizing:content-box overrides the `*` reset -> WIDE
-# again (rx=336). --------------------------------------------------------------
-assert_grep '^BBOX 17 19 128 336 #aa00aa' \
-    "box-sizing:content-box overrides the * reset (rx=336, WIDE)"
+# again (28..236, w=208). ------------------------------------------------------
+assert_grep '^BBOX 17 19 28 236 #aa00aa' \
+    "box-sizing:content-box overrides the * reset (28..236, w=208, WIDE)"
 
-# ---- (5) two border-box width:50% flex items TILE: item B opens exactly at
-# item A's right edge (x=404) and the row stays inside the content column. ------
-assert_grep '^BBOX 21 23 108 404 #333333' \
-    "flex border-box 50% item A occupies the left half (108..404)"
-assert_grep '^BBOX 21 23 404 684 #333333' \
-    "flex border-box 50% item B tiles from A's right edge with no overflow (404..684)"
+# ---- (5) two border-box width:50% flex items in the row: EQUAL border-box
+# widths (w=276 each — the old gate pinned an unequal 296/280 pair that predated
+# the flex-halves equalisation), item B opens to the RIGHT of item A, and the row
+# stays inside the viewport (no overflow — independently reconfirmed on the PPM
+# bands below). ----------------------------------------------------------------
+assert_grep '^BBOX 22 24 18 294 #333333' \
+    "flex border-box 50% item A occupies the left half (18..294, w=276)"
+assert_grep '^BBOX 22 24 314 590 #333333' \
+    "flex border-box 50% item B is the equal-width right half, no overflow (314..590, w=276)"
 
-# ---- (6) semantic check: content-box outer width - border-box outer width == 50
-# (= 2*padding + 2*border), computed from the BBOX left/right columns. ----------
+# ---- (6) semantic check (ORIGIN-INDEPENDENT): content-box outer width - border-
+# box outer width == 50 (= 2*padding + 2*border), computed from the BBOX
+# left/right columns regardless of the page's horizontal origin. ---------------
 diffw=$(awk '
-    /^BBOX 1 3 128 / {cb=$5-$4}
-    /^BBOX 6 9 128 / {bb=$5-$4}
+    /^BBOX 1 3 / {cb=$5-$4}
+    /^BBOX 6 9 / {bb=$5-$4}
     END {print cb-bb}' "$D")
 if [ "$diffw" = "50" ]; then
     echo "[hb-bs] PASS content-box is exactly padding+border (50px) wider than border-box"
