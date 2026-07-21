@@ -74,7 +74,7 @@ assert_seg "active link"     'bg#112233' "[data-active] exists selector fills th
 assert_seg " plain link no bg" 'bg- '     "link without the attribute is NOT matched"
 
 # [attr=v] exact — hero fills #445566; data-role=other gets nothing.
-assert_grep 'FILL 1 2 0 800 #445566'   "[data-role=hero] exact match fills #445566"
+assert_grep 'FILL 1 2 8 800 #445566'   "[data-role=hero] exact match fills #445566"
 assert_seg "other box no bg" 'bg- '       "[data-role=hero] does not match data-role=other"
 
 # [attr~=v] whitespace token — a real token matches, a substring does NOT.
@@ -82,12 +82,12 @@ assert_seg "tagged para red"      '#ff0000' "[data-tags~=news] matches the 'news
 assert_seg "not tokenized para"   '#101010' "[data-tags~=news] does NOT match inside 'sportsnews'"
 
 # [attr^=v] prefix — abcdef matches, xabc does not.
-assert_grep 'FILL 7 8 0 800 #00aa00'   "[data-x^=abc] prefix match fills #00aa00"
+assert_grep 'FILL 7 8 8 800 #00aa00'   "[data-x^=abc] prefix match fills #00aa00"
 assert_seg "no prefix box" 'bg- '          "[data-x^=abc] does not match a non-prefix"
 
 # [attr$=v] suffix / [attr*=v] substring.
-assert_grep 'FILL 9 10 0 800 #0000ff'  "[data-y\$=zzz] suffix match fills #0000ff"
-assert_grep 'FILL 10 11 0 800 #aa00aa'  "[data-z*=mid] substring match fills #aa00aa"
+assert_grep 'FILL 9 10 8 800 #0000ff'  "[data-y\$=zzz] suffix match fills #0000ff"
+assert_grep 'FILL 10 11 8 800 #aa00aa'  "[data-z*=mid] substring match fills #aa00aa"
 
 # [attr|=v] dash-match — en-US matches, fr does not.
 assert_seg "english dashmatch teal" '#008080' "[lang|=en] matches en-US -> teal"
@@ -95,7 +95,7 @@ assert_seg "french no color"        '#101010' "[lang|=en] does NOT match lang=fr
 
 # specificity — div[data-role=card] (0,1,1) beats .card (0,1,0): box is #123456,
 # NOT the plain-class #eeeeee.
-assert_grep 'FILL 15 16 0 800 #123456'  "tag+attr specificity (011) beats bare class (010)"
+assert_grep 'FILL 15 16 8 800 #123456'  "tag+attr specificity (011) beats bare class (010)"
 
 # descendant combinator with an ATTRIBUTE on the ancestor.
 assert_seg "themed span orange" '#ffaa00'  "section[data-theme=dark] span matches ancestor attribute"

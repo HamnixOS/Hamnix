@@ -56,13 +56,13 @@ D0="$OUT/viewport.txt"
 grep -E 'FILL' "$D0" | grep -Ei '#111111|#222222|#333333|#555555|#666666' || true
 
 # vw resolves against viewport WIDTH (800).
-assert_grep 'FILL 0 1 0 416 #111111'  "50vw -> 400px (1% of width 800)"
-assert_grep 'FILL 1 2 0 216 #222222'  "25vw -> 200px"
+assert_grep 'FILL 0 1 8 416 #111111'  "50vw -> 400px (1% of width 800)"
+assert_grep 'FILL 1 2 8 216 #222222'  "25vw -> 200px"
 # vh resolves against viewport HEIGHT (600) -> distinct from 50vw.
-assert_grep 'FILL 2 3 0 316 #333333'  "50vh -> 300px (1% of HEIGHT 600, not width)"
+assert_grep 'FILL 2 3 8 316 #333333'  "50vh -> 300px (1% of HEIGHT 600, not width)"
 # vmin = smaller axis (height 600) ; vmax = larger axis (width 800) -> distinct.
-assert_grep 'FILL 3 4 0 316 #555555'  "50vmin -> 300px (min axis = height)"
-assert_grep 'FILL 4 5 0 416 #666666'  "50vmax -> 400px (max axis = width)"
+assert_grep 'FILL 3 4 8 316 #555555'  "50vmin -> 300px (min axis = height)"
+assert_grep 'FILL 4 5 8 416 #666666'  "50vmax -> 400px (max axis = width)"
 
 if [ "$fail" -ne 0 ]; then
     echo "[hb-viewport] RESULT: FAIL"; exit 1

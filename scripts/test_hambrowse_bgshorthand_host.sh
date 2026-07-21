@@ -58,12 +58,12 @@ assert_seg() {    # text  regex  message
     fi
 }
 
-assert_grep 'FILL 0 1 0 800 #ffcc00'  "colour as the FIRST token still works"
-assert_grep 'FILL 1 2 0 800 #33cc99'  "colour as the LAST token (after no-repeat)"
-assert_grep 'FILL 2 3 0 800 #cc3366'  "colour after a '/' (position/size shorthand)"
-assert_grep 'FILL 3 4 0 800 #ff0000'  "colour first with a url() present"
-assert_grep 'FILL 4 5 0 800 #4682b4'  "NAMED colour after a repeat keyword (steelblue)"
-assert_grep 'FILL 5 6 0 800 #0a78c8' "rgb() colour mid-shorthand (internal spaces)"
+assert_grep 'FILL 0 1 8 800 #ffcc00'  "colour as the FIRST token still works"
+assert_grep 'FILL 1 2 8 800 #33cc99'  "colour as the LAST token (after no-repeat)"
+assert_grep 'FILL 2 3 8 800 #cc3366'  "colour after a '/' (position/size shorthand)"
+assert_grep 'FILL 3 4 8 800 #ff0000'  "colour first with a url() present"
+assert_grep 'FILL 4 5 8 800 #4682b4'  "NAMED colour after a repeat keyword (steelblue)"
+assert_grep 'FILL 5 6 8 800 #0a78c8' "rgb() colour mid-shorthand (internal spaces)"
 # `background: none` must NOT fabricate a fill.
 assert_seg "background none no fill" 'bg- ' "background: none yields no fill"
 if grep -Eq '^FILL 12 ' "$D0"; then
