@@ -97,17 +97,45 @@ def besttime(reps, argv):
     return best, last_out, last_rc
 
 
-def build_adder(name, opt):
-    """Compile <name>.ad (prelude + kernel) through native codegen.ad, opt on/off.
-    Returns (elf_path, checksum_stdout, passes_dict). Raises on unsupported/fail."""
+# The AST-only lane: --opt ON (the 10 high-level AST passes fire) but the six
+# sibling CODEGEN levers are turned OFF via ADDER_OPT_DISABLE. This isolates the
+# speedup the AST passes alone deliver — the config we can SHIP TODAY, because
+# the register-allocator lever (the largest codegen lever) has a kernel-target
+# miscompile that blanks the desktop. Userspace microbenchmarks are unaffected
+# by that kernel-specific regalloc bug, so AST-only is expected to be CORRECT on
+# every kernel here; a miscompile under AST-only would itself be a finding.
+AST_ONLY_DISABLE = "regalloc,iremit,strengthreduce,isel,vec,cmpjcc"
+
+
+def build_adder(name, mode):
+    """Compile <name>.ad (prelude + kernel) through native codegen.ad.
+    mode: "off"     — no --opt (baseline backend),
+          "on"      — full --opt (all 10 AST passes + 6 codegen levers),
+          "astonly" — --opt with ADDER_OPT_DISABLE=<6 codegen levers>, so only
+                      the 10 AST passes run (shippable-today config).
+    ADDER_OPT_DISABLE is read from the ENVIRONMENT by the codegen driver ELF at
+    compile time; run_dump inherits os.environ, so we set/clear it here around
+    the compile. Returns (elf_path, checksum_stdout, passes_dict)."""
     body = PRELUDE + "\n" + (SRC / f"{name}.ad").read_text()
-    tag = f"{name}_{'on' if opt else 'off'}"
-    r = h.run_through_codegen_ad(tag, body, WORK, keep=True, opt=opt)
+    opt = (mode != "off")
+    tag = f"{name}_{mode}"
+    prev = os.environ.get("ADDER_OPT_DISABLE")
+    if mode == "astonly":
+        os.environ["ADDER_OPT_DISABLE"] = AST_ONLY_DISABLE
+    else:
+        os.environ.pop("ADDER_OPT_DISABLE", None)
+    try:
+        r = h.run_through_codegen_ad(tag, body, WORK, keep=True, opt=opt)
+    finally:
+        if prev is None:
+            os.environ.pop("ADDER_OPT_DISABLE", None)
+        else:
+            os.environ["ADDER_OPT_DISABLE"] = prev
     if r.kind != "ok":
-        die(f"adder({'ON' if opt else 'OFF'}) {name}: {r.kind} {r.detail[:300]}")
+        die(f"adder({mode}) {name}: {r.kind} {r.detail[:300]}")
     elf = WORK / f"ad_{tag}.elf"
     if not elf.exists():
-        die(f"adder({'ON' if opt else 'OFF'}) {name}: no ELF produced")
+        die(f"adder({mode}) {name}: no ELF produced")
     passes = {
         "fold": r.folds, "ffold": r.ffold, "cse": r.cse, "licm": r.licm,
         "dce": getattr(r, "dce", 0), "constbranch": getattr(r, "constbranch", 0),
@@ -161,25 +189,28 @@ def main():
     h.build_driver()  # ensure the codegen.ad dump driver is built once
 
     print(f"[bench_opt] suite={kernels} reps(best-of)={reps}")
-    print("[bench_opt] compiling all four configs + cross-config checksum check")
+    print("[bench_opt] compiling all five configs + cross-config checksum check")
 
     built = {}        # name -> dict(...)  (only kernels valid under ALL configs)
-    miscompiled = []  # names whose ADDER_OPT=1 build computes the wrong checksum
+    miscompiled = []      # names whose full ADDER_OPT=1 build is wrong
+    ast_miscompiled = []  # names whose AST-only build is wrong (would be a finding)
     for name in kernels:
-        elf_off, chk_off, _ = build_adder(name, opt=False)
-        elf_on, chk_on, passes = build_adder(name, opt=True)
+        elf_off, chk_off, _ = build_adder(name, "off")
+        elf_ast, chk_ast, _ = build_adder(name, "astonly")
+        elf_on, chk_on, passes = build_adder(name, "on")
         c0, chk_c0 = build_c(name, 0)
         c2, chk_c2 = build_c(name, 2)
-        checks = {
-            "adder-off": chk_off, "adder-on": chk_on,
-            "c-O0": chk_c0, "c-O2": chk_c2,
-        }
         # The baseline (Adder-OFF) and both C builds MUST agree — that pins the
         # reference answer. A disagreement there is a hard error (bad kernel).
         ref = {"adder-off": chk_off, "c-O0": chk_c0, "c-O2": chk_c2}
         if len(set(ref.values())) != 1:
             die(f"{name} BASELINE CHECKSUM MISMATCH (bad kernel): {ref}")
         fired = ",".join(f"{k}={v}" for k, v in passes.items() if v)
+        # AST-only correctness: it is expected to AGREE with the baseline (the
+        # regalloc bug is kernel-target-specific). A disagreement is a finding.
+        ast_ok = (chk_ast == chk_off)
+        if not ast_ok:
+            ast_miscompiled.append((name, chk_off, chk_ast))
         if chk_on != chk_off:
             # ADDER_OPT=1 miscompiled this kernel. Per the task: this is a
             # FINDING, not a license to retune. Report it and exclude the
@@ -188,18 +219,28 @@ def main():
             print(f"  {name:9s} checksum={chk_off:>22s}  *** ADDER_OPT=1 "
                   f"MISCOMPILE: got {chk_on} (excluded from timing) ***")
             continue
-        print(f"  {name:9s} checksum={chk_off:>22s}  AGREE  "
+        ast_tag = "AST-only=AGREE" if ast_ok else f"AST-only=WRONG({chk_ast})"
+        print(f"  {name:9s} checksum={chk_off:>22s}  AGREE  {ast_tag}  "
               f"opt-passes-fired[{fired or 'none'}]")
-        built[name] = dict(elf_off=elf_off, elf_on=elf_on, c0=c0, c2=c2,
-                           checksum=chk_off, passes=passes)
+        if not ast_ok:
+            # AST-only is wrong here: exclude from the AST timing/ratios (its
+            # time is not comparable) but keep the full-opt row intact.
+            built[name] = dict(elf_off=elf_off, elf_ast=None, elf_on=elf_on,
+                               c0=c0, c2=c2, checksum=chk_off, passes=passes)
+            continue
+        built[name] = dict(elf_off=elf_off, elf_ast=elf_ast, elf_on=elf_on,
+                           c0=c0, c2=c2, checksum=chk_off, passes=passes)
     timed = [k for k in kernels if k in built]
     if miscompiled:
         print(f"[bench_opt] WARNING: {len(miscompiled)} kernel(s) MISCOMPILE "
               f"under ADDER_OPT=1: {[m[0] for m in miscompiled]} — see the doc.")
-    print(f"[bench_opt] timing {len(timed)} correct kernel(s) across all four "
+    if ast_miscompiled:
+        print(f"[bench_opt] WARNING: {len(ast_miscompiled)} kernel(s) MISCOMPILE "
+              f"under AST-only: {[m[0] for m in ast_miscompiled]} — see the doc.")
+    print(f"[bench_opt] timing {len(timed)} correct kernel(s) across five "
           f"configs\n")
 
-    # --- timing ---
+    # --- timing (Adder-OFF, AST-only, full-ON, C-O0, C-O2) ---
     rows = []
     for name in timed:
         b = built[name]
@@ -207,53 +248,95 @@ def main():
         t_on, _, _ = besttime(reps, [str(b["elf_on"])])
         t_c0, _, _ = besttime(reps, [str(b["c0"])])
         t_c2, _, _ = besttime(reps, [str(b["c2"])])
-        rows.append((name, t_off, t_on, t_c0, t_c2))
+        # AST-only may be excluded (miscompile finding) — time it only if kept.
+        t_ast = None
+        if b["elf_ast"] is not None:
+            t_ast, _, _ = besttime(reps, [str(b["elf_ast"])])
+        rows.append((name, t_off, t_ast, t_on, t_c0, t_c2))
 
-    # headline ratios
-    hdr = ("kernel", "Adder-OFF", "Adder-ON", "C-O0", "C-O2",
-           "ON/OFF", "ON/C-O2", "ON/C-O0")
+    # headline ratios. su_full = OFF/ON (full speedup vs O0); su_ast = OFF/AST;
+    # frac = fraction of the wall-time reduction AST-only captures; ast_c2 /
+    # full_c2 = each vs gcc-O2 (x slower).
+    hdr = ("kernel", "Adder-O0", "AST-only", "full-ON", "C-O2",
+           "full/O0", "AST/O0", "AST%", "AST/O2", "full/O2")
     print(f"{hdr[0]:9s} {hdr[1]:>10s} {hdr[2]:>10s} {hdr[3]:>10s} "
-          f"{hdr[4]:>10s} {hdr[5]:>8s} {hdr[6]:>9s} {hdr[7]:>9s}")
-    print("-" * 80)
+          f"{hdr[4]:>10s} {hdr[5]:>8s} {hdr[6]:>8s} {hdr[7]:>6s} "
+          f"{hdr[8]:>8s} {hdr[9]:>8s}")
+    print("-" * 96)
     if not rows:
         print("(no correct kernels to time)")
-    speedups, on_vs_c2, on_vs_c0 = [], [], []
+    su_full_l, su_ast_l, ast_c2_l, full_c2_l = [], [], [], []
     md_rows = []
-    for (name, t_off, t_on, t_c0, t_c2) in rows:
-        su = t_off / t_on            # >1 means ON is faster
-        r_c2 = t_on / t_c2           # how many x slower than C -O2
-        r_c0 = t_on / t_c0           # how many x slower than C -O0
-        speedups.append(su); on_vs_c2.append(r_c2); on_vs_c0.append(r_c0)
-        print(f"{name:9s} {t_off:9.4f}s {t_on:9.4f}s {t_c0:9.4f}s "
-              f"{t_c2:9.4f}s {su:7.2f}x {r_c2:8.2f}x {r_c0:8.2f}x")
-        md_rows.append((name, t_off, t_on, t_c0, t_c2, su, r_c2, r_c0))
-    print("-" * 80)
-    g_su = geomean(speedups)
-    g_c2 = geomean(on_vs_c2)
-    g_c0 = geomean(on_vs_c0)
+    for (name, t_off, t_ast, t_on, t_c0, t_c2) in rows:
+        su_full = t_off / t_on            # >1 means full-opt is faster than O0
+        r_full_c2 = t_on / t_c2           # full-opt: x slower than C -O2
+        r_full_c0 = t_on / t_c0
+        su_full_l.append(su_full); full_c2_l.append(r_full_c2)
+        if t_ast is not None:
+            su_ast = t_off / t_ast
+            r_ast_c2 = t_ast / t_c2
+            # fraction of the wall-time REDUCTION AST-only captures vs full:
+            # (t_off - t_ast) / (t_off - t_on). Guard tiny/negative denominators.
+            denom = t_off - t_on
+            frac = ((t_off - t_ast) / denom) if denom > 1e-9 else float("nan")
+            su_ast_l.append(su_ast); ast_c2_l.append(r_ast_c2)
+            print(f"{name:9s} {t_off:9.4f}s {t_ast:9.4f}s {t_on:9.4f}s "
+                  f"{t_c2:9.4f}s {su_full:7.2f}x {su_ast:7.2f}x "
+                  f"{frac*100:5.0f}% {r_ast_c2:7.2f}x {r_full_c2:7.2f}x")
+            md_rows.append((name, t_off, t_ast, t_on, t_c0, t_c2, su_full,
+                            su_ast, frac, r_ast_c2, r_full_c2, r_full_c0))
+        else:
+            print(f"{name:9s} {t_off:9.4f}s {'  MISCOMP':>10s} {t_on:9.4f}s "
+                  f"{t_c2:9.4f}s {su_full:7.2f}x {'   n/a':>8s} "
+                  f"{'n/a':>6s} {'   n/a':>8s} {r_full_c2:7.2f}x")
+            md_rows.append((name, t_off, None, t_on, t_c0, t_c2, su_full,
+                            None, None, None, r_full_c2, r_full_c0))
+    print("-" * 96)
+    g_full = geomean(su_full_l)
+    g_ast = geomean(su_ast_l)
+    g_ast_c2 = geomean(ast_c2_l)
+    g_full_c2 = geomean(full_c2_l)
+    # Fraction of the SPEEDUP captured (linear excess over 1x, from geomeans):
+    # (g_ast - 1) / (g_full - 1). This is the headline "% of the win".
+    g_frac = ((g_ast - 1.0) / (g_full - 1.0)) if g_full > 1.0 + 1e-9 else float("nan")
     print(f"{'geomean':9s} {'':>10s} {'':>10s} {'':>10s} {'':>10s} "
-          f"{g_su:7.2f}x {g_c2:8.2f}x {g_c0:8.2f}x")
+          f"{g_full:7.2f}x {g_ast:7.2f}x {g_frac*100:5.0f}% "
+          f"{g_ast_c2:7.2f}x {g_full_c2:7.2f}x")
     print()
-    print(f"[bench_opt] HEADLINE: optimizer ON is {g_su:.2f}x faster than OFF "
-          f"(geomean); Adder-ON is {g_c2:.2f}x C-O2 and {g_c0:.2f}x C-O0 (geomean).")
+    # "x gcc-O2" == the ON/C-O2 slower-than ratio (the project's convention:
+    # full --opt has historically held ~1.83x gcc-O2; lower is better, <1 = faster).
+    print(f"[bench_opt] HEADLINE: AST-only captures {g_frac*100:.0f}% of the "
+          f"full --opt speedup ({g_ast:.2f}x vs {g_full:.2f}x over O0); "
+          f"AST-only is {g_ast_c2:.2f}x gcc-O2 vs full's {g_full_c2:.2f}x gcc-O2.")
 
     # emit a machine-readable block the .sh wrapper turns into the md doc
     print("=== BENCH_OPT_MD_BEGIN ===")
     print(f"REPS {reps}")
-    for (name, t_off, t_on, t_c0, t_c2, su, r_c2, r_c0) in md_rows:
+    for r in md_rows:
+        (name, t_off, t_ast, t_on, t_c0, t_c2, su_full,
+         su_ast, frac, r_ast_c2, r_full_c2, r_full_c0) = r
         p = built[name]["passes"]
         fired = ";".join(f"{k}={v}" for k, v in p.items() if v) or "none"
-        print(f"ROW {name} {t_off:.4f} {t_on:.4f} {t_c0:.4f} {t_c2:.4f} "
-              f"{su:.2f} {r_c2:.2f} {r_c0:.2f} {built[name]['checksum']} {fired}")
+        astf = f"{t_ast:.4f}" if t_ast is not None else "NA"
+        su_astf = f"{su_ast:.2f}" if su_ast is not None else "NA"
+        fracf = f"{frac*100:.0f}" if (frac is not None and frac == frac) else "NA"
+        ac2f = f"{r_ast_c2:.2f}" if r_ast_c2 is not None else "NA"
+        print(f"ROW {name} {t_off:.4f} {astf} {t_on:.4f} {t_c0:.4f} {t_c2:.4f} "
+              f"{su_full:.2f} {su_astf} {fracf} {ac2f} {r_full_c2:.2f} "
+              f"{r_full_c0:.2f} {built[name]['checksum']} {fired}")
     if md_rows:
-        print(f"GEOMEAN {g_su:.2f} {g_c2:.2f} {g_c0:.2f}")
+        gfrac_s = f"{g_frac*100:.0f}" if g_frac == g_frac else "NA"
+        print(f"GEOMEAN {g_full:.2f} {g_ast:.2f} {gfrac_s} "
+              f"{g_ast_c2:.2f} {g_full_c2:.2f}")
     for (name, ref, got) in miscompiled:
         print(f"MISCOMPILE {name} ref={ref} adder_opt1_got={got}")
+    for (name, ref, got) in ast_miscompiled:
+        print(f"ASTMISCOMPILE {name} ref={ref} astonly_got={got}")
     print("=== BENCH_OPT_MD_END ===")
 
-    if miscompiled:
+    if miscompiled or ast_miscompiled:
         # Non-fatal exit code 2: results produced, but a correctness finding
-        # exists. The .sh wrapper surfaces it.
+        # exists (full-opt and/or AST-only miscompile). The .sh wrapper surfaces it.
         sys.exit(2)
 
 
