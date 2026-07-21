@@ -153,6 +153,177 @@ def ra_is_enabled() -> uint32:
 ra_skip_addr: uint64 = 0               # address of the SKIP comma-list value, 0=unset
 ra_dump_fns: uint32 = 0                 # 1 => stream the processed-function list
 
+# =======================================================================
+# FILE-based veto inputs (no MAX_ARG_STRLEN cap — for large skip/only sets).
+# =======================================================================
+#
+# ADDER_RA_SKIP_FILE=<path> — read newline-separated function names from the
+# file and UNION them with any ADDER_RA_SKIP_FNS comma-list. Same match
+# semantics (the mangled name ra_build_cfg sees via nd_name_off/len).
+#
+# ADDER_RA_ONLY_FILE=<path> — regalloc ONLY the functions named in the file;
+# every OTHER function falls back to the -O0 all-memory path. With BOTH given,
+# a function is regalloc'd iff it is in ONLY and not in (env-SKIP or SKIP-FILE).
+# An EMPTY only-file (opens, zero names) skips ALL functions (== global-off).
+#
+# The env var is capped at MAX_ARG_STRLEN (128 KiB, ~3600 names) but the kernel
+# has ~11 K regalloc functions, so a large skip/only set must come from a file.
+# Names are parsed ONCE (ra_nl_ensure_loaded, lazy on first ra_build_cfg) into a
+# hash set keyed by FNV-1a over the name bytes, so the per-function membership
+# check the veto runs is O(1) amortised — a full-kernel compile stays linear in
+# the function count (no 11 K x 11 K linear scan). Reads reuse the driver's exact
+# open/read/close path (raw Linux __syscall 2/0/3, as drv_read_file_to_scratch),
+# so no new syscall or link dependency is introduced. Both are inert when unset
+# (addr == 0 => nothing loaded => the allocation is byte-identical to before).
+ra_skip_file_addr: uint64 = 0          # address of ADDER_RA_SKIP_FILE path, 0=unset
+ra_only_file_addr: uint64 = 0          # address of ADDER_RA_ONLY_FILE path, 0=unset
+ra_only_active: uint32 = 0             # 1 => ONLY-file given (whitelist mode on)
+ra_nl_loaded: uint32 = 0              # 1 => name-list files parsed (parse-once cache)
+
+# Name-list storage. File bytes are read straight into ra_nl_buf and the parsed
+# names index into it (off,len) — no per-name copy. RA_NL_BUF_CAP (8 MiB) holds
+# both files' bytes (each ~350 KB for 11 K names) with headroom; .bss, so the
+# size costs memsz only. RA_NL_MAX (32 K) bounds distinct names across BOTH sets.
+RA_NL_BUF_CAP: uint32 = 8388608
+ra_nl_buf: Array[8388608, uint8]
+ra_nl_buf_len: uint32 = 0             # bytes read into ra_nl_buf so far
+RA_NL_MAX: uint32 = 32768             # max distinct names (skip + only, deduped)
+ra_nl_off: Array[32768, uint32]      # name i -> start offset in ra_nl_buf
+ra_nl_len: Array[32768, uint32]      # name i -> length
+ra_nl_flags: Array[32768, uint8]     # bit0 => in SKIP set, bit1 => in ONLY set
+ra_nl_next: Array[32768, uint32]     # hash chain: next name index, or RA_NONE
+ra_nl_count: uint32 = 0              # distinct names inserted
+# Open-chained hash table (power-of-two, mask RA_HT_SIZE-1). Head index per
+# bucket, or RA_NONE. 64 K buckets over <=32 K names keeps chains short.
+RA_HT_SIZE: uint32 = 65536
+ra_ht: Array[65536, uint32]
+
+# Raw Linux file I/O for the name-list files (open=2, read=0, close=3). Same
+# path drv_read_file_to_scratch uses; only reached in the host compiler when the
+# ONLY/SKIP-file env is set, so the Linux numbers never fire on-device (where
+# ra_parse_env is not called at all). Returns 1 on open success, 0 on failure.
+def ra_nl_load_file(path_addr: uint64, flag: uint8) -> uint32:
+    if path_addr == 0:
+        return 0
+    fd: int64 = __syscall3(2, path_addr, 0, 0)      # open(path, O_RDONLY, 0)
+    if fd < 0:
+        return 0
+    start: uint32 = ra_nl_buf_len
+    total: uint32 = start
+    while total < RA_NL_BUF_CAP:
+        n: int64 = __syscall3(0,
+                              cast[uint64](fd),
+                              cast[uint64](&ra_nl_buf[0]) + cast[uint64](total),
+                              cast[uint64](RA_NL_BUF_CAP - total))
+        if n <= 0:
+            break
+        total = total + cast[uint32](n)
+    __syscall1(3, cast[uint64](fd))                 # close(fd)
+    ra_nl_buf_len = total
+    # Split [start,total) into newline-delimited names, trimming surrounding
+    # whitespace/CR; blank lines are ignored. Each surviving name is inserted
+    # (deduped) with `flag` OR'd onto any prior membership.
+    i: uint32 = start
+    while i < total:
+        while i < total and (ra_nl_buf[i] == 32 or ra_nl_buf[i] == 9 or ra_nl_buf[i] == 13):
+            i = i + 1                                # skip leading blanks (not \n)
+        ls: uint32 = i
+        while i < total and ra_nl_buf[i] != 10:
+            i = i + 1
+        le: uint32 = i
+        if i < total:
+            i = i + 1                                # consume the '\n'
+        while le > ls and (ra_nl_buf[le - 1] == 32 or ra_nl_buf[le - 1] == 9 or ra_nl_buf[le - 1] == 13):
+            le = le - 1                              # trim trailing blanks/CR
+        if le > ls:
+            ra_nl_insert(ls, le - ls, flag)
+    return 1
+
+
+# FNV-1a over `len_` bytes at base[off..]. Same result for a name whether it
+# lives in ra_nl_buf (insert) or strbuf (lookup) — identical bytes hash alike.
+def ra_hash_bytes(base: Ptr[uint8], off: uint32, len_: uint32) -> uint32:
+    h: uint32 = 2166136261
+    j: uint32 = 0
+    while j < len_:
+        h = h ^ cast[uint32](base[off + j])
+        h = h * 16777619
+        j = j + 1
+    return h
+
+
+# 1 iff the `len_`-byte spans a[aoff..] and b[boff..] are byte-equal.
+def ra_bytes_eq(a: Ptr[uint8], aoff: uint32, b: Ptr[uint8], boff: uint32, len_: uint32) -> uint32:
+    j: uint32 = 0
+    while j < len_:
+        if a[aoff + j] != b[boff + j]:
+            return 0
+        j = j + 1
+    return 1
+
+
+# Insert name ra_nl_buf[off..off+len_) into the hash set, OR-ing `flag` onto its
+# membership. Duplicate names (within a file or across the two files) fold onto
+# one entry. Silently caps at RA_NL_MAX (never hit at 11 K names / 32 K slots).
+def ra_nl_insert(off: uint32, len_: uint32, flag: uint8):
+    nb: Ptr[uint8] = &ra_nl_buf[0]
+    h: uint32 = ra_hash_bytes(nb, off, len_)
+    b: uint32 = h & (RA_HT_SIZE - 1)
+    idx: uint32 = ra_ht[b]
+    while idx != RA_NONE:
+        if ra_nl_len[idx] == len_ and ra_bytes_eq(nb, ra_nl_off[idx], nb, off, len_) != 0:
+            ra_nl_flags[idx] = ra_nl_flags[idx] | flag
+            return
+        idx = ra_nl_next[idx]
+    if ra_nl_count >= RA_NL_MAX:
+        return
+    ni: uint32 = ra_nl_count
+    ra_nl_off[ni] = off
+    ra_nl_len[ni] = len_
+    ra_nl_flags[ni] = flag
+    ra_nl_next[ni] = ra_ht[b]
+    ra_ht[b] = ni
+    ra_nl_count = ni + 1
+
+
+# Parse the name-list files ONCE (lazy, first ra_build_cfg). Sets ra_only_active
+# from whether an ONLY-file was named. Fully inert (no file I/O, ra_nl_count
+# stays 0) when neither file env is set — so the default allocation is unchanged.
+def ra_nl_ensure_loaded():
+    if ra_nl_loaded != 0:
+        return
+    ra_nl_loaded = 1
+    ra_only_active = 0
+    if ra_only_file_addr != 0:
+        ra_only_active = 1
+    if ra_skip_file_addr == 0 and ra_only_file_addr == 0:
+        return
+    k: uint32 = 0
+    while k < RA_HT_SIZE:
+        ra_ht[k] = RA_NONE                           # .bss is 0; RA_NONE is all-ones
+        k = k + 1
+    ra_nl_buf_len = 0
+    ra_nl_count = 0
+    ra_nl_load_file(ra_skip_file_addr, 1)            # bit0 = SKIP-file membership
+    ra_nl_load_file(ra_only_file_addr, 2)            # bit1 = ONLY-file membership
+
+
+# Combined file-set membership flags for the function named strbuf[off..off+len_):
+# bit0 => in SKIP-file set, bit1 => in ONLY-file set. 0 when unloaded/not found.
+def ra_nl_lookup(off: uint32, len_: uint32) -> uint32:
+    if ra_nl_count == 0:
+        return 0
+    sb: Ptr[uint8] = &strbuf[0]
+    nb: Ptr[uint8] = &ra_nl_buf[0]
+    h: uint32 = ra_hash_bytes(sb, off, len_)
+    b: uint32 = h & (RA_HT_SIZE - 1)
+    idx: uint32 = ra_ht[b]
+    while idx != RA_NONE:
+        if ra_nl_len[idx] == len_ and ra_bytes_eq(nb, ra_nl_off[idx], sb, off, len_) != 0:
+            return cast[uint32](ra_nl_flags[idx])
+        idx = ra_nl_next[idx]
+    return 0
+
 
 # Length of NUL-terminated prefix `pfx` iff C-string `e` begins with it, else 0.
 # (Local copy of opt_str_prefix_len so regalloc keeps no opt dependency.)
@@ -173,6 +344,9 @@ def ra_str_prefix_len(e: Ptr[uint8], pfx: Ptr[uint8]) -> uint32:
 def ra_parse_env(argc: int32, argv: Ptr[uint64]):
     ra_skip_addr = 0
     ra_dump_fns = 0
+    ra_skip_file_addr = 0
+    ra_only_file_addr = 0
+    ra_nl_loaded = 0                             # force a re-parse on next compile
     ei: uint32 = cast[uint32](argc) + 1          # skip argv[argc] (the NULL)
     while argv[ei] != 0:
         e: Ptr[uint8] = cast[Ptr[uint8]](argv[ei])
@@ -187,6 +361,20 @@ def ra_parse_env(argc: int32, argv: Ptr[uint64]):
             # enabled for any value except empty or a literal "0"
             if vc != 0 and vc != 48:             # 48 == '0'
                 ra_dump_fns = 1
+        # ADDER_RA_SKIP_FILE / ADDER_RA_ONLY_FILE — path to a newline-separated
+        # name list (no MAX_ARG_STRLEN cap). Only a NON-EMPTY value arms them, so
+        # a bare `ADDER_RA_ONLY_FILE=` (empty value) stays inert like unset; an
+        # actual empty FILE is a distinct case (opens, zero names => skip-all).
+        # The prefixes diverge from ADDER_RA_SKIP_FNS/DUMP_FNS at the 'FI' of
+        # FILE, so ra_str_prefix_len never cross-matches.
+        k3: uint32 = ra_str_prefix_len(e, "ADDER_RA_SKIP_FILE=")
+        if k3 != 0:
+            if e[k3] != 0:
+                ra_skip_file_addr = cast[uint64](e) + cast[uint64](k3)
+        k4: uint32 = ra_str_prefix_len(e, "ADDER_RA_ONLY_FILE=")
+        if k4 != 0:
+            if e[k4] != 0:
+                ra_only_file_addr = cast[uint64](e) + cast[uint64](k4)
         ei = ei + 1
 
 
@@ -622,7 +810,21 @@ def ra_build_cfg(fn: uint32) -> uint32:
     # any allocation work so codegen takes its exact all-memory / -O0 path for this
     # function only. Both are inert (name never matches, no dump) when the env is
     # unset, so the default --opt allocation is byte-identical.
-    skipped: uint32 = ra_fn_in_skip_list(nd_name_off[fn], nd_name_len[fn])
+    # Compose the env comma-list veto with the FILE-based inputs (parsed once,
+    # lazily). in_skip = env-SKIP OR SKIP-FILE. When an ONLY-file is armed, a
+    # function is skipped UNLESS it is in the ONLY set (and not skipped). All
+    # inert when unset: ra_nl_lookup returns 0 (nothing loaded) and ra_only_active
+    # is 0, so `skipped` reduces to the original env comma-list result.
+    ra_nl_ensure_loaded()
+    nflags: uint32 = ra_nl_lookup(nd_name_off[fn], nd_name_len[fn])
+    in_skip: uint32 = ra_fn_in_skip_list(nd_name_off[fn], nd_name_len[fn])
+    if (nflags & 1) != 0:
+        in_skip = 1
+    skipped: uint32 = 0
+    if in_skip != 0:
+        skipped = 1
+    elif ra_only_active != 0 and (nflags & 2) == 0:
+        skipped = 1
     ra_dump_fn_name(nd_name_off[fn], nd_name_len[fn], skipped)
     if skipped != 0:
         return 0                         # per-function veto: all-memory fallback
