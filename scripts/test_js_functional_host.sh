@@ -164,6 +164,21 @@ assert_grep 'FLOW  *-   One'         "sibling #i1 untouched"
 assert_grep 'FLOW  *-   Three'       "sibling #i3 untouched"
 assert_nogrep '^JSERR'               "no uncaught JS error"
 
+echo "----- (8) deferclick: a click handler's setTimeout fires + updates DOM -----"
+# Expected DOM: click #load -> #status becomes 'LOADED-OK' (the deferred
+# callback ran on the post-event drain, not left at 'LOADING'). Console:
+# 'DEFERCLICK click' then 'DEFERCLICK settled'.
+run deferclick.html click load
+assert_grep '^JSLOG DEFERCLICK click$'   "click handler ran"
+assert_grep '^JSLOG DEFERCLICK settled$' "the handler's setTimeout callback fired (post-event drain)"
+assert_grep 'LOADED-OK'                  "the deferred DOM mutation rendered"
+if sed -n '/^CLICK/,$p' "$D0" | grep -Eq 'IDLE|LOADING'; then
+    echo "[js-fn] FAIL the status stalled at IDLE/LOADING (deferred update lost)"; fail=1
+else
+    echo "[js-fn] PASS the status settled past IDLE/LOADING to LOADED-OK"
+fi
+assert_nogrep '^JSERR'                   "no uncaught JS error"
+
 if [ "$fail" -ne 0 ]; then
     echo "[js-fn] RESULT: FAIL"; exit 1
 fi
