@@ -7,12 +7,17 @@
 # modern design system depends on and that an integer-only length scanner
 # silently truncates at the '.':
 #
+# Plain prose now spans the FULL viewport like Chrome (content column =
+# 800-2*8 = 784px, boxes at x0=0); percentages resolve against 784.
+#
 #   * padding: 0.75rem  -> 12px  (0.75 * 16px root-em). A truncating scanner
-#     reads 0rem -> padding 0, so the box's left edge would sit at x=100 (the
-#     content margin) instead of x=112.
+#     reads 0rem -> padding 0, so the box TEXT would sit at x=8 (the bare content
+#     margin) instead of x=20 (8 + 12px left padding), and the fill would be 24px
+#     narrower (no left+right padding).
 #   * width: 33.3%      -> a width strictly WIDER than an integer 33% (which
-#     truncation would produce). 33% -> right edge 308; 33.3% -> 310.
-#   * width: 25.5%      -> a fractional percentage distinct from 25%.
+#     truncation would produce). Against 784: 33% -> ~275; 33.3% -> 277 (x1).
+#   * width: 25.5%      -> a fractional percentage distinct from 25% (25.5% of
+#     784 = 199.9 -> 215 x1; 25% would be 212).
 #   * font-size:1.5rem / 1.5em -> 24px headings that parse (the host preview is
 #     monospace and cannot depict glyph scaling — see feedback_host_preview_
 #     monospace_lies — so size is proven by the pixel-accurate length math
@@ -55,20 +60,27 @@ assert_grep() {
 # Layout produced content.
 assert_grep 'LAYOUT segs=[1-9][0-9]* rows=[1-9][0-9]* ' "layout produced segments/rows"
 
-# --- 0.75rem padding -> 12px left edge (fractional rem) ---------------
-# Integer truncation reads 0rem: the box would start at x=100, not x=112.
-assert_grep '^FILL 5 6 112 328 #ffcc00'  "padding:0.75rem -> 12px left padding (x=112, not 100)"
+# --- 0.75rem padding -> 12px (fractional rem) ------------------------
+# Integer truncation reads 0rem: the box fill would be 216px wide (no padding)
+# and the text would start at x=8, not x=20. The 240px fill (200 width + 24px
+# horizontal padding + 16 chrome) and the text at x=20 (8 + 12px left padding)
+# both prove the fractional 0.75rem resolved to 12px.
+assert_grep '^FILL [0-9]+ [0-9]+ 0 240 #ffcc00'  "padding:0.75rem -> 12px (240px fill = 200 + 24 pad + 16, not 216)"
+assert_grep '^SEG [0-9]+ 20 #[0-9a-f]+ b0 u0 s0 l-1 bg#ffcc00 .Padded 0.75rem box.' \
+    "padding:0.75rem -> text at x=20 (8 + 12px left padding, not x=8)"
 
-# --- 33.3% width -> right edge WIDER than an integer 33% (=308) -------
-assert_grep '^FILL 7 9 100 310 #33aa33'  "width:33.3% -> 310px right edge (33% would be 308)"
+# --- 33.3% width -> right edge WIDER than an integer 33% --------------
+# 33.3% of 784 = 261.1 -> 261px width -> x1 277 (33% -> ~259 -> x1 275).
+assert_grep '^FILL [0-9]+ [0-9]+ 0 277 #33aa33'  "width:33.3% -> 277px right edge (33% would be 275)"
 
 # --- 25.5% width -> a fractional percentage box ----------------------
-assert_grep '^FILL 11 13 100 264 #2255aa'  "width:25.5% -> 264px right edge (fractional %)"
+# 25.5% of 784 = 199.9 -> 199px width -> x1 215 (25% -> 196 -> x1 212).
+assert_grep '^FILL [0-9]+ [0-9]+ 0 215 #2255aa'  "width:25.5% -> 215px right edge (fractional %)"
 
 # --- decimal em/rem font-size boxes render (value path exercised) ----
-assert_grep '^SEG 0 108 #[0-9a-f]+ b1 u0 s0 l-1 bg#eeeeee .Heading at 1.5rem.' \
+assert_grep '^SEG 0 8 #[0-9a-f]+ b1 u0 s0 l-1 bg#eeeeee .Heading at 1.5rem.' \
     "font-size:1.5rem heading renders (bold, tinted bg)"
-assert_grep '^SEG [0-9]+ 108 #[0-9a-f]+ b0 u0 s0 l-1 bg#cc00cc .Text at 1.5em.' \
+assert_grep '^SEG [0-9]+ 8 #[0-9a-f]+ b0 u0 s0 l-1 bg#cc00cc .Text at 1.5em.' \
     "font-size:1.5em paragraph renders"
 
 echo "[hb-decimlen] compiling native hambrowse for x86_64-adder-user (no regress) ..."

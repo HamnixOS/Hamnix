@@ -1,27 +1,26 @@
 #!/usr/bin/env bash
 # scripts/test_hambrowse_fullwidth_host.sh — FAST, QEMU-free render-to-PNG gate
-# for the READABLE-MEASURE SCOPING fix (lib/web/state.ad + lib/web/layout/flow.ad).
+# for the READABLE-MEASURE SCOPING contract (lib/web/state.ad + lib/web/layout/flow.ad).
 #
-# THE BUG: the engine capped EVERY page's content to a 584px readable-measure
-# column CENTRED in the window (MEASURE_MAX + _page_gutter). Real websites — whose
-# chrome is a full-bleed nav bar and whose body is a multi-column flex/grid — then
-# rendered as a narrow strip floating in the middle of a wide window, nothing like
-# Firefox/Chrome, which render the body at the FULL viewport width and let the
-# page's own CSS narrow any column.
+# CHROME PARITY: Chrome/Firefox do NOT cap body width — plain prose runs the FULL
+# viewport content width, and only the page's OWN CSS (a max-width column) narrows
+# it. The engine matches this: the readable-measure gutter is DISABLED by default
+# and re-enabled ONLY when the page (a) establishes an author layout context
+# (display:flex / display:grid / position:absolute|fixed) — which already drives
+# its own full-width layout — OR (b) declares its own `max-width` (g_page_maxwidth),
+# the signal that the author WANTS a narrow centred reading column. A plain-prose
+# page with NO author max-width renders EDGE-TO-EDGE like Chrome.
 #
-# THE FIX (scoped, not a blanket removal): the readable-measure gutter is kept for
-# a plain-prose page (bare <p>/<h*> text with no author layout) so long lines stay
-# comfortable, but is DISABLED for any page that establishes an author layout
-# context — display:flex / display:grid / position:absolute|fixed — so a real
-# website spans the whole window edge-to-edge like a real browser.
-#
-# This gate pixel-asserts BOTH halves of that contract at a wide (1000px) window:
-#   (A) FULL-WIDTH: a display:flex page's full-bleed nav bar background spans the
-#       whole window (NOT a 584px centred strip), and its 3-card flex row fills
+# This gate pixel-asserts ALL THREE halves of that contract at a wide (1000px) window:
+#   (A) FULL-WIDTH LAYOUT: a display:flex page's full-bleed nav bar background spans
+#       the whole window (NOT a 584px centred strip), and its 3-card flex row fills
 #       the width with the rightmost card near the right edge.
-#   (B) READABLE: a plain unstyled <p>-only page STILL caps + centres its text at
-#       the ~584px readable measure (a left gutter, and a right edge well short of
-#       the window edge) — proving the fix did not regress plain prose.
+#   (B) FULL-WIDTH PROSE: a plain unstyled <p>-only page with NO author max-width now
+#       spans the FULL window edge-to-edge (left margin ~8px, right edge near the
+#       window edge) — Chrome parity, the readable-measure cap no longer engages.
+#   (C) AUTHOR MAX-WIDTH: a prose page that DECLARES its own max-width KEEPS a narrow
+#       centred reading column (a left gutter, right edge well short of the window
+#       edge) — proving g_page_maxwidth honours the author's narrow column.
 #
 # Renders via the pixel backend (lib/htmlpaint + lib/htmlpage) — no QEMU boot.
 # See docs/browser_w3c_conformance.md.
@@ -104,7 +103,8 @@ else
 fi
 
 # ============================================================================
-# (B) READABLE: a plain unstyled prose page KEEPS the ~584px readable measure.
+# (B) FULL-WIDTH PROSE: a plain unstyled page with NO author max-width spans the
+#     FULL window edge-to-edge (Chrome parity — the readable cap no longer engages).
 # ============================================================================
 PD="$OUT/fw_prose.txt"
 echo "[hb-fw] rendering $PROSE at width $W ..."
@@ -114,21 +114,50 @@ fi
 python3 scripts/ppm_to_png.py "$OUT/fw_prose.ppm" "$OUT/fw_prose.png" >/dev/null 2>&1 \
     && echo "[hb-fw] wrote $OUT/fw_prose.png"
 
-# The left content margin (UAELEM ddx) must show the centring gutter (>> the bare
-# 8px CONTENT_X), and the rightmost text x (REFLOW maxx) must stay well short of
-# the 1000px window edge — the text column is the ~584px readable measure, centred.
+# No author max-width -> no gutter: the left content margin (UAELEM ddx) is the
+# bare ~8px CONTENT_X and the rightmost text x (REFLOW maxx) runs near the 1000px
+# window edge, exactly like Chrome renders unstyled body prose.
 DDX=$(grep -oE "ddx [0-9]+" "$PD" | head -1 | awk '{print $2}')
 MAXX=$(grep -E "^REFLOW " "$PD" | awk '{for(i=1;i<=NF;i++) if($i=="maxx") print $(i+1)}' | head -1)
-echo "[hb-fw] prose column: left-gutter ddx=${DDX:-?} right-edge maxx=${MAXX:-?} (window ${W}px)"
-if [ -n "$DDX" ] && [ "$DDX" -ge 150 ] && [ "$DDX" -le 260 ]; then
-    pass "unstyled prose keeps a centring left gutter (ddx=${DDX}px, not 8px edge-to-edge)"
+echo "[hb-fw] prose column: left-margin ddx=${DDX:-?} right-edge maxx=${MAXX:-?} (window ${W}px)"
+if [ -n "$DDX" ] && [ "$DDX" -le 24 ]; then
+    pass "no-max-width prose spans full width (left margin ddx=${DDX}px ~= 8px CONTENT_X, no gutter)"
 else
-    bad "prose left gutter wrong (ddx=${DDX:-?}; expected ~200 = 8 + (984-584)/2)"
+    bad "prose left margin not edge-to-edge (ddx=${DDX:-?}; expected ~8px, no readable gutter)"
 fi
-if [ -n "$MAXX" ] && [ "$MAXX" -le 810 ] && [ "$MAXX" -ge 560 ]; then
-    pass "unstyled prose keeps the ~584px readable measure (right edge maxx=${MAXX}px << 1000)"
+if [ -n "$MAXX" ] && [ "$MAXX" -ge 900 ]; then
+    pass "no-max-width prose runs to the window edge (right edge maxx=${MAXX}px ~ ${W}px, not a 584 strip)"
 else
-    bad "prose measure not capped (maxx=${MAXX:-?}; expected ~584..792, NOT near the ${W}px edge)"
+    bad "prose not full-width (maxx=${MAXX:-?}; expected near the ${W}px edge, Chrome parity)"
+fi
+
+# ============================================================================
+# (C) AUTHOR MAX-WIDTH: a prose page that declares its OWN max-width keeps a
+#     narrow centred reading column (g_page_maxwidth honours the author intent).
+# ============================================================================
+PMW="tests/fixtures/hambrowse_fullwidth_prose_maxw.html"
+PMD="$OUT/fw_prose_maxw.txt"
+echo "[hb-fw] rendering $PMW at width $W ..."
+if ! "$GFX" "$PMW" "$OUT/fw_prose_maxw.ppm" "$W" >"$PMD" 2>&1; then
+    echo "[hb-fw] FAIL: max-width prose render exited non-zero"; cat "$PMD"; exit 1
+fi
+python3 scripts/ppm_to_png.py "$OUT/fw_prose_maxw.ppm" "$OUT/fw_prose_maxw.png" >/dev/null 2>&1 \
+    && echo "[hb-fw] wrote $OUT/fw_prose_maxw.png"
+
+# The author max-width re-engages the readable measure: a centring left gutter
+# (>> the bare 8px CONTENT_X) and a right edge well short of the 1000px window.
+MDDX=$(grep -oE "ddx [0-9]+" "$PMD" | head -1 | awk '{print $2}')
+MMAXX=$(grep -E "^REFLOW " "$PMD" | awk '{for(i=1;i<=NF;i++) if($i=="maxx") print $(i+1)}' | head -1)
+echo "[hb-fw] max-width prose column: left-gutter ddx=${MDDX:-?} right-edge maxx=${MMAXX:-?} (window ${W}px)"
+if [ -n "$MDDX" ] && [ "$MDDX" -ge 150 ] && [ "$MDDX" -le 260 ]; then
+    pass "author-max-width prose keeps a centring left gutter (ddx=${MDDX}px, not 8px edge-to-edge)"
+else
+    bad "max-width prose gutter wrong (ddx=${MDDX:-?}; expected ~208 = 8 + (984-584)/2)"
+fi
+if [ -n "$MMAXX" ] && [ "$MMAXX" -le 810 ] && [ "$MMAXX" -ge 560 ]; then
+    pass "author-max-width prose keeps the ~584px readable measure (right edge maxx=${MMAXX}px << 1000)"
+else
+    bad "max-width prose measure not capped (maxx=${MMAXX:-?}; expected ~584..792, NOT the ${W}px edge)"
 fi
 
 if [ "$fail" -ne 0 ]; then

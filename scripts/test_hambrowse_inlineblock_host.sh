@@ -57,12 +57,15 @@ else
 fi
 
 # ---- (2) chips WRAP to a new line when the row overflows ----------------------
-ir=$(seg_row "iota"); kr=$(seg_row "kappa"); kx=$(seg_x "kappa")
-echo "[hb-inlb] wrap: iota(row=$ir) kappa(row=$kr x=$kx)"
-if [ -n "$ir" ] && [ -n "$kr" ] && [ "$kr" -gt "$ir" ] && [ "$kx" -lt 200 ]; then
-    echo "[hb-inlb] PASS overflowing chips wrap to the next line (kappa row $kr, x reset)"
+# Prose now spans the full viewport (Chrome parity), so the chip cloud is long
+# enough (a..omega) to overflow the ~784px row and wrap: a later chip (omicron)
+# lands on a row below alpha's with its x reset to the left margin.
+ar2=$(seg_row "alpha"); or=$(seg_row "omicron"); ox=$(seg_x "omicron")
+echo "[hb-inlb] wrap: alpha(row=$ar2) omicron(row=$or x=$ox)"
+if [ -n "$ar2" ] && [ -n "$or" ] && [ "$or" -gt "$ar2" ] && [ "$ox" -lt 200 ]; then
+    echo "[hb-inlb] PASS overflowing chips wrap to the next line (omicron row $or, x reset)"
 else
-    echo "[hb-inlb] FAIL chips did not wrap (iota=$ir kappa=$kr x=$kx)"; fail=1
+    echo "[hb-inlb] FAIL chips did not wrap (alpha=$ar2 omicron=$or x=$ox)"; fail=1
 fi
 
 # ---- (3) each chip paints a NARROW box FILL (not a full-width block row) ------
