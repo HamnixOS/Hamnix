@@ -1,0 +1,499 @@
+# adder/compiler/ssa_emit.ad
+#
+# Phase 1b of the SSA optimizer rewrite (docs/adder_ssa_optimizer_design.md §5):
+# the machine-code EMISSION round-trip.  Lowers the Phase-1 SSA IR (ssa.ad)
+# straight back to x86_64 machine code through codegen.ad's EXISTING `emit_*`
+# byte encoders, with the TRIVIAL all-memory register allocator the design
+# scopes for this phase (every SSA value gets its own stack slot; each op loads
+# operands to scratch, computes, stores the result).  Correct, not fast — the
+# real linear-scan allocator is Phase 3.
+#
+# WHERE THE MIR WENT
+# ------------------
+# The design (§5.1) calls for a thin machine-IR arena, one MIR instruction per
+# SSA op.  For the TRIVIAL all-memory allocator that MIR is degenerate: every
+# SSA value IS a memory operand (its stack slot) and every op maps to a fixed
+# short instruction sequence, so this module lowers SSA directly to bytes in one
+# RPO walk — the "MIR" is fused into the emit walk.  A materialised MIR arena is
+# deferred to Phase 3, where the linear-scan allocator needs an explicit
+# instruction list with virtual/physical operands to rewrite.  φ-nodes are
+# resolved to parallel copies on predecessor edges (Boissinot), using a distinct
+# per-φ temp slot so no copy clobbers a source read on the same edge.
+#
+# ISOLATION / SEED PARITY
+# -----------------------
+# codegen.ad (a seed MODULE, scripts/concat_compiler_source.py) is UNCHANGED —
+# this module only CALLS its exported emitters, it does not modify it, so the
+# ADDER_OPT2-unset path stays byte-for-byte identical and the seed compiler
+# build is untouched.  ssa.ad + ssa_emit.ad remain OUT of the seed MODULES list;
+# they are pulled into the host driver only by its `from compiler.*` imports.
+# The per-function ESCAPE HATCH (§2.6): ssa_emit_function returns 0 whenever SSA
+# construction/verification bails, and the caller emits the function via the
+# legacy gen_function — a function is wholly OPT2 or wholly legacy, never a mix.
+
+from compiler.parser import (
+    nd_kind,
+    nd_name_off,
+    nd_name_len,
+    nd_a,
+    nd_b,
+    nd_next,
+    ND_FUNCTION,
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_BIT_OR,
+    BINOP_BIT_AND,
+    BINOP_BIT_XOR,
+    BINOP_SHL,
+    BINOP_EQ,
+    BINOP_NEQ,
+)
+
+from compiler.ssa import (
+    sv_op,
+    sv_a,
+    sv_b,
+    sv_c,
+    sv_aux,
+    sv_imm,
+    sv_ast,
+    sv_next,
+    sv_arg_head,
+    sv_count,
+    arg_val,
+    arg_pred,
+    arg_next,
+    sb_first_val,
+    sb_rpo,
+    sb_rpo_n,
+    sb_count,
+    ssa_build_function,
+    ssa_verify,
+    ssa_is_terminator,
+    ssa_bail,
+    ssa_prog_decls,
+    SVO_CONST,
+    SVO_UNDEF,
+    SVO_PARAM,
+    SVO_BINOP,
+    SVO_NEG,
+    SVO_NOT,
+    SVO_BITNOT,
+    SVO_ICMP,
+    SVO_BR,
+    SVO_CONDBR,
+    SVO_RET,
+    SVO_PHI,
+    SVO_CALL,
+    SSAV_OK,
+)
+
+from compiler.codegen import (
+    code_len,
+    emit_b,
+    emit_imm32,
+    emit_endbr64,
+    emit_push_rbp,
+    emit_mov_rsp_rbp,
+    emit_sub_rsp,
+    emit_leave,
+    emit_ret,
+    emit_mov_imm_rax,
+    emit_xor_rax_rax,
+    emit_xor_eax_eax,
+    emit_load_local_rax,
+    emit_store_local_rax,
+    emit_load_local_callee,
+    emit_store_local_callee,
+    emit_alu_reg_reg,
+    emit_cmp_rcx_rax,
+    emit_setcc_al,
+    emit_movzx_al_rax,
+    emit_test_rax_rax,
+    patch_rel32,
+    emit_jz_fwd,
+    fn_define,
+    add_call_fixup,
+    sysv_arg_reg_enc,
+    # program-level orchestration (replicated per-function dispatch, see
+    # ssa_emit_program) — CALLED, never modified.
+    cg_init,
+    cg_prog_decls,
+    cg_target_kernel,
+    collect_externs,
+    layout_classes,
+    register_enums,
+    layout_globals,
+    gen_function,
+    gen_class_methods,
+    link_runtime_externs,
+    resolve_calls,
+    resolve_method_calls,
+    resolve_data_fixups,
+    resolve_entry,
+    cg_fail,
+    fn_count,
+)
+
+# Captured per function: the value-count high-water so temp (φ) slots sit in a
+# disjoint region above the value slots.
+ssa_nvals: uint32 = 0
+
+# Start offset of the most-recently SSA-emitted function (so ssa_emit_program can
+# anchor `first`/entry resolution just like gen_function's return value).
+ssa_last_fn_start: uint32 = 0
+
+# Block -> emitted code offset (filled as each block is laid out; forward jumps
+# are patched from the fixup table once every block has an offset).
+se_bid_off: Array[1024, uint32]
+
+# Forward/back jump fixups: (rel32-field site, target bid).  All jumps are
+# recorded and patched uniformly at the end (works for forward and back edges).
+SE_FIX_MAX: uint32 = 8192
+se_fix_site: Array[8192, uint32]
+se_fix_bid: Array[8192, uint32]
+se_fix_n: uint32 = 0
+
+# Call-argument scratch (values, in ABI order) — ≤6 (construction bails >6).
+se_call_args: Array[8, uint32]
+
+# stats (Phase-1b emission lane)
+ssa_emit_stat_funcs: uint32 = 0
+ssa_emit_stat_emitted: uint32 = 0
+ssa_emit_stat_fallback: uint32 = 0
+
+
+def ssa_emit_stats_reset():
+    ssa_emit_stat_funcs = 0
+    ssa_emit_stat_emitted = 0
+    ssa_emit_stat_fallback = 0
+
+
+# Stack slot (rbp-relative) for value `v` and its φ-temp companion.  Value slots
+# occupy -8*v; temp slots occupy a disjoint region -8*(nvals+v).
+def ssa_slot(v: uint32) -> int32:
+    return 0 - cast[int32](v * 8)
+
+
+def ssa_temp_slot(v: uint32) -> int32:
+    return 0 - cast[int32]((ssa_nvals + v) * 8)
+
+
+def se_fix_add(site: uint32, bid: uint32):
+    if se_fix_n >= SE_FIX_MAX:
+        return
+    se_fix_site[se_fix_n] = site
+    se_fix_bid[se_fix_n] = bid
+    se_fix_n = se_fix_n + 1
+
+
+# Load value `v`'s slot into %rax / %rcx.
+def se_load_rax(v: uint32):
+    emit_load_local_rax(ssa_slot(v))
+
+
+def se_load_rcx(v: uint32):
+    emit_load_local_callee(1, ssa_slot(v))   # movq slot,%rcx
+
+
+def se_store_rax(v: uint32):
+    emit_store_local_rax(ssa_slot(v))
+
+
+# shlq %cl, %rax -> 48 D3 E0
+def se_emit_shl_rax_cl():
+    emit_b(0x48)
+    emit_b(0xD3)
+    emit_b(0xE0)
+
+
+# negq %rax -> 48 F7 D8
+def se_emit_neg_rax():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xD8)
+
+
+# notq %rax -> 48 F7 D0
+def se_emit_not_rax():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xD0)
+
+
+# jmp rel32 to a (possibly forward) block; records a fixup.
+def se_emit_jmp_block(bid: uint32):
+    emit_b(0xE9)
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    se_fix_add(at, bid)
+
+
+# =======================================================================
+# per-value emission (the trivial all-memory lowering).
+# =======================================================================
+def ssa_emit_value(v: uint32):
+    op: uint32 = sv_op[v]
+
+    if op == SVO_PARAM:
+        # spill the incoming SysV arg register into the value's slot.
+        emit_store_local_callee(sysv_arg_reg_enc(sv_aux[v]), ssa_slot(v))
+        return
+
+    if op == SVO_CONST:
+        emit_mov_imm_rax(sv_imm[v])
+        se_store_rax(v)
+        return
+
+    if op == SVO_UNDEF:
+        emit_xor_rax_rax()
+        se_store_rax(v)
+        return
+
+    if op == SVO_BINOP:
+        se_load_rax(sv_a[v])
+        se_load_rcx(sv_b[v])
+        aux: uint32 = sv_aux[v]
+        if aux == BINOP_SHL:
+            se_emit_shl_rax_cl()                 # rax <<= cl  (low-64 invariant)
+        else:
+            emit_alu_reg_reg(aux, 1, 0)          # rax = rax OP rcx (ADD/SUB/MUL/AND/OR/XOR)
+        se_store_rax(v)
+        return
+
+    if op == SVO_NEG:
+        se_load_rax(sv_a[v])
+        se_emit_neg_rax()
+        se_store_rax(v)
+        return
+
+    if op == SVO_BITNOT:
+        se_load_rax(sv_a[v])
+        se_emit_not_rax()
+        se_store_rax(v)
+        return
+
+    if op == SVO_NOT:
+        # logical not: rax = (a == 0) ? 1 : 0
+        se_load_rax(sv_a[v])
+        emit_test_rax_rax()
+        emit_setcc_al(0x94)                      # sete %al
+        emit_movzx_al_rax()
+        se_store_rax(v)
+        return
+
+    if op == SVO_ICMP:
+        se_load_rax(sv_a[v])
+        se_load_rcx(sv_b[v])
+        emit_cmp_rcx_rax()                       # cmpq %rcx,%rax  (flags of a-b)
+        if sv_aux[v] == BINOP_EQ:
+            emit_setcc_al(0x94)                  # sete
+        else:
+            emit_setcc_al(0x95)                  # setne
+        emit_movzx_al_rax()
+        se_store_rax(v)
+        return
+
+    if op == SVO_CALL:
+        ssa_emit_call(v)
+        return
+
+    # SVO_PHI is handled at block head; terminators by ssa_emit_term; anything
+    # else is outside the accepted subset and cannot reach here.
+    return
+
+
+def ssa_emit_call(v: uint32):
+    node: uint32 = sv_ast[v]
+    callee: uint32 = nd_a[node]
+    argc: uint32 = sv_aux[v]
+    # The use-list is prepended, so its head is the LAST argument.  Reverse it
+    # into ABI order.
+    node2: uint32 = sv_arg_head[v]
+    j: uint32 = 0
+    while node2 != 0:
+        if argc >= 1 + j:
+            se_call_args[argc - 1 - j] = arg_val[node2]
+        j = j + 1
+        node2 = arg_next[node2]
+    # Load each argument into its SysV integer register (sources are memory
+    # slots, so the loads are order-independent).
+    i: uint32 = 0
+    while i < argc:
+        emit_load_local_callee(sysv_arg_reg_enc(i), ssa_slot(se_call_args[i]))
+        i = i + 1
+    emit_xor_eax_eax()                           # AL = 0 (variadic ABI, matches legacy default)
+    emit_b(0xE8)                                 # call rel32
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    add_call_fixup(at, nd_name_off[callee], nd_name_len[callee])
+    se_store_rax(v)                              # result in %rax -> slot
+
+
+# φ read: move the value staged in the φ's temp slot into its value slot (the
+# staging happened on each predecessor edge, see ssa_emit_edge_copies).
+def ssa_emit_phi_read(v: uint32):
+    emit_load_local_rax(ssa_temp_slot(v))
+    se_store_rax(v)
+
+
+# On edge pred->succ, stage each φ's incoming value (for THIS pred) into the φ's
+# temp slot.  Reads value slots, writes temp slots — disjoint regions, so the
+# parallel copy is hazard-free even for swap cycles.
+def ssa_emit_edge_copies(pred: uint32, succ: uint32):
+    v2: uint32 = sb_first_val[succ]
+    while v2 != 0:
+        if sv_op[v2] != SVO_PHI:
+            return
+        node: uint32 = sv_arg_head[v2]
+        src: uint32 = 0
+        while node != 0:
+            if arg_pred[node] == pred:
+                src = arg_val[node]
+                node = 0
+            else:
+                node = arg_next[node]
+        if src != 0:
+            emit_load_local_rax(ssa_slot(src))
+            emit_store_local_rax(ssa_temp_slot(v2))
+        v2 = sv_next[v2]
+
+
+def ssa_emit_term(v: uint32, bb: uint32):
+    op: uint32 = sv_op[v]
+    if op == SVO_RET:
+        if sv_a[v] != 0:
+            se_load_rax(sv_a[v])
+        else:
+            emit_xor_rax_rax()
+        emit_leave()
+        emit_ret()
+        return
+    if op == SVO_BR:
+        tgt: uint32 = sv_a[v]
+        ssa_emit_edge_copies(bb, tgt)
+        se_emit_jmp_block(tgt)
+        return
+    if op == SVO_CONDBR:
+        cond: uint32 = sv_a[v]
+        then_bb: uint32 = sv_b[v]
+        else_bb: uint32 = sv_c[v]
+        se_load_rax(cond)
+        emit_test_rax_rax()
+        jzsite: uint32 = emit_jz_fwd()           # cond==0 -> take the else path
+        # then edge
+        ssa_emit_edge_copies(bb, then_bb)
+        se_emit_jmp_block(then_bb)
+        # else edge
+        patch_rel32(jzsite, code_len)
+        ssa_emit_edge_copies(bb, else_bb)
+        se_emit_jmp_block(else_bb)
+        return
+
+
+# =======================================================================
+# whole-function emission.  Returns 1 if the function was emitted through the
+# SSA pipeline, 0 if it bailed (escape hatch -> caller emits legacy).
+# =======================================================================
+def ssa_emit_function(fn: uint32) -> uint32:
+    ssa_emit_stat_funcs = ssa_emit_stat_funcs + 1
+    entry: uint32 = ssa_build_function(fn)
+    if entry == 0 or ssa_bail != 0:
+        ssa_emit_stat_fallback = ssa_emit_stat_fallback + 1
+        return 0
+    rc: uint32 = ssa_verify()                    # also builds RPO + domtree
+    if rc != SSAV_OK:
+        ssa_emit_stat_fallback = ssa_emit_stat_fallback + 1
+        return 0
+
+    ssa_nvals = sv_count
+    ssa_last_fn_start = code_len
+    se_fix_n = 0
+    # clear block offsets
+    b: uint32 = 0
+    while b < sb_count:
+        se_bid_off[b] = 0
+        b = b + 1
+
+    # symbol + prologue.  These SSA functions clobber only caller-saved GPRs
+    # (rax/rcx/rdx + arg regs) plus rbp, so no callee-saved save/restore is
+    # needed and the epilogue is a plain leave; ret.
+    fn_define(nd_name_off[fn], nd_name_len[fn], code_len)
+    frame: uint32 = ((2 * sv_count * 8) + 15) & cast[uint32](0xFFFFFFF0)
+    emit_endbr64()
+    emit_push_rbp()
+    emit_mov_rsp_rbp()
+    if frame > 0:
+        emit_sub_rsp(frame)
+
+    # emit every reachable block in RPO (entry first).
+    i: uint32 = 0
+    while i < sb_rpo_n:
+        bb: uint32 = sb_rpo[i]
+        se_bid_off[bb] = code_len
+        vv: uint32 = sb_first_val[bb]
+        while vv != 0:
+            op: uint32 = sv_op[vv]
+            if op == SVO_PHI:
+                ssa_emit_phi_read(vv)
+            elif ssa_is_terminator(op) != 0:
+                ssa_emit_term(vv, bb)
+            else:
+                ssa_emit_value(vv)
+            vv = sv_next[vv]
+        i = i + 1
+
+    # patch every recorded jump against its (now-known) target block offset.
+    k: uint32 = 0
+    while k < se_fix_n:
+        patch_rel32(se_fix_site[k], se_bid_off[se_fix_bid[k]])
+        k = k + 1
+
+    ssa_emit_stat_emitted = ssa_emit_stat_emitted + 1
+    return 1
+
+
+# =======================================================================
+# program driver (ADDER_OPT2 codegen lane).  Mirrors codegen.ad's
+# gen_program_with_globals EXACTLY, except each top-level ND_FUNCTION is first
+# offered to ssa_emit_function; on bail it falls through to the legacy
+# gen_function.  Class methods, globals, extern linking and all fixup resolution
+# use codegen's unchanged machinery, so an SSA-emitted function and a legacy one
+# interoperate through the same symbol table / call fixups.
+# =======================================================================
+def ssa_emit_program(prog: uint32) -> uint32:
+    ssa_emit_stats_reset()
+    ssa_prog_decls = nd_b[prog]
+    cg_prog_decls = nd_b[prog]
+    if cg_target_kernel != 0:
+        collect_externs(prog)
+    layout_classes(prog)
+    register_enums(prog)
+    layout_globals(prog)
+    decls: uint32 = nd_b[prog]
+    cur: uint32 = decls
+    first: uint32 = 0
+    seen: uint32 = 0
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            off: uint32 = 0
+            if ssa_emit_function(cur) != 0:
+                off = ssa_last_fn_start
+            else:
+                off = gen_function(cur)
+            if seen == 0:
+                first = off
+                seen = 1
+        cur = nd_next[cur]
+    gen_class_methods(prog)
+    if seen == 0:
+        cg_fail(9, 0)
+        return 0
+    if cg_target_kernel == 0:
+        link_runtime_externs()
+    resolve_calls()
+    resolve_method_calls()
+    resolve_data_fixups()
+    resolve_entry(first)
+    return first

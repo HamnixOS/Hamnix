@@ -117,6 +117,23 @@ from compiler.cfg import (
     NM_MAX,
 )
 
+# Phase-1b: the width/signedness gate (§2.4, §3.3) reuses codegen's type-node
+# helpers so "accepted" == "emittable through the trivial all-memory round-trip".
+# ssa.ad already coexists with codegen in the host driver build (both are pulled
+# in by the dump driver's `from compiler.*` imports); this adds an ssa -> codegen
+# dependency but NOT the reverse, so there is no import cycle and codegen (the
+# seed module) is untouched. Ph1b restricts construction to values whose low-64
+# bits are correct regardless of source signedness/width — see ssa_type_scalar_ok
+# and the div/mod/shr/ordered-compare bails below.
+from compiler.codegen import (
+    prim_type_size,
+    type_float_width,
+)
+
+from compiler.lexer import (
+    strbuf,
+)
+
 # =======================================================================
 # 2.2  Value / instruction model — opcodes (SVO_*), the LLVM subset.
 # =======================================================================
@@ -262,9 +279,57 @@ ssa_stat_fail_code: uint32 = 0    # last verifier failure code
 # gating flag (2.6 / 6.1)
 ssa_enabled: uint32 = 0
 
+# Program decl chain head (nd_b of ND_PROGRAM), stashed per run so the callee-
+# return-type gate (Phase 1b) can resolve a direct call's return width.
+ssa_prog_decls: uint32 = 0
+
 
 def ssa_enable():
     ssa_enabled = 1
+
+
+# =======================================================================
+# Phase-1b emittability gate (§2.4 / §3.3): the trivial all-memory round-trip
+# keeps every SSA value in a 64-bit stack slot and never truncates, so a value
+# is only correct if its low 64 bits match the source regardless of declared
+# signedness/width.  A scalar is emittable iff it is a full-width (8-byte),
+# non-float integer.  Narrower locals/params would need store-truncation the
+# mem2reg value model does not carry; floats need SSE.  Both bail to the legacy
+# path (escape hatch).
+# =======================================================================
+def ssa_type_scalar_ok(tnode: uint32) -> uint32:
+    if type_float_width(tnode) != 0:
+        return 0
+    if prim_type_size(tnode) != 8:
+        return 0
+    return 1
+
+
+# Byte-compare two interned name spans (both index the lexer strbuf).
+def ssa_name_bytes_eq(off1: uint32, len1: uint32, off2: uint32, len2: uint32) -> uint32:
+    if len1 != len2:
+        return 0
+    i: uint32 = 0
+    while i < len1:
+        if strbuf[off1 + i] != strbuf[off2 + i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Callee-return-type gate: a direct call's result is only emittable if the
+# callee is an in-unit function whose declared return type is a full-width
+# non-float integer (so the returned %rax is a correct full-64-bit value).  An
+# extern / unknown callee, or one returning a narrow/float/aggregate type, is
+# NOT resolvable to a safe width here and bails the function.  Returns 1 iff OK.
+def ssa_callee_rettype_ok(off: uint32, len_: uint32) -> uint32:
+    cur: uint32 = ssa_prog_decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            if ssa_name_bytes_eq(nd_name_off[cur], nd_name_len[cur], off, len_) != 0:
+                return ssa_type_scalar_ok(nd_b[cur])
+        cur = nd_next[cur]
+    return 0
 
 
 def ssa_is_enabled() -> uint32:
@@ -595,9 +660,21 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             # short-circuit control flow, not a value op in Ph1.
             ssa_set_bail(SBR_NONSUBSET_EXPR)
             return 0
+        # Phase-1b emittability: div/mod and arithmetic-shift-right depend on
+        # operand SIGNEDNESS (idiv vs div, sar vs shr) which the Ph1 value model
+        # does not track, so bail them to the legacy path.  shl and the bitwise
+        # ops are low-64-invariant and stay.
+        if op == BINOP_DIV or op == BINOP_IDIV or op == BINOP_MOD or op == BINOP_SHR:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
         arith: uint32 = ssa_binop_is_arith(op)
         cmp: uint32 = ssa_binop_is_cmp(op)
         if arith == 0 and cmp == 0:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
+        # Ordered compares (< <= > >=) pick signed vs unsigned setcc from operand
+        # signedness; only EQ/NEQ are signedness-invariant.  Bail the rest.
+        if cmp != 0 and op != BINOP_EQ and op != BINOP_NEQ:
             ssa_set_bail(SBR_NONSUBSET_EXPR)
             return 0
         la: uint32 = ssa_lower_expr(nd_a[node], bb)
@@ -656,6 +733,12 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             # calling through a local (fn-pointer) -> bail (indirect not modeled).
             ssa_set_bail(SBR_NONSUBSET_EXPR)
             return 0
+        # Phase-1b: the call result lands in %rax full-width; it is only correct
+        # if the callee is an in-unit function returning a full-width non-float
+        # integer.  Extern / narrow / float / unknown callees bail the function.
+        if ssa_callee_rettype_ok(nd_name_off[callee], nd_name_len[callee]) == 0:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
         cv: uint32 = sv_new(SVO_CALL)
         if cv == 0:
             return 0
@@ -671,6 +754,10 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             phi_add_operand(cv, 0, av)
             argc = argc + 1
             arg = nd_next[arg]
+        # Phase-1b: >6 register args would need stack marshalling; bail those.
+        if argc > 6:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
         sv_aux[cv] = argc
         bb_append(bb, cv)
         return cv
@@ -684,12 +771,17 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
 # statement lowering: threads the current block; returns fallthrough block
 # (0 == control cannot fall through, e.g. after return/break/continue).
 # =======================================================================
-def ssa_intern_local(off: uint32, len_: uint32) -> uint32:
+def ssa_intern_local(off: uint32, len_: uint32, tnode: uint32) -> uint32:
     nid: uint32 = nm_intern(off, len_)
     if nid >= NM_MAX:
         ssa_set_bail(SBR_OVERFLOW)
         return NM_MAX
     if ssa_name_promotable(nid) == 0:
+        ssa_set_bail(SBR_NONPROMOTABLE)
+        return NM_MAX
+    # Phase-1b: only full-width non-float integer scalars are emittable through
+    # the trivial round-trip (narrow/float locals bail to the legacy path).
+    if ssa_type_scalar_ok(tnode) == 0:
         ssa_set_bail(SBR_NONPROMOTABLE)
         return NM_MAX
     ssa_islocal[nid] = 1
@@ -707,7 +799,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
         return bb
 
     if k == ND_VAR_DECL:
-        nid: uint32 = ssa_intern_local(nd_name_off[stmt], nd_name_len[stmt])
+        nid: uint32 = ssa_intern_local(nd_name_off[stmt], nd_name_len[stmt], nd_a[stmt])
         if nid >= NM_MAX:
             return bb
         val: uint32 = 0
@@ -742,6 +834,11 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             ssa_set_bail(SBR_NONPROMOTABLE)
             return bb
         aug: uint32 = nd_aux[stmt]
+        # Phase-1b: an augmented op that is div/mod/shr is not emittable (see the
+        # ND_BINARY gate) — bail the whole function.
+        if aug == BINOP_DIV or aug == BINOP_IDIV or aug == BINOP_MOD or aug == BINOP_SHR:
+            ssa_set_bail(SBR_NONSUBSET_STMT)
+            return bb
         rhs: uint32 = ssa_lower_expr(nd_b[stmt], bb)
         if rhs == 0:
             return bb
@@ -1036,7 +1133,12 @@ def ssa_build_function(fn: uint32) -> uint32:
     pidx: uint32 = 0
     while p != 0:
         if nd_kind[p] == ND_PARAM:
-            nid: uint32 = ssa_intern_local(nd_name_off[p], nd_name_len[p])
+            # Phase-1b: >6 params would need stack-arg spill; bail those (the
+            # trivial round-trip only spills the 6 SysV register args).
+            if pidx >= 6:
+                ssa_set_bail(SBR_NONSUBSET_STMT)
+                return 0
+            nid: uint32 = ssa_intern_local(nd_name_off[p], nd_name_len[p], nd_a[p])
             if nid >= NM_MAX:
                 return 0
             pv: uint32 = sv_new(SVO_PARAM)
@@ -1398,6 +1500,7 @@ def ssa_run_program(prog: uint32):
     ssa_stats_reset()
     if prog == 0:
         return
+    ssa_prog_decls = nd_b[prog]
     cur: uint32 = nd_b[prog]
     while cur != 0:
         if nd_kind[cur] == ND_FUNCTION:
