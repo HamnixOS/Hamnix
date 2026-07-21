@@ -104,6 +104,30 @@ echo "[fuzz_adder_diff] float regression result: $REGF_OUT (expect 'ok 6051507 1
 [ "$REGF_OUT" = "ok 6051507 179" ] \
     || fail "codegen.ad miscompiled the float-literal regression fixture: $REGF_OUT"
 
+# ---- Regression: UNSAFE-BLOCK LIVENESS (tests/fuzz/regress_unsafe_liveness.ad).
+#      Pins the --opt register-allocator miscompile that blanked the desktop: an
+#      `unsafe:` body's 2nd+ statements were unscanned by the CFG, truncating a
+#      promoted integer local's live range so two genuinely-overlapping locals
+#      shared one register. Run through codegen.ad with the native optimizer ON
+#      *and* OFF; both must print 333 (pre-fix --opt printed 444). `unsafe:` is a
+#      kernel-only construct the differential fuzzer never emits, so this fixed
+#      case is the guard.
+echo "[fuzz_adder_diff] regression: regress_unsafe_liveness.ad (opt ON+OFF)"
+REGU_OUT="$(python3 - <<'PY'
+import sys; sys.path.insert(0, "tests/fuzz")
+import ad_codegen_host as h
+from pathlib import Path
+wd = Path("build/fuzz_ad_codegen")
+body = open("tests/fuzz/regress_unsafe_liveness.ad").read()
+off = h.run_through_codegen_ad("regru_off", body, wd, opt=False)
+on  = h.run_through_codegen_ad("regru_on",  body, wd, opt=True)
+print(f"{off.kind}/{on.kind} off={off.stdout} on={on.stdout}")
+PY
+)"
+echo "[fuzz_adder_diff] unsafe-liveness result: $REGU_OUT (expect 'ok/ok off=333 on=333')"
+[ "$REGU_OUT" = "ok/ok off=333 on=333" ] \
+    || fail "codegen.ad --opt miscompiled the unsafe-block liveness fixture: $REGU_OUT"
+
 # ---- Seeded differential batch -----------------------------------------
 echo "[fuzz_adder_diff] differential: count=$FUZZ_COUNT seed=$FUZZ_SEED"
 python3 tests/fuzz/adder_fuzzer.py --ad-codegen \
