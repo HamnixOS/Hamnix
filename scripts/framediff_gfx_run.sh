@@ -113,14 +113,28 @@ score_against() {
     rmse_norm="$(printf '%s' "$rmse" | sed -E 's/.*\(([0-9.]+)\).*/\1/')"
     rmse="$(printf '%s' "$rmse" | awk '{print $1}')"
 
+    # STRUCTURAL metric (SSIM + blurred RMSE) — the parity signal. Raw RMSE
+    # over-penalizes a correct large render (area + subpixel AA); SSIM rewards
+    # STRUCTURE (right boxes / text at the right place & size). See
+    # scripts/framediff_metric.py. Fields: ssim (higher=better) + brmse (lower).
+    local m ssim brmse dssim
+    m="$(python3 scripts/framediff_metric.py "$ohb" "$oref" 2>>"$OUT/prep_$engine.log")"
+    ssim="$(printf '%s' "$m"  | sed -E 's/.* ssim=([0-9.]+).*/\1/')"
+    brmse="$(printf '%s' "$m" | sed -E 's/.*brmse=([0-9.]+).*/\1/')"
+    dssim="$(printf '%s' "$m" | sed -E 's/.*dssim=([0-9.]+).*/\1/')"
+    [ -n "$ssim" ] || ssim="n/a"; [ -n "$brmse" ] || brmse="n/a"
+    [ -n "$dssim" ] || dssim="n/a"
+
     montage -label 'hambrowse (pixel)' "$ohb" -label "$engine" "$oref" \
         -label "diff (fuzz $FUZZ)" "$OUT/diff_$engine.png" \
         -tile 3x1 -geometry +4+4 -background '#dddddd' \
         "$OUT/sxs_$engine.png" >/dev/null 2>&1
 
-    printf '%s %s %s %s\n' "$engine" "$rmse" "$rmse_norm" "$ae" >>"$OUT/score.txt"
-    printf '[framediff-gfx] %-10s vs %-8s  RMSE=%-10s (norm %-9s)  AE(fuzz %s)=%s\n' \
-        "$NAME" "$engine" "$rmse" "$rmse_norm" "$FUZZ" "$ae"
+    # score.txt line: engine rmse rmse_norm ae ssim brmse dssim
+    printf '%s %s %s %s %s %s %s\n' "$engine" "$rmse" "$rmse_norm" "$ae" \
+        "$ssim" "$brmse" "$dssim" >>"$OUT/score.txt"
+    printf '[framediff-gfx] %-10s vs %-8s  SSIM=%-9s brmse=%-9s  RMSE=%-9s (norm %s)\n' \
+        "$NAME" "$engine" "$ssim" "$brmse" "$rmse" "$rmse_norm"
     return 0
 }
 

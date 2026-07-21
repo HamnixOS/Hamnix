@@ -98,15 +98,27 @@ score_against() {
     rmse_norm="$(printf '%s' "$rmse" | sed -E 's/.*\(([0-9.]+)\).*/\1/')"
     rmse="$(printf '%s' "$rmse" | awk '{print $1}')"
 
+    # Structural metric (SSIM + blurred RMSE). NB this is a MONO-GRID preview: the
+    # text-dump path lays text on the 8px char grid (no proportional reflow), so
+    # even the structural score is only a rough preview — the parity signal is the
+    # pixel harness (scripts/framediff_gfx_run.sh). See scripts/framediff_metric.py.
+    local m ssim brmse
+    m="$(python3 scripts/framediff_metric.py "$ohb" "$oref" 2>>"$OUT/prep_$engine.log")"
+    ssim="$(printf '%s' "$m"  | sed -E 's/.* ssim=([0-9.]+).*/\1/')"
+    brmse="$(printf '%s' "$m" | sed -E 's/.*brmse=([0-9.]+).*/\1/')"
+    [ -n "$ssim" ] || ssim="n/a"; [ -n "$brmse" ] || brmse="n/a"
+
     # side-by-side: hambrowse | reference | heatmap
     montage -label 'hambrowse' "$ohb" -label "$engine" "$oref" \
         -label 'diff' "$OUT/diff_$engine.png" \
         -tile 3x1 -geometry +4+4 -background '#dddddd' \
         "$OUT/sxs_$engine.png" >/dev/null 2>&1
 
-    printf '%s %s %s %s\n' "$engine" "$rmse" "$rmse_norm" "$ae" >>"$OUT/score.txt"
-    printf '[framediff] %-8s vs %-8s  RMSE=%-10s (norm %-9s)  AE(fuzz8%%)=%s\n' \
-        "$NAME" "$engine" "$rmse" "$rmse_norm" "$ae"
+    # score.txt line: engine rmse rmse_norm ae ssim brmse
+    printf '%s %s %s %s %s %s\n' "$engine" "$rmse" "$rmse_norm" "$ae" \
+        "$ssim" "$brmse" >>"$OUT/score.txt"
+    printf '[framediff] %-8s vs %-8s  SSIM=%-9s brmse=%-9s RMSE=%-10s (norm %-9s)\n' \
+        "$NAME" "$engine" "$ssim" "$brmse" "$rmse" "$rmse_norm"
 }
 
 [ -n "$CHROME_OK" ] && { score_against chromium "$OUT/chromium_raw.png" && have_ref=1; } \
