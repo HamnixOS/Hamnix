@@ -65,10 +65,16 @@ from compiler.ssa import (
     sv_next,
     sv_arg_head,
     sv_count,
+    sv_block,
+    sv_prev,
     arg_val,
     arg_pred,
     arg_next,
     sb_first_val,
+    sb_last_val,
+    sb_succ0,
+    sb_succ1,
+    sb_nsucc,
     sb_rpo,
     sb_rpo_n,
     sb_count,
@@ -118,6 +124,9 @@ from compiler.codegen import (
     emit_store_local_rax,
     emit_load_local_callee,
     emit_store_local_callee,
+    emit_mov_reg_reg,
+    emit_push_callee,
+    emit_pop_callee,
     emit_alu_reg_reg,
     emit_shr_cl_rax,
     emit_sar_cl_rax,
@@ -212,17 +221,35 @@ def se_fix_add(site: uint32, bid: uint32):
     se_fix_n = se_fix_n + 1
 
 
-# Load value `v`'s slot into %rax / %rcx.
+# Load value `v` into %rax / %rcx — register-aware (Phase 3 allocator).  A value
+# the allocator placed in a callee-saved GPR is read with a reg-reg mov; a
+# spilled (SRA_MEM) value is loaded from its stack slot exactly as the trivial
+# all-memory lowering did.  Because every op reads ALL its operands into the
+# rax/rcx SCRATCH before writing its result home, an operand and the result may
+# safely share a physical register (read-before-write), which is why linear scan
+# is free to coalesce them.
 def se_load_rax(v: uint32):
-    emit_load_local_rax(ssa_slot(v))
+    r: uint32 = sra_vreg[v]
+    if r != SRA_MEM:
+        emit_mov_reg_reg(r, 0)                # movq %<r>, %rax
+    else:
+        emit_load_local_rax(ssa_slot(v))
 
 
 def se_load_rcx(v: uint32):
-    emit_load_local_callee(1, ssa_slot(v))   # movq slot,%rcx
+    r: uint32 = sra_vreg[v]
+    if r != SRA_MEM:
+        emit_mov_reg_reg(r, 1)                # movq %<r>, %rcx
+    else:
+        emit_load_local_callee(1, ssa_slot(v))   # movq slot,%rcx
 
 
 def se_store_rax(v: uint32):
-    emit_store_local_rax(ssa_slot(v))
+    r: uint32 = sra_vreg[v]
+    if r != SRA_MEM:
+        emit_mov_reg_reg(0, r)                # movq %rax, %<r>
+    else:
+        emit_store_local_rax(ssa_slot(v))
 
 
 # shlq %cl, %rax -> 48 D3 E0
@@ -255,14 +282,489 @@ def se_emit_jmp_block(bid: uint32):
 
 
 # =======================================================================
-# per-value emission (the trivial all-memory lowering).
+# Phase 3 — SSA linear-scan register allocator (design §5).
+# =======================================================================
+# A value-based (NOT name-based) allocator: it computes precise live intervals
+# from the SSA def/use graph, then a single ordered linear-scan walk (Poletto/
+# Traub-style, spill-the-furthest-endpoint on pressure) assigns each value a
+# physical register or leaves it in memory.  Because liveness is derived from the
+# actual value graph — every use is an explicit operand edge — the liveness
+# UNDER-approximation that let the OLD name-based allocator share one register
+# between two genuinely-overlapping locals (the `unsafe:`/match-body kernel
+# miscompile) CANNOT occur: the overlap-invariant is checked directly
+# (sra_check_overlap) and holds by construction.
+#
+# POOL: only the SysV CALLEE-SAVED GPRs {rbx=3, r12..r15=12..15} are handed out.
+# This is deliberately the safe subset:
+#   * They are disjoint from the rax/rcx/rdx scratch the op sequences use and
+#     from the rdi/rsi/rdx/rcx/r8/r9 call-argument registers, so no operand
+#     load, no call-arg setup and no div/shift fixed-register use can ever
+#     clobber a register-resident value.
+#   * They SURVIVE a call (the callee preserves them), so a value live across a
+#     call needs no special handling — every resident value is automatically
+#     call-safe.  (§5.6.3's caller-saved extension pool for call-free lifetimes
+#     is a future quality add; it needs parallel-copy-safe arg setup.)
+# The prologue saves exactly the pool regs the allocation used, derived from the
+# authoritative assignment (sra_used_mask), and the epilogue restores them on
+# every RET — the one-source-of-truth save-set rule (§5.6.1).
+
+SRA_MEM: uint32 = 0xFFFFFFFF          # sra_vreg sentinel: value lives in memory
+SRA_NOPOOL: uint32 = 0xFFFFFFFF       # pool-index sentinel: no free pool slot
+SRA_MAXV: uint32 = 2048               # >this many SSA values => all-memory fallback
+SRA_MAXB: uint32 = 256                # >this many blocks     => all-memory fallback
+SRA_WORDS: uint32 = 64                # SRA_MAXV / 32 (bitset words per block)
+SRA_NPOOL: uint32 = 5                 # {rbx, r12, r13, r14, r15}
+
+SRA_IN: uint32 = 0
+SRA_OUT: uint32 = 1
+
+# allocatable callee-saved encodings, in push order (filled in sra_pool_init).
+sra_pool: Array[8, uint32]
+sra_pool_ready: uint32 = 0
+
+# per-value allocation results (indexed by vid; sized like the sv_* arenas).
+sra_vreg: Array[65536, uint32]        # assigned x86 encoding, or SRA_MEM
+sra_start: Array[65536, uint32]       # interval start = def position
+sra_end: Array[65536, uint32]         # interval end   = last live position
+sra_defpos: Array[65536, uint32]      # linear position of the defining instruction
+
+# reverse map: linear position -> vid defined there (0 = none).
+sra_posval: Array[8192, uint32]
+
+# per-block linear-position bounds (index = bid).
+sra_blk_start: Array[256, uint32]
+sra_blk_end: Array[256, uint32]
+
+# liveness bitsets: sra_bs[(which*SRA_MAXB + bid)*SRA_WORDS + word], which in {IN,OUT}.
+sra_bs: Array[32768, uint32]          # 2 * 256 * 64
+
+# linear-scan working state: current occupant vid of each pool slot (0 = free).
+sra_regocc: Array[8, uint32]
+
+sra_used_mask: uint32 = 0             # bitmask over pool indices actually assigned
+sra_maxpos: uint32 = 0
+
+# stats + deliberate-break machinery (proves the overlap invariant is load-bearing).
+sra_stat_reg_vals: uint32 = 0         # values that won a register (this function)
+sra_stat_overlap_viol: uint32 = 0     # times sra_check_overlap FIRED (should be 0)
+sra_break_flag: uint32 = 0            # 1 => force an overlap + safety-revert;
+                                     # 2 => force an overlap, SKIP the revert
+                                     #      (lets the fuzzer observe the miscompile).
+
+
+def sra_pool_init():
+    if sra_pool_ready != 0:
+        return
+    sra_pool[0] = 3                    # rbx
+    sra_pool[1] = 12                   # r12
+    sra_pool[2] = 13                   # r13
+    sra_pool[3] = 14                   # r14
+    sra_pool[4] = 15                   # r15
+    sra_pool_ready = 1
+
+
+def sra_popcount(m: uint32) -> uint32:
+    n: uint32 = 0
+    i: uint32 = 0
+    while i < 32:
+        if ((m >> i) & 1) != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+# ---- liveness bitset helpers ------------------------------------------
+def sra_bs_word(which: uint32, bid: uint32, v: uint32) -> uint32:
+    return ((which * SRA_MAXB + bid) * SRA_WORDS) + (v >> 5)
+
+
+def sra_bs_get(which: uint32, bid: uint32, v: uint32) -> uint32:
+    return (sra_bs[sra_bs_word(which, bid, v)] >> (v & 31)) & 1
+
+
+# Set bit; returns 1 iff it was newly set (drives fixpoint change detection).
+def sra_bs_set(which: uint32, bid: uint32, v: uint32) -> uint32:
+    idx: uint32 = sra_bs_word(which, bid, v)
+    bit: uint32 = cast[uint32](1) << (v & 31)
+    if (sra_bs[idx] & bit) != 0:
+        return 0
+    sra_bs[idx] = sra_bs[idx] | bit
+    return 1
+
+
+# True iff op `op` produces an SSA value that may be register-resident.
+def sra_op_defines(op: uint32) -> uint32:
+    if op == SVO_STORE or op == SVO_BR or op == SVO_CONDBR or op == SVO_RET:
+        return 0
+    return 1
+
+
+# Seed liveIn with the block's upward-exposed uses (operands whose def is OUTSIDE
+# this block).  φ operands are edge uses, handled in the liveOut union, so φs are
+# skipped here.
+def sra_seed_uses(bid: uint32, w: uint32):
+    op: uint32 = sv_op[w]
+    if op == SVO_PHI:
+        return
+    if op == SVO_BINOP or op == SVO_ICMP or op == SVO_STORE:
+        if sv_block[sv_a[w]] != bid:
+            sra_bs_set(SRA_IN, bid, sv_a[w])
+        if sv_block[sv_b[w]] != bid:
+            sra_bs_set(SRA_IN, bid, sv_b[w])
+        return
+    if op == SVO_NEG or op == SVO_NOT or op == SVO_BITNOT or op == SVO_LOAD or op == SVO_TRUNC:
+        if sv_block[sv_a[w]] != bid:
+            sra_bs_set(SRA_IN, bid, sv_a[w])
+        return
+    if op == SVO_CONDBR:
+        if sv_block[sv_a[w]] != bid:
+            sra_bs_set(SRA_IN, bid, sv_a[w])
+        return
+    if op == SVO_RET:
+        if sv_a[w] != 0 and sv_block[sv_a[w]] != bid:
+            sra_bs_set(SRA_IN, bid, sv_a[w])
+        return
+    if op == SVO_CALL:
+        node: uint32 = sv_arg_head[w]
+        while node != 0:
+            u: uint32 = arg_val[node]
+            if sv_block[u] != bid:
+                sra_bs_set(SRA_IN, bid, u)
+            node = arg_next[node]
+        return
+
+
+# Union successor `S`'s liveIn into pred `bid`'s liveOut, plus the φ operands of
+# S that flow from edge bid.  Returns 1 iff any bit was newly set.
+def sra_union_succ(bid: uint32, S: uint32) -> uint32:
+    changed: uint32 = 0
+    v: uint32 = 1
+    while v < sv_count:
+        if sra_bs_get(SRA_IN, S, v) != 0:
+            if sra_bs_set(SRA_OUT, bid, v) != 0:
+                changed = 1
+        v = v + 1
+    # φ inputs from this edge are live-out of bid.
+    p: uint32 = sb_first_val[S]
+    while p != 0:
+        if sv_op[p] != SVO_PHI:
+            p = 0
+        else:
+            node: uint32 = sv_arg_head[p]
+            while node != 0:
+                if arg_pred[node] == bid:
+                    if sra_bs_set(SRA_OUT, bid, arg_val[node]) != 0:
+                        changed = 1
+                node = arg_next[node]
+            p = sv_next[p]
+    return changed
+
+
+# Backward dataflow liveness fixpoint over the SSA CFG (value-based).  Monotone
+# union iteration in reverse RPO; converges in <= loop-nesting-depth+2 passes.
+def sra_compute_liveness():
+    # zero the bitsets for every block in play.
+    n: uint32 = 2 * SRA_MAXB * SRA_WORDS
+    i: uint32 = 0
+    while i < n:
+        sra_bs[i] = 0
+        i = i + 1
+    # seed liveIn with upward-exposed uses.
+    bi: uint32 = 0
+    while bi < sb_rpo_n:
+        bid: uint32 = sb_rpo[bi]
+        w: uint32 = sb_first_val[bid]
+        while w != 0:
+            sra_seed_uses(bid, w)
+            w = sv_next[w]
+        bi = bi + 1
+    # fixpoint.
+    changed: uint32 = 1
+    guard: uint32 = 0
+    while changed != 0 and guard < (sb_count + 4):
+        changed = 0
+        guard = guard + 1
+        j: uint32 = sb_rpo_n
+        while j > 0:
+            j = j - 1
+            bid2: uint32 = sb_rpo[j]
+            # liveOut[bid2] |= union of successor liveIn (+ φ edge operands).
+            if sb_nsucc[bid2] >= 1:
+                if sra_union_succ(bid2, sb_succ0[bid2]) != 0:
+                    changed = 1
+            if sb_nsucc[bid2] >= 2:
+                if sra_union_succ(bid2, sb_succ1[bid2]) != 0:
+                    changed = 1
+            # liveIn[bid2] |= liveOut[bid2] minus values DEFINED in bid2.
+            v2: uint32 = 1
+            while v2 < sv_count:
+                if sra_bs_get(SRA_OUT, bid2, v2) != 0 and sv_block[v2] != bid2:
+                    if sra_bs_set(SRA_IN, bid2, v2) != 0:
+                        changed = 1
+                v2 = v2 + 1
+
+
+# Assign linear positions (RPO instruction order) and record block bounds.
+def sra_number_positions():
+    pos: uint32 = 1
+    p: uint32 = 0
+    while p < SRA_MAXV * 2:
+        if p < 8192:
+            sra_posval[p] = 0
+        p = p + 1
+    i: uint32 = 0
+    while i < sb_rpo_n:
+        bid: uint32 = sb_rpo[i]
+        sra_blk_start[bid] = pos
+        last: uint32 = pos
+        v: uint32 = sb_first_val[bid]
+        while v != 0:
+            sra_defpos[v] = pos
+            if pos < 8192:
+                sra_posval[pos] = v
+            last = pos
+            pos = pos + 1
+            v = sv_next[v]
+        sra_blk_end[bid] = last
+        i = i + 1
+    sra_maxpos = pos
+
+
+# Build contiguous over-approximated intervals [def, last-live] from liveness +
+# uses.  Over-approximation (treating a value as live across gaps in its range)
+# is SOUND for allocation — it can only add conflicts, never remove them, so it
+# never lets two live values share a register.  Holes/splitting (§5.4) are the
+# quality refinement deferred past this correctness baseline.
+def sra_extend(v: uint32, upto: uint32):
+    if v != 0:
+        if sra_end[v] < upto:
+            sra_end[v] = upto
+
+
+def sra_build_intervals():
+    v: uint32 = 1
+    while v < sv_count:
+        sra_start[v] = sra_defpos[v]
+        sra_end[v] = sra_defpos[v]
+        v = v + 1
+    # live-in / live-out extend a value across the whole block it is live in.
+    i: uint32 = 0
+    while i < sb_rpo_n:
+        bid: uint32 = sb_rpo[i]
+        e: uint32 = sra_blk_end[bid]
+        v2: uint32 = 1
+        while v2 < sv_count:
+            if sra_bs_get(SRA_IN, bid, v2) != 0 or sra_bs_get(SRA_OUT, bid, v2) != 0:
+                sra_extend(v2, e)
+            v2 = v2 + 1
+        i = i + 1
+    # in-block uses (non-φ at the using instruction's position; φ operands at the
+    # end of the predecessor block they flow from).
+    j: uint32 = 0
+    while j < sb_rpo_n:
+        bid3: uint32 = sb_rpo[j]
+        w: uint32 = sb_first_val[bid3]
+        while w != 0:
+            op: uint32 = sv_op[w]
+            pos: uint32 = sra_defpos[w]
+            if op == SVO_PHI:
+                node: uint32 = sv_arg_head[w]
+                while node != 0:
+                    sra_extend(arg_val[node], sra_blk_end[arg_pred[node]])
+                    node = arg_next[node]
+            elif op == SVO_BINOP or op == SVO_ICMP or op == SVO_STORE:
+                sra_extend(sv_a[w], pos)
+                sra_extend(sv_b[w], pos)
+            elif op == SVO_NEG or op == SVO_NOT or op == SVO_BITNOT or op == SVO_LOAD or op == SVO_TRUNC:
+                sra_extend(sv_a[w], pos)
+            elif op == SVO_CONDBR:
+                sra_extend(sv_a[w], pos)
+            elif op == SVO_RET:
+                if sv_a[w] != 0:
+                    sra_extend(sv_a[w], pos)
+            elif op == SVO_CALL:
+                node2: uint32 = sv_arg_head[w]
+                while node2 != 0:
+                    sra_extend(arg_val[node2], pos)
+                    node2 = arg_next[node2]
+            w = sv_next[w]
+        j = j + 1
+
+
+# Intervals [a] and [b] overlap iff neither ends at-or-before the other starts —
+# the exact condition the linear-scan expiry test (end <= start => free) uses.
+def sra_overlaps(a: uint32, b: uint32) -> uint32:
+    if sra_start[a] < sra_end[b] and sra_start[b] < sra_end[a]:
+        return 1
+    return 0
+
+
+# The linear-scan walk: values in def-position order; expire, then assign a free
+# pool reg, else spill the active value whose interval ends furthest (giving its
+# register to the newcomer only if that strictly shortens total register
+# pressure), else spill the newcomer.
+def sra_linear_scan():
+    k: uint32 = 0
+    while k < SRA_NPOOL:
+        sra_regocc[k] = 0
+        k = k + 1
+    sra_used_mask = 0
+    sra_stat_reg_vals = 0
+    pos: uint32 = 1
+    while pos < sra_maxpos:
+        v: uint32 = 0
+        if pos < 8192:
+            v = sra_posval[pos]
+        if v != 0 and sra_op_defines(sv_op[v]) != 0 and sra_end[v] > sra_start[v]:
+            # expire occupants whose interval ended at-or-before v starts.
+            e: uint32 = 0
+            while e < SRA_NPOOL:
+                occ: uint32 = sra_regocc[e]
+                if occ != 0 and sra_end[occ] <= sra_start[v]:
+                    sra_regocc[e] = 0
+                e = e + 1
+            # find a free pool slot.
+            free: uint32 = SRA_NOPOOL
+            f: uint32 = 0
+            while f < SRA_NPOOL:
+                if sra_regocc[f] == 0 and free == SRA_NOPOOL:
+                    free = f
+                f = f + 1
+            if free != SRA_NOPOOL:
+                sra_regocc[free] = v
+                sra_vreg[v] = sra_pool[free]
+                sra_used_mask = sra_used_mask | (cast[uint32](1) << free)
+                sra_stat_reg_vals = sra_stat_reg_vals + 1
+            else:
+                # all busy: pick the occupant with the furthest endpoint.
+                maxk: uint32 = 0
+                maxend: uint32 = 0
+                kk: uint32 = 0
+                while kk < SRA_NPOOL:
+                    occ2: uint32 = sra_regocc[kk]
+                    if sra_end[occ2] > maxend:
+                        maxend = sra_end[occ2]
+                        maxk = kk
+                    kk = kk + 1
+                if maxend > sra_end[v]:
+                    spilled: uint32 = sra_regocc[maxk]
+                    sra_vreg[spilled] = SRA_MEM
+                    sra_regocc[maxk] = v
+                    sra_vreg[v] = sra_pool[maxk]
+                    sra_stat_reg_vals = sra_stat_reg_vals + 1
+                else:
+                    sra_vreg[v] = SRA_MEM
+        pos = pos + 1
+
+
+# Direct assertion of the invariant the OLD allocator violated: no two values
+# with OVERLAPPING live intervals share a physical register.  Returns 1 on a
+# violation (which, by construction of the linear scan, never happens — unless
+# the deliberate break is armed).
+def sra_check_overlap() -> uint32:
+    a: uint32 = 1
+    while a < sv_count:
+        if sra_vreg[a] != SRA_MEM:
+            b: uint32 = a + 1
+            while b < sv_count:
+                if sra_vreg[b] != SRA_MEM and sra_vreg[b] == sra_vreg[a]:
+                    if sra_overlaps(a, b) != 0:
+                        return 1
+                b = b + 1
+        a = a + 1
+    return 0
+
+
+# Deliberate break: find the first pair of register-assigned values whose
+# intervals overlap (the linear scan gave them DIFFERENT regs) and force them to
+# share one, so sra_check_overlap must fire.  Proves the invariant is load-bearing.
+def sra_force_overlap():
+    a: uint32 = 1
+    while a < sv_count:
+        if sra_vreg[a] != SRA_MEM:
+            b: uint32 = a + 1
+            while b < sv_count:
+                if sra_vreg[b] != SRA_MEM and sra_overlaps(a, b) != 0:
+                    sra_vreg[b] = sra_vreg[a]     # force the illegal share
+                    return
+                b = b + 1
+        a = a + 1
+
+
+# Set every value to memory (the trivial all-memory lowering).  Used as the
+# fallback when the function exceeds the allocator's static bounds, and as the
+# safety revert if the overlap check ever fires.
+def sra_all_memory():
+    v: uint32 = 0
+    while v < sv_count:
+        sra_vreg[v] = SRA_MEM
+        v = v + 1
+    sra_used_mask = 0
+    sra_stat_reg_vals = 0
+
+
+# Whole allocation for the current function (SSA already built + verified, so RPO
+# and dom info are current).  Fills sra_vreg / sra_used_mask.
+def sra_allocate():
+    sra_pool_init()
+    sra_all_memory()
+    if sv_count > SRA_MAXV or sb_count > SRA_MAXB:
+        return                                  # too big -> all memory (correct)
+    sra_number_positions()
+    sra_compute_liveness()
+    sra_build_intervals()
+    sra_linear_scan()
+    if sra_break_flag != 0:
+        sra_force_overlap()
+    if sra_check_overlap() != 0:
+        sra_stat_overlap_viol = sra_stat_overlap_viol + 1
+        if sra_break_flag != 2:
+            sra_all_memory()                     # safety net: never emit a violation
+
+
+# Prologue callee-saved SAVE set = exactly the pool regs the allocation used
+# (sra_used_mask), pushed in pool order BEFORE `push %rbp` so `leave` (which pops
+# rbp) leaves them exposed on top of the stack for the epilogue.  With no
+# register allocated (sra_used_mask == 0) this collapses to the trivial prologue,
+# byte-identical to the all-memory lowering.
+def se_emit_callee_saves():
+    p: uint32 = 0
+    while p < SRA_NPOOL:
+        if ((sra_used_mask >> p) & 1) != 0:
+            emit_push_callee(sra_pool[p])
+        p = p + 1
+
+
+# Epilogue: `leave` (rsp=rbp; pop rbp) exposes the saved callee regs, popped in
+# REVERSE pool order, then `ret`.  Emitted at every SVO_RET — SSA guarantees each
+# block ends in exactly one terminator, so no return path can forget the restore.
+def se_emit_epilogue():
+    emit_leave()
+    p: uint32 = SRA_NPOOL
+    while p > 0:
+        p = p - 1
+        if ((sra_used_mask >> p) & 1) != 0:
+            emit_pop_callee(sra_pool[p])
+    emit_ret()
+
+
+# =======================================================================
+# per-value emission (register-resident where allocated, else all-memory).
 # =======================================================================
 def ssa_emit_value(v: uint32):
     op: uint32 = sv_op[v]
 
     if op == SVO_PARAM:
-        # spill the incoming SysV arg register into the value's slot.
-        emit_store_local_callee(sysv_arg_reg_enc(sv_aux[v]), ssa_slot(v))
+        # move the incoming SysV arg register to the param's home: its callee-
+        # saved register if allocated, else its stack slot.  Params are processed
+        # before any body code and each move's SOURCE is an arg register while its
+        # DEST is a callee-saved register (disjoint sets), so an earlier param's
+        # move never clobbers a later param's still-live incoming arg register.
+        r: uint32 = sra_vreg[v]
+        if r != SRA_MEM:
+            emit_mov_reg_reg(sysv_arg_reg_enc(sv_aux[v]), r)
+        else:
+            emit_store_local_callee(sysv_arg_reg_enc(sv_aux[v]), ssa_slot(v))
         return
 
     if op == SVO_CONST:
@@ -387,11 +889,19 @@ def ssa_emit_call(v: uint32):
             se_call_args[argc - 1 - j] = arg_val[node2]
         j = j + 1
         node2 = arg_next[node2]
-    # Load each argument into its SysV integer register (sources are memory
-    # slots, so the loads are order-independent).
+    # Load each argument into its SysV integer register.  Sources are either a
+    # stack slot or a CALLEE-SAVED register (the allocator's only pool), both
+    # disjoint from the arg registers being written, so the loads stay order-
+    # independent — writing an arg register can never clobber a not-yet-read
+    # source.
     i: uint32 = 0
     while i < argc:
-        emit_load_local_callee(sysv_arg_reg_enc(i), ssa_slot(se_call_args[i]))
+        av: uint32 = se_call_args[i]
+        ar: uint32 = sra_vreg[av]
+        if ar != SRA_MEM:
+            emit_mov_reg_reg(ar, sysv_arg_reg_enc(i))
+        else:
+            emit_load_local_callee(sysv_arg_reg_enc(i), ssa_slot(av))
         i = i + 1
     emit_xor_eax_eax()                           # AL = 0 (variadic ABI, matches legacy default)
     emit_b(0xE8)                                 # call rel32
@@ -425,7 +935,7 @@ def ssa_emit_edge_copies(pred: uint32, succ: uint32):
             else:
                 node = arg_next[node]
         if src != 0:
-            emit_load_local_rax(ssa_slot(src))
+            se_load_rax(src)                     # register-aware read of the source
             emit_store_local_rax(ssa_temp_slot(v2))
         v2 = sv_next[v2]
 
@@ -437,8 +947,7 @@ def ssa_emit_term(v: uint32, bb: uint32):
             se_load_rax(sv_a[v])
         else:
             emit_xor_rax_rax()
-        emit_leave()
-        emit_ret()
+        se_emit_epilogue()
         return
     if op == SVO_BR:
         tgt: uint32 = sv_a[v]
@@ -482,6 +991,12 @@ def ssa_emit_function(fn: uint32) -> uint32:
         ssa_emit_stat_fallback = ssa_emit_stat_fallback + 1
         return 0
 
+    # Phase 3: SSA linear-scan register allocation (value-based liveness ->
+    # intervals -> linear scan -> overlap-invariant check).  Fills sra_vreg /
+    # sra_used_mask; on any bound overflow it falls back to all-memory, which
+    # reproduces the trivial lowering exactly.
+    sra_allocate()
+
     ssa_nvals = sv_count
     ssa_last_fn_start = code_len
     se_fix_n = 0
@@ -491,12 +1006,18 @@ def ssa_emit_function(fn: uint32) -> uint32:
         se_bid_off[b] = 0
         b = b + 1
 
-    # symbol + prologue.  These SSA functions clobber only caller-saved GPRs
-    # (rax/rcx/rdx + arg regs) plus rbp, so no callee-saved save/restore is
-    # needed and the epilogue is a plain leave; ret.
+    # symbol + prologue.  Register-resident values live in CALLEE-SAVED GPRs, so
+    # the prologue pushes exactly the pool regs the allocation used (sra_used_mask)
+    # and the epilogue pops them on every return.  An odd number of callee pushes
+    # is padded by 8 so %rsp stays 16-byte aligned at inner call sites.  With no
+    # register allocated this is byte-identical to the trivial all-memory prologue.
     fn_define(nd_name_off[fn], nd_name_len[fn], code_len)
+    kpop: uint32 = sra_popcount(sra_used_mask)
     frame: uint32 = ((2 * sv_count * 8) + 15) & cast[uint32](0xFFFFFFF0)
+    if (kpop & 1) != 0:
+        frame = frame + 8
     emit_endbr64()
+    se_emit_callee_saves()
     emit_push_rbp()
     emit_mov_rsp_rbp()
     if frame > 0:
