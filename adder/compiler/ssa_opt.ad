@@ -1,0 +1,377 @@
+# adder/compiler/ssa_opt.ad
+#
+# Phase 2 of the SSA optimizer rewrite (docs/adder_ssa_optimizer_design.md §4):
+# the OPTIMIZATION PASSES on SSA.  These transform the Phase-1 SSA IR (ssa.ad)
+# BEFORE the trivial all-memory lowering in ssa_emit.ad — they are independent of
+# the register allocator (Phase 3) and rely only on SSA + the dominator tree
+# (both already produced by ssa.ad).
+#
+# PIPELINE (LLVM canon, §4):
+#     build SSA - verify - SCCP - InstCombine - GVN/CSE - LICM - DCE - verify
+# The middle passes iterate to a small fixpoint, then a final DCE sweeps corpses.
+#
+# WHY THESE ARE SAFE ON SSA
+# -------------------------
+#  * DCE — an SSA value with no uses and no side effect is dead by construction;
+#    a store to a global is a side effect and is NEVER removed (this structurally
+#    kills the old dead-store global-cap bug).
+#  * SCCP — a joint value+edge lattice folds constants and prunes provably-dead
+#    branch edges; strictly stronger than the old separate constfold/constbranch.
+#  * GVN/CSE — hash-cons pure instructions; an earlier congruent value whose def
+#    DOMINATES the use replaces the redundant one (no name-clobber scan needed,
+#    SSA values are immutable).
+#  * LICM — an instruction is loop-invariant iff ALL its operands are defined
+#    OUTSIDE the loop.  The old loop-condition-CSE hoist bug CANNOT recur: a
+#    body-mutated value is a DIFFERENT SSA value with a def inside the loop, so it
+#    fails the invariance test trivially.
+#  * InstCombine — algebraic identities (x+0, x*1, x&x, x^x, x*2^k -> shl, ...).
+#
+# GATING / ISOLATION
+# ------------------
+# Reached ONLY from ssa_emit_function (ssa_emit.ad), which runs ONLY under the
+# ADDER_OPT2 gate.  With the gate off this module is never entered, so codegen
+# output is byte-for-byte the pre-SSA path.  Like ssa.ad / ssa_emit.ad this stays
+# OUT of the seed MODULES list (host-only); codegen.ad is untouched.  Every pass
+# preserves SSA well-formedness; ssa_verify re-runs after the pipeline (and, in
+# this host lane, after each pass — ssa_opt_verify_fail counts any corruption).
+
+from compiler.parser import (
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_IDIV,
+    BINOP_MOD,
+    BINOP_EQ,
+    BINOP_NEQ,
+    BINOP_LT,
+    BINOP_LTE,
+    BINOP_GT,
+    BINOP_GTE,
+    BINOP_BIT_OR,
+    BINOP_BIT_AND,
+    BINOP_BIT_XOR,
+    BINOP_SHL,
+    BINOP_SHR,
+)
+
+from compiler.ssa import (
+    sv_op,
+    sv_type,
+    sv_a,
+    sv_b,
+    sv_c,
+    sv_aux,
+    sv_imm,
+    sv_block,
+    sv_ast,
+    sv_next,
+    sv_prev,
+    sv_pos,
+    sv_arg_head,
+    sv_argn,
+    sv_count,
+    arg_val,
+    arg_pred,
+    arg_next,
+    sb_first_val,
+    sb_last_val,
+    sb_term,
+    sb_nval,
+    sb_succ0,
+    sb_succ1,
+    sb_nsucc,
+    sb_pred_head,
+    sb_npred,
+    sb_idom,
+    sb_rpo,
+    sb_rpo_n,
+    sb_count,
+    sb_entry,
+    sb_visited,
+    pl_bid,
+    pl_next,
+    ssa_build_domtree,
+    ssa_build_rpo,
+    ssa_dominates,
+    ssa_is_terminator,
+    ssa_verify,
+    SSAV_OK,
+    SVO_NULL,
+    SVO_CONST,
+    SVO_FCONST,
+    SVO_UNDEF,
+    SVO_PARAM,
+    SVO_BINOP,
+    SVO_NEG,
+    SVO_NOT,
+    SVO_BITNOT,
+    SVO_ICMP,
+    SVO_FCMP,
+    SVO_TRUNC,
+    SVO_ZEXT,
+    SVO_SEXT,
+    SVO_BITCAST,
+    SVO_I2F,
+    SVO_F2I,
+    SVO_ALLOCA,
+    SVO_LOAD,
+    SVO_STORE,
+    SVO_GEP,
+    SVO_BR,
+    SVO_CONDBR,
+    SVO_RET,
+    SVO_PHI,
+    SVO_CALL,
+    SVO_SYSCALL,
+    SVO_GLOBALADDR,
+    SVO_PERCPU,
+    SVT_I1,
+    SVT_I64,
+)
+
+# =======================================================================
+# scratch arenas (per-run; sized like the value arena)
+# =======================================================================
+sv_mark: Array[65536, uint32]      # DCE liveness scratch (1 = live)
+opt_stack: Array[65536, uint32]    # generic worklist
+opt_sp: uint32 = 0
+
+OPT_STACK_MAX: uint32 = 65536
+
+# =======================================================================
+# pass enable/disable mask (ADDER_OPT_DISABLE names, §6.1).  Bit set => the pass
+# is DISABLED.  Parsed by ssa_opt_parse_disable (driver wires it next to
+# ssa_parse_env); default 0 => all passes on.
+# =======================================================================
+SSAOPT_SCCP: uint32 = 1
+SSAOPT_INSTCOMBINE: uint32 = 2
+SSAOPT_GVN: uint32 = 4
+SSAOPT_LICM: uint32 = 8
+SSAOPT_DCE: uint32 = 16
+ssa_opt_disabled_mask: uint32 = 0
+
+# whole-pipeline gate (independent of ADDER_OPT2 driver gate; default on so the
+# emit lane always optimizes when it reaches here).
+ssa_opt_pipeline_on: uint32 = 1
+
+# per-pass verify (host lane): re-verify after every pass and count corruption.
+ssa_opt_verify_each: uint32 = 1
+
+# =======================================================================
+# stats / evidence counters (exposed via the driver's OPT2 report)
+# =======================================================================
+ssa_opt_dce_removed: uint32 = 0
+ssa_opt_sccp_folded: uint32 = 0
+ssa_opt_sccp_edges_pruned: uint32 = 0
+ssa_opt_gvn_replaced: uint32 = 0
+ssa_opt_licm_hoisted: uint32 = 0
+ssa_opt_instcombine_count: uint32 = 0
+ssa_opt_verify_fail: uint32 = 0
+ssa_opt_runs: uint32 = 0
+
+
+def ssa_opt_stats_reset():
+    ssa_opt_dce_removed = 0
+    ssa_opt_sccp_folded = 0
+    ssa_opt_sccp_edges_pruned = 0
+    ssa_opt_gvn_replaced = 0
+    ssa_opt_licm_hoisted = 0
+    ssa_opt_instcombine_count = 0
+    ssa_opt_verify_fail = 0
+    ssa_opt_runs = 0
+
+
+def ssa_opt_pass_disabled(bit: uint32) -> uint32:
+    if (ssa_opt_disabled_mask & bit) != 0:
+        return 1
+    return 0
+
+
+# =======================================================================
+# intrusive-list surgery: unlink value `v` from its block.  Positions (sv_pos)
+# stay a MONOTONIC subsequence of the original order, so intra-block dominance
+# (def-pos < use-pos) remains valid without renumbering.
+# =======================================================================
+def ssa_unlink_value(v: uint32):
+    bb: uint32 = sv_block[v]
+    if bb == 0:
+        return
+    pv: uint32 = sv_prev[v]
+    nx: uint32 = sv_next[v]
+    if pv != 0:
+        sv_next[pv] = nx
+    else:
+        sb_first_val[bb] = nx
+    if nx != 0:
+        sv_prev[nx] = pv
+    else:
+        sb_last_val[bb] = pv
+    if sb_nval[bb] > 0:
+        sb_nval[bb] = sb_nval[bb] - 1
+    sv_block[v] = 0
+    sv_next[v] = 0
+    sv_prev[v] = 0
+
+
+# Insert value `v` immediately BEFORE the terminator of block `bb` (used by LICM
+# to move an invariant into the pre-header).  `v` must currently be unlinked.
+def ssa_insert_before_term(bb: uint32, v: uint32):
+    if bb == 0 or v == 0:
+        return
+    term: uint32 = sb_last_val[bb]
+    sv_block[v] = bb
+    sb_nval[bb] = sb_nval[bb] + 1
+    if term == 0:
+        # empty block: v becomes the sole value.
+        sb_first_val[bb] = v
+        sb_last_val[bb] = v
+        sv_prev[v] = 0
+        sv_next[v] = 0
+        ssa_renumber(bb)
+        return
+    pv: uint32 = sv_prev[term]
+    sv_prev[v] = pv
+    sv_next[v] = term
+    sv_prev[term] = v
+    if pv != 0:
+        sv_next[pv] = v
+    else:
+        sb_first_val[bb] = v
+    ssa_renumber(bb)
+
+
+# Re-stamp sv_pos across a block so positions stay dense + ordered.
+def ssa_renumber(bb: uint32):
+    p: uint32 = 0
+    cur: uint32 = sb_first_val[bb]
+    while cur != 0:
+        sv_pos[cur] = p
+        p = p + 1
+        cur = sv_next[cur]
+
+
+# =======================================================================
+# operand iteration helpers (shared by DCE / GVN / LICM).  A value's VALUE
+# operands are its data dependencies; block-id fields (BR/CONDBR targets) are
+# NOT operands.
+# =======================================================================
+# Number of fixed (non-list) value operands carried in sv_a/sv_b.
+def ssa_op_has_a(op: uint32) -> uint32:
+    if op == SVO_BINOP or op == SVO_ICMP or op == SVO_FCMP or op == SVO_GEP or op == SVO_STORE:
+        return 1
+    if op == SVO_NEG or op == SVO_NOT or op == SVO_BITNOT or op == SVO_LOAD:
+        return 1
+    if op == SVO_TRUNC or op == SVO_ZEXT or op == SVO_SEXT or op == SVO_BITCAST or op == SVO_I2F or op == SVO_F2I:
+        return 1
+    if op == SVO_CONDBR:
+        return 1
+    if op == SVO_RET:
+        return 1
+    return 0
+
+
+def ssa_op_has_b(op: uint32) -> uint32:
+    if op == SVO_BINOP or op == SVO_ICMP or op == SVO_FCMP or op == SVO_GEP or op == SVO_STORE:
+        return 1
+    return 0
+
+
+# =======================================================================
+# 4.4  DCE — mark-sweep over SSA.
+# =======================================================================
+def ssa_dce_side_effect(op: uint32) -> uint32:
+    # stores / calls / syscalls / terminators are live regardless of use.
+    if op == SVO_STORE or op == SVO_CALL or op == SVO_SYSCALL:
+        return 1
+    if op == SVO_BR or op == SVO_CONDBR or op == SVO_RET:
+        return 1
+    # a %gs/percpu access is a volatile read — never dead (conservative).
+    if op == SVO_PERCPU:
+        return 1
+    return 0
+
+
+def dce_visit(w: uint32):
+    if w == 0:
+        return
+    if w >= sv_count:
+        return
+    if sv_mark[w] != 0:
+        return
+    if opt_sp >= OPT_STACK_MAX:
+        return
+    sv_mark[w] = 1
+    opt_stack[opt_sp] = w
+    opt_sp = opt_sp + 1
+
+
+# Push v's value operands onto the worklist.
+def dce_push_operands(v: uint32):
+    op: uint32 = sv_op[v]
+    if ssa_op_has_a(op) != 0:
+        dce_visit(sv_a[v])
+    if ssa_op_has_b(op) != 0:
+        dce_visit(sv_b[v])
+    if op == SVO_PHI or op == SVO_CALL:
+        node: uint32 = sv_arg_head[v]
+        while node != 0:
+            dce_visit(arg_val[node])
+            node = arg_next[node]
+
+
+def ssa_dce():
+    if ssa_opt_pass_disabled(SSAOPT_DCE) != 0:
+        return
+    # clear marks
+    i: uint32 = 1
+    while i < sv_count:
+        sv_mark[i] = 0
+        i = i + 1
+    # seed: every LINKED side-effecting value.
+    opt_sp = 0
+    i = 1
+    while i < sv_count:
+        if sv_block[i] != 0:
+            if ssa_dce_side_effect(sv_op[i]) != 0:
+                dce_visit(i)
+        i = i + 1
+    # propagate liveness through operands.
+    while opt_sp > 0:
+        opt_sp = opt_sp - 1
+        v: uint32 = opt_stack[opt_sp]
+        dce_push_operands(v)
+    # sweep: unlink every unmarked non-terminator value.
+    b: uint32 = 1
+    while b < sb_count:
+        cur: uint32 = sb_first_val[b]
+        while cur != 0:
+            nxt: uint32 = sv_next[cur]
+            if sv_mark[cur] == 0 and ssa_is_terminator(sv_op[cur]) == 0:
+                ssa_unlink_value(cur)
+                ssa_opt_dce_removed = ssa_opt_dce_removed + 1
+            cur = nxt
+        b = b + 1
+
+
+# =======================================================================
+# pass manager (§4).  Runs after ssa_build_function, before the trivial lowering.
+# =======================================================================
+def ssa_opt_verify_check():
+    if ssa_opt_verify_each == 0:
+        return
+    rc: uint32 = ssa_verify()
+    if rc != SSAV_OK:
+        ssa_opt_verify_fail = ssa_opt_verify_fail + 1
+
+
+def ssa_opt_run(entry: uint32):
+    if ssa_opt_pipeline_on == 0:
+        return
+    ssa_opt_runs = ssa_opt_runs + 1
+    # dominator tree + RPO for the dominance-aware passes.
+    ssa_build_domtree()
+    # Phase-2 increment 1: DCE only.  Later increments add SCCP/GVN/LICM/
+    # InstCombine before this final sweep.
+    ssa_dce()
+    ssa_opt_verify_check()
