@@ -80,14 +80,21 @@ def parse_dump(text):
         elif line.startswith("TITLE "):
             title = line[6:]
         elif line.startswith("FILL "):
-            # FILL top bot lx rx #rrggbb [rad] [z] — an element background rect.
-            # `z` is the stacking key (default 0); a CONTAINER's own background is
-            # graded to a negative z so it paints BEHIND the descendant fills it
-            # encloses, mirroring the z-sort in lib/htmlpage.ad. Older dumps omit
-            # the trailing rad/z fields, so treat them as optional (default 0).
+            # FILL top bot lx rx #rrggbb [rad] [z] [padt] [padb] [b<col>] — an
+            # element background rect. `z` is the stacking key (default 0); a
+            # CONTAINER's own background is graded to a negative z so it paints
+            # BEHIND the descendant fills it encloses, mirroring the z-sort in
+            # lib/htmlpage.ad. `padt`/`padb` are the top/bottom PADDING-box pixel
+            # extensions the engine grows onto the fill so a padded coloured panel
+            # (nav bar / hero) covers its vertical padding like a real browser —
+            # without them a `padding:8px` nav bar renders 16px shorter than
+            # chrome/firefox. Older dumps omit the trailing fields (default 0).
             p = line.split()
             fz = int(p[7]) if len(p) > 7 else 0
-            fills.append((int(p[1]), int(p[2]), int(p[3]), int(p[4]), p[5], fz))
+            padt = int(p[8]) if len(p) > 8 else 0
+            padb = int(p[9]) if len(p) > 9 else 0
+            fills.append((int(p[1]), int(p[2]), int(p[3]), int(p[4]), p[5], fz,
+                          padt, padb))
         elif line.startswith("RULE row "):
             p = line.split()
             rules[int(p[2])] = int(p[4])
@@ -174,12 +181,15 @@ def render(text, out_path, url="about:demo", win_title="Browser",
     # Paint in STABLE z-index order (mirror lib/htmlpage.ad): lower z first, so a
     # container's negative-z background lands BEHIND the descendant fills (item
     # chips) it encloses, and positioned boxes' explicit z-index still wins.
-    for (ftop, fbot, lx, rx, col, fz) in sorted(fills, key=lambda f: f[5]):
+    for (ftop, fbot, lx, rx, col, fz, padt, padb) in sorted(
+            fills, key=lambda f: f[5]):
         if ftop >= total_rows:
             continue
         fb = min(fbot, total_rows)
-        y = CONTENT_Y + ftop * LINE_H
-        h = (fb - ftop) * LINE_H
+        # Grow the fill by the engine-emitted vertical padding so a padded panel
+        # (nav bar, hero) covers its padding box, matching real browsers.
+        y = CONTENT_Y + ftop * LINE_H - padt
+        h = (fb - ftop) * LINE_H + padt + padb
         if h > 0 and rx > lx:
             rect(lx, y, rx - lx, h, col)
 
