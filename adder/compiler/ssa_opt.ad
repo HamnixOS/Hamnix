@@ -55,6 +55,10 @@ from compiler.parser import (
     BINOP_SHR,
 )
 
+from compiler.ir import (
+    ir_eval_binop,
+)
+
 from compiler.ssa import (
     sv_op,
     sv_type,
@@ -138,6 +142,35 @@ opt_stack: Array[65536, uint32]    # generic worklist
 opt_sp: uint32 = 0
 
 OPT_STACK_MAX: uint32 = 65536
+SSA_BB_MAX_LOCAL: uint32 = 1024
+
+# ----- SCCP lattice + worklists (Wegman-Zadeck) ------------------------
+LAT_TOP: uint32 = 0                # unknown (optimistic)
+LAT_CONST: uint32 = 1
+LAT_BOT: uint32 = 2               # overdefined
+sccp_lat: Array[65536, uint32]
+sccp_cv: Array[65536, uint64]
+sccp_bexec: Array[1024, uint32]   # block reachable
+sccp_e0: Array[1024, uint32]      # edge (b -> succ0) executable
+sccp_e1: Array[1024, uint32]      # edge (b -> succ1) executable
+# def -> users map (reverse operand edges), rebuilt per SCCP run.
+u_head: Array[65536, uint32]
+u_next: Array[262144, uint32]
+u_valn: Array[262144, uint32]     # the using value id
+u_count: uint32 = 1
+U_MAX: uint32 = 262144
+# block + value worklists (dedup-flagged so they stay bounded).
+sccp_bwl: Array[1024, uint32]
+sccp_bsp: uint32 = 0
+sccp_bq: Array[1024, uint32]
+sccp_vwl: Array[65536, uint32]
+sccp_vsp: uint32 = 0
+sccp_vq: Array[65536, uint32]
+# sccp_compute / meet results (Adder has no tuple return; use scratch globals).
+res_lat: uint32 = 0
+res_cv: uint64 = 0
+acc_lat: uint32 = 0
+acc_cv: uint64 = 0
 
 # =======================================================================
 # pass enable/disable mask (ADDER_OPT_DISABLE names, §6.1).  Bit set => the pass
@@ -804,6 +837,401 @@ def ssa_licm():
 
 
 # =======================================================================
+# 4.1  SCCP — Sparse Conditional Constant Propagation (Wegman-Zadeck).
+# Joint value-lattice (TOP -> CONST -> BOTTOM) + CFG edge reachability.  Folds
+# constant instructions and marks branch edges dead when the condition is a known
+# constant — subsuming the old constfold + constbranch + much of copyprop, done
+# right (propagates through phis and around loops).  Constant evaluation reuses
+# ir.ad's ir_eval_binop so folded values match the legacy runtime semantics
+# EXACTLY; only ops with unambiguous 64-bit semantics are folded (ADD/SUB/MUL/
+# AND/OR/XOR/SHL, EQ/NEQ, NEG/BITNOT/NOT); div/mod/shr/ordered-compare/trunc stay
+# overdefined (conservative — never a wrong fold).
+# =======================================================================
+def sccp_binop_foldable(op: uint32) -> uint32:
+    if op == BINOP_ADD or op == BINOP_SUB or op == BINOP_MUL:
+        return 1
+    if op == BINOP_BIT_AND or op == BINOP_BIT_OR or op == BINOP_BIT_XOR:
+        return 1
+    if op == BINOP_SHL:
+        return 1
+    return 0
+
+
+def sccp_add_use(operand: uint32, user: uint32):
+    if operand == 0 or operand >= sv_count:
+        return
+    if u_count >= U_MAX:
+        return
+    node: uint32 = u_count
+    u_count = u_count + 1
+    u_valn[node] = user
+    u_next[node] = u_head[operand]
+    u_head[operand] = node
+
+
+def sccp_build_uses():
+    i: uint32 = 0
+    while i < sv_count:
+        u_head[i] = 0
+        i = i + 1
+    u_count = 1
+    w: uint32 = 1
+    while w < sv_count:
+        if sv_block[w] != 0:
+            op: uint32 = sv_op[w]
+            if ssa_op_has_a(op) != 0:
+                sccp_add_use(sv_a[w], w)
+            if ssa_op_has_b(op) != 0:
+                sccp_add_use(sv_b[w], w)
+            if op == SVO_PHI or op == SVO_CALL:
+                node: uint32 = sv_arg_head[w]
+                while node != 0:
+                    sccp_add_use(arg_val[node], w)
+                    node = arg_next[node]
+        w = w + 1
+
+
+def sccp_edge_exec(pred: uint32, succ: uint32) -> uint32:
+    if sb_succ0[pred] == succ and sccp_e0[pred] != 0:
+        return 1
+    if sb_succ1[pred] == succ and sccp_e1[pred] != 0:
+        return 1
+    return 0
+
+
+def sccp_bwl_push(b: uint32):
+    if sccp_bq[b] != 0:
+        return
+    if sccp_bsp >= SSA_BB_MAX_LOCAL:
+        return
+    sccp_bq[b] = 1
+    sccp_bwl[sccp_bsp] = b
+    sccp_bsp = sccp_bsp + 1
+
+
+def sccp_vwl_push(v: uint32):
+    if v == 0 or v >= sv_count:
+        return
+    if sccp_vq[v] != 0:
+        return
+    if sccp_vsp >= OPT_STACK_MAX:
+        return
+    sccp_vq[v] = 1
+    sccp_vwl[sccp_vsp] = v
+    sccp_vsp = sccp_vsp + 1
+
+
+def sccp_meet_acc(lat2: uint32, cv2: uint64):
+    if lat2 == LAT_TOP:
+        return
+    if acc_lat == LAT_TOP:
+        acc_lat = lat2
+        acc_cv = cv2
+        return
+    if acc_lat == LAT_BOT:
+        return
+    if lat2 == LAT_BOT:
+        acc_lat = LAT_BOT
+        return
+    # both CONST
+    if acc_cv != cv2:
+        acc_lat = LAT_BOT
+
+
+# Compute the lattice of value v into res_lat/res_cv from current operand states.
+def sccp_compute(v: uint32):
+    op: uint32 = sv_op[v]
+    if op == SVO_CONST:
+        res_lat = LAT_CONST
+        res_cv = sv_imm[v]
+        return
+    if op == SVO_PHI:
+        acc_lat = LAT_TOP
+        acc_cv = cast[uint64](0)
+        bb: uint32 = sv_block[v]
+        node: uint32 = sv_arg_head[v]
+        while node != 0:
+            pred: uint32 = arg_pred[node]
+            if sccp_edge_exec(pred, bb) != 0:
+                ov: uint32 = arg_val[node]
+                sccp_meet_acc(sccp_lat[ov], sccp_cv[ov])
+            node = arg_next[node]
+        res_lat = acc_lat
+        res_cv = acc_cv
+        return
+    if op == SVO_BINOP:
+        a: uint32 = sv_a[v]
+        b: uint32 = sv_b[v]
+        la: uint32 = sccp_lat[a]
+        lb: uint32 = sccp_lat[b]
+        if la == LAT_BOT or lb == LAT_BOT:
+            res_lat = LAT_BOT
+            return
+        if la == LAT_TOP or lb == LAT_TOP:
+            res_lat = LAT_TOP
+            return
+        if sccp_binop_foldable(sv_aux[v]) != 0:
+            res_lat = LAT_CONST
+            res_cv = ir_eval_binop(sv_aux[v], sccp_cv[a], sccp_cv[b])
+            return
+        res_lat = LAT_BOT
+        return
+    if op == SVO_ICMP:
+        aux: uint32 = sv_aux[v]
+        if aux == BINOP_EQ or aux == BINOP_NEQ:
+            a2: uint32 = sv_a[v]
+            b2: uint32 = sv_b[v]
+            la2: uint32 = sccp_lat[a2]
+            lb2: uint32 = sccp_lat[b2]
+            if la2 == LAT_BOT or lb2 == LAT_BOT:
+                res_lat = LAT_BOT
+                return
+            if la2 == LAT_TOP or lb2 == LAT_TOP:
+                res_lat = LAT_TOP
+                return
+            eqv: uint32 = 0
+            if sccp_cv[a2] == sccp_cv[b2]:
+                eqv = 1
+            r: uint32 = 0
+            if aux == BINOP_EQ:
+                r = eqv
+            else:
+                if eqv == 0:
+                    r = 1
+            res_lat = LAT_CONST
+            res_cv = cast[uint64](r)
+            return
+        res_lat = LAT_BOT
+        return
+    if op == SVO_NEG:
+        a3: uint32 = sv_a[v]
+        if sccp_lat[a3] == LAT_CONST:
+            res_lat = LAT_CONST
+            res_cv = cast[uint64](0) - sccp_cv[a3]
+            return
+        res_lat = sccp_lat[a3]
+        return
+    if op == SVO_BITNOT:
+        a4: uint32 = sv_a[v]
+        if sccp_lat[a4] == LAT_CONST:
+            res_lat = LAT_CONST
+            res_cv = ~sccp_cv[a4]
+            return
+        res_lat = sccp_lat[a4]
+        return
+    if op == SVO_NOT:
+        a5: uint32 = sv_a[v]
+        if sccp_lat[a5] == LAT_CONST:
+            res_lat = LAT_CONST
+            if sccp_cv[a5] == cast[uint64](0):
+                res_cv = cast[uint64](1)
+            else:
+                res_cv = cast[uint64](0)
+            return
+        res_lat = sccp_lat[a5]
+        return
+    # PARAM / CALL / LOAD / UNDEF / GLOBALADDR / PERCPU / TRUNC / casts -> overdefined.
+    res_lat = LAT_BOT
+
+
+def sccp_eval_value(v: uint32):
+    sccp_compute(v)
+    changed: uint32 = 0
+    if res_lat != sccp_lat[v]:
+        changed = 1
+    elif res_lat == LAT_CONST and res_cv != sccp_cv[v]:
+        changed = 1
+    if changed != 0:
+        sccp_lat[v] = res_lat
+        sccp_cv[v] = res_cv
+        sccp_push_users(v)
+
+
+def sccp_push_users(v: uint32):
+    node: uint32 = u_head[v]
+    while node != 0:
+        u: uint32 = u_valn[node]
+        op: uint32 = sv_op[u]
+        if op == SVO_CONDBR or op == SVO_BR:
+            sccp_bwl_push(sv_block[u])
+        else:
+            sccp_vwl_push(u)
+        node = u_next[node]
+
+
+def sccp_mark_edge(pred: uint32, succ: uint32):
+    newedge: uint32 = 0
+    if sb_succ0[pred] == succ:
+        if sccp_e0[pred] == 0:
+            sccp_e0[pred] = 1
+            newedge = 1
+    elif sb_succ1[pred] == succ:
+        if sccp_e1[pred] == 0:
+            sccp_e1[pred] = 1
+            newedge = 1
+    if newedge != 0:
+        # a new incoming edge changes succ's phi meet -> re-eval its phis.
+        p: uint32 = sb_first_val[succ]
+        while p != 0 and sv_op[p] == SVO_PHI:
+            sccp_vwl_push(p)
+            p = sv_next[p]
+        if sccp_bexec[succ] == 0:
+            sccp_bexec[succ] = 1
+            sccp_bwl_push(succ)
+
+
+def sccp_process_terminator(b: uint32):
+    term: uint32 = sb_last_val[b]
+    if term == 0:
+        return
+    op: uint32 = sv_op[term]
+    if op == SVO_BR:
+        sccp_mark_edge(b, sv_a[term])
+        return
+    if op == SVO_CONDBR:
+        cond: uint32 = sv_a[term]
+        if sccp_lat[cond] == LAT_CONST:
+            if sccp_cv[cond] != cast[uint64](0):
+                sccp_mark_edge(b, sv_b[term])
+            else:
+                sccp_mark_edge(b, sv_c[term])
+        elif sccp_lat[cond] == LAT_BOT:
+            sccp_mark_edge(b, sv_b[term])
+            sccp_mark_edge(b, sv_c[term])
+
+
+def sccp_visit_block(b: uint32):
+    v: uint32 = sb_first_val[b]
+    while v != 0:
+        if ssa_is_terminator(sv_op[v]) == 0:
+            sccp_eval_value(v)
+        v = sv_next[v]
+    sccp_process_terminator(b)
+
+
+# Drop the single phi operand flowing from predecessor `pred`.
+def sccp_phi_drop_pred(phi: uint32, pred: uint32):
+    prev: uint32 = 0
+    node: uint32 = sv_arg_head[phi]
+    while node != 0:
+        if arg_pred[node] == pred:
+            if prev == 0:
+                sv_arg_head[phi] = arg_next[node]
+            else:
+                arg_next[prev] = arg_next[node]
+            if sv_argn[phi] > 0:
+                sv_argn[phi] = sv_argn[phi] - 1
+            return
+        prev = node
+        node = arg_next[node]
+
+
+# Remove ONE predecessor edge pred->succ (pred list entry + matching phi operands).
+def sccp_remove_one_pred(succ: uint32, pred: uint32):
+    prev: uint32 = 0
+    node: uint32 = sb_pred_head[succ]
+    done: uint32 = 0
+    while node != 0 and done == 0:
+        if pl_bid[node] == pred:
+            if prev == 0:
+                sb_pred_head[succ] = pl_next[node]
+            else:
+                pl_next[prev] = pl_next[node]
+            if sb_npred[succ] > 0:
+                sb_npred[succ] = sb_npred[succ] - 1
+            done = 1
+        else:
+            prev = node
+            node = pl_next[node]
+    p: uint32 = sb_first_val[succ]
+    while p != 0 and sv_op[p] == SVO_PHI:
+        sccp_phi_drop_pred(p, pred)
+        p = sv_next[p]
+
+
+# Turn a constant-condition CONDBR at block b into an unconditional BR to `taken`,
+# dropping the b->untaken edge (untaken becomes unreachable-from-here; RPO drops
+# it if no other path reaches it).
+def sccp_prune_branch(b: uint32, term: uint32, taken: uint32, untaken: uint32):
+    sv_op[term] = SVO_BR
+    sv_a[term] = taken
+    sv_b[term] = 0
+    sv_c[term] = 0
+    sb_term[b] = SVO_BR
+    sb_succ0[b] = taken
+    sb_succ1[b] = 0
+    sb_nsucc[b] = 1
+    sccp_remove_one_pred(untaken, b)
+
+
+def sccp_rewrite():
+    # 1. fold every reachable value proven CONST into an SVO_CONST in place.
+    v: uint32 = 1
+    while v < sv_count:
+        if sv_block[v] != 0:
+            if sccp_lat[v] == LAT_CONST and sv_op[v] != SVO_CONST:
+                ssa_make_const(v, sccp_cv[v])
+                ssa_opt_sccp_folded = ssa_opt_sccp_folded + 1
+        v = v + 1
+    # 2. prune constant branch edges.
+    b: uint32 = 1
+    while b < sb_count:
+        if sccp_bexec[b] != 0:
+            term: uint32 = sb_last_val[b]
+            if term != 0 and sv_op[term] == SVO_CONDBR:
+                cond: uint32 = sv_a[term]
+                if sccp_lat[cond] == LAT_CONST:
+                    taken: uint32 = sv_c[term]
+                    untaken: uint32 = sv_b[term]
+                    if sccp_cv[cond] != cast[uint64](0):
+                        taken = sv_b[term]
+                        untaken = sv_c[term]
+                    if taken != untaken:
+                        sccp_prune_branch(b, term, taken, untaken)
+                        ssa_opt_sccp_edges_pruned = ssa_opt_sccp_edges_pruned + 1
+        b = b + 1
+
+
+def ssa_sccp():
+    if ssa_opt_pass_disabled(SSAOPT_SCCP) != 0:
+        return
+    # init lattice + edge/reachability state.
+    i: uint32 = 1
+    while i < sv_count:
+        sccp_lat[i] = LAT_TOP
+        sccp_cv[i] = cast[uint64](0)
+        sccp_vq[i] = 0
+        i = i + 1
+    b: uint32 = 0
+    while b < sb_count:
+        sccp_bexec[b] = 0
+        sccp_e0[b] = 0
+        sccp_e1[b] = 0
+        sccp_bq[b] = 0
+        b = b + 1
+    sccp_build_uses()
+    sccp_bsp = 0
+    sccp_vsp = 0
+    sccp_bexec[sb_entry] = 1
+    sccp_bwl_push(sb_entry)
+    # propagate to fixpoint (guarded — monotonic lattice guarantees termination).
+    guard: uint32 = 0
+    while (sccp_bsp > 0 or sccp_vsp > 0) and guard < 4000000:
+        guard = guard + 1
+        if sccp_bsp > 0:
+            sccp_bsp = sccp_bsp - 1
+            bb: uint32 = sccp_bwl[sccp_bsp]
+            sccp_bq[bb] = 0
+            sccp_visit_block(bb)
+        elif sccp_vsp > 0:
+            sccp_vsp = sccp_vsp - 1
+            vv: uint32 = sccp_vwl[sccp_vsp]
+            sccp_vq[vv] = 0
+            sccp_eval_value(vv)
+    sccp_rewrite()
+
+
+# =======================================================================
 # pass manager (§4).  Runs after ssa_build_function, before the trivial lowering.
 # =======================================================================
 def ssa_opt_verify_check():
@@ -818,7 +1246,12 @@ def ssa_opt_run(entry: uint32):
     if ssa_opt_pipeline_on == 0:
         return
     ssa_opt_runs = ssa_opt_runs + 1
-    # dominator tree + RPO for the dominance-aware passes.
+    # SCCP first (§4): folds constants + prunes dead branch edges.  It rewrites
+    # the CFG (const CONDBR -> BR), so the dominator tree is (re)built AFTER it.
+    ssa_sccp()
+    ssa_opt_verify_check()
+    # dominator tree + RPO for the dominance-aware passes (ssa_verify above already
+    # rebuilt them; this is a no-op refresh when verify_each is off).
     ssa_build_domtree()
     # InstCombine canonicalizes so downstream passes see more congruences.
     ssa_instcombine()
