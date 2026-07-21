@@ -1,0 +1,1429 @@
+# adder/compiler/ssa.ad
+#
+# LLVM-shaped SSA IR + on-the-fly Braun construction + verifier.  Phase 1 of the
+# SSA optimizer rewrite (docs/adder_ssa_optimizer_design.md).
+#
+# WHAT THIS IS
+# ------------
+# A new, self-contained SSA intermediate representation for the self-hosted Adder
+# backend, in the parallel-global-array style of ir.ad / cfg.ad (no dynamic
+# allocation; fixed arenas; per-function reset).  It coexists ALONGSIDE the
+# existing ir.ad expression-IR and cfg.ad name-level analysis and touches neither.
+#
+# Phase 1 delivers, exactly as the design doc scopes it:
+#   (2.2) the SSA value/instruction model (SVO_* opcode subset, incl. percpu as a
+#         first-class op), parallel value arenas + a use-list side arena,
+#   (2.3) basic blocks + CFG with predecessor lists and a dominator tree,
+#   (3.1) Braun et al. on-the-fly SSA construction (chosen over Cytron) folded
+#         into the AST->CFG lowering walk, with mem2reg for promotable scalars,
+#   (3.4) ssa_verify — SSA well-formedness (one def per value, dominance of every
+#         use, phi operand==pred count, single terminator per block) with a
+#         deliberate-break switch,
+#   (2.6) the per-function ESCAPE HATCH: on any non-subset construct or arena
+#         overflow, construction bails (returns 0) and the caller falls back to
+#         the legacy pipeline for that function.
+#
+# GATING / BYTE-IDENTITY
+# ----------------------
+# This module is native-only and is reached ONLY under the new ADDER_OPT2 gate
+# (env var / --dump-ssa lane in the dump driver).  With the gate off it is never
+# entered and codegen output is byte-for-byte the pre-existing path.  Phase 1
+# does NOT wire SSA into the machine-code emit path (that is the Phase 1b/3 MIR
+# lowering + register allocator), so the byte-identity invariant is preserved
+# structurally: no emit-path code changes.
+#
+# PHASE-1 SUBSET (what construction accepts; everything else hits the escape
+# hatch and falls back cleanly):
+#   * every local/param is a PROMOTABLE SCALAR — its address is never taken and
+#     its slot is never read directly (reuses cfg.ad's cl_build escape scan:
+#     cl_set==0 AND nm_slotread==0).  Address-taken / aggregate / pointer locals
+#     bail the function (they would need memory SVO_ALLOCA/LOAD/STORE, modeled in
+#     the opcode set but produced by a later increment).
+#   * expressions over int/char/bool literals, promotable-scalar reads, integer
+#     arithmetic/bitwise/shift binops, integer compares, unary neg/not/bitnot,
+#     and direct calls to named functions.
+#   * statements: var-decl, plain/augmented assign to a promotable scalar,
+#     expr-stmt, return, if/elif/else, while, do-while, break, continue, pass.
+#   * anything outside this subset (float, cast, index, member, address-of,
+#     deref, short-circuit and/or, for-loops, match/try/with/defer/yield, a read
+#     of an unknown/global name, ...) bails the whole function.
+
+from compiler.parser import (
+    nd_kind,
+    nd_aux,
+    nd_num,
+    nd_name_off,
+    nd_name_len,
+    nd_a,
+    nd_b,
+    nd_c,
+    nd_d,
+    nd_next,
+    ND_INT_LIT,
+    ND_FLOAT_LIT,
+    ND_CHAR_LIT,
+    ND_BOOL_LIT,
+    ND_IDENT,
+    ND_BINARY,
+    ND_UNARY,
+    ND_CALL,
+    ND_VAR_DECL,
+    ND_ASSIGN,
+    ND_EXPR_STMT,
+    ND_RETURN,
+    ND_IF,
+    ND_ELIF,
+    ND_WHILE,
+    ND_DO_WHILE,
+    ND_FOR,
+    ND_BREAK,
+    ND_CONTINUE,
+    ND_PASS,
+    ND_FUNCTION,
+    ND_PARAM,
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_IDIV,
+    BINOP_MOD,
+    BINOP_EQ,
+    BINOP_NEQ,
+    BINOP_LT,
+    BINOP_LTE,
+    BINOP_GT,
+    BINOP_GTE,
+    BINOP_AND,
+    BINOP_OR,
+    BINOP_BIT_OR,
+    BINOP_BIT_AND,
+    BINOP_BIT_XOR,
+    BINOP_SHL,
+    BINOP_SHR,
+    UNOP_NEG,
+    UNOP_NOT,
+    UNOP_BIT_NOT,
+)
+
+from compiler.cfg import (
+    nm_intern,
+    nm_count,
+    nm_off,
+    nm_len,
+    cl_set,
+    nm_slotread,
+    cfg_build_function,
+    cl_build,
+    NM_MAX,
+)
+
+# =======================================================================
+# 2.2  Value / instruction model — opcodes (SVO_*), the LLVM subset.
+# =======================================================================
+SVO_NULL: uint32 = 0
+SVO_CONST: uint32 = 1        # sv_imm = 64-bit int/bool/char value
+SVO_FCONST: uint32 = 2       # sv_imm = float bit pattern (reserved; Ph1 bails floats)
+SVO_UNDEF: uint32 = 3
+SVO_PARAM: uint32 = 4        # sv_aux = parameter index (entry-block value)
+SVO_BINOP: uint32 = 5        # sv_aux = BINOP_* (arith/bitwise/shift), sv_a/sv_b operands
+SVO_NEG: uint32 = 6          # sv_a operand
+SVO_NOT: uint32 = 7          # logical not, sv_a operand
+SVO_BITNOT: uint32 = 8       # ~x, sv_a operand
+SVO_ICMP: uint32 = 9         # sv_aux = BINOP_* compare predicate, sv_a/sv_b operands
+SVO_FCMP: uint32 = 10        # reserved
+SVO_TRUNC: uint32 = 11       # reserved conversions (Ph1 bails casts)
+SVO_ZEXT: uint32 = 12
+SVO_SEXT: uint32 = 13
+SVO_BITCAST: uint32 = 14
+SVO_I2F: uint32 = 15
+SVO_F2I: uint32 = 16
+SVO_ALLOCA: uint32 = 17      # reserved: address-taken/aggregate local slot
+SVO_LOAD: uint32 = 18        # reserved: sv_a = address value, sv_aux = size
+SVO_STORE: uint32 = 19       # reserved: sv_a = address, sv_b = value
+SVO_GEP: uint32 = 20         # reserved: sv_a = base, sv_b = index, sv_aux = scale
+SVO_BR: uint32 = 21          # sv_a = target bid (terminator)
+SVO_CONDBR: uint32 = 22      # sv_a = cond vid, sv_b = then bid, sv_c = else bid
+SVO_RET: uint32 = 23         # sv_a = value vid (0 = void) (terminator)
+SVO_PHI: uint32 = 24         # operands in use-list (pred bid, incoming vid) pairs
+SVO_CALL: uint32 = 25        # direct call; sv_ast = call node; args in use-list
+SVO_SYSCALL: uint32 = 26     # reserved
+SVO_GLOBALADDR: uint32 = 27  # reserved: RIP-relative symbol in sv_imm
+SVO_PERCPU: uint32 = 28      # first-class %gs-relative op (sv_imm = offset)
+
+# Type ids (2.4) — small interned set.  Signedness rides bit 8 (0x100).
+SVT_VOID: uint32 = 0
+SVT_I1: uint32 = 1
+SVT_I8: uint32 = 2
+SVT_I16: uint32 = 3
+SVT_I32: uint32 = 4
+SVT_I64: uint32 = 5
+SVT_F32: uint32 = 6
+SVT_F64: uint32 = 7
+SVT_PTR: uint32 = 8
+
+# Arena sizes (fixed; overflow => escape-hatch bail).
+SSA_VAL_MAX: uint32 = 65536
+SSA_BB_MAX: uint32 = 1024
+SSA_ARG_MAX: uint32 = 131072
+
+# ----- value arena (index = vid; 0 = null/undef) -----------------------
+sv_op: Array[65536, uint32]
+sv_type: Array[65536, uint32]
+sv_a: Array[65536, uint32]
+sv_b: Array[65536, uint32]
+sv_c: Array[65536, uint32]
+sv_aux: Array[65536, uint32]
+sv_imm: Array[65536, uint64]
+sv_block: Array[65536, uint32]
+sv_ast: Array[65536, uint32]
+sv_next: Array[65536, uint32]      # intrusive per-block list (forward)
+sv_prev: Array[65536, uint32]      # intrusive per-block list (backward)
+sv_pos: Array[65536, uint32]       # index within block (for intra-block dominance)
+sv_arg_head: Array[65536, uint32]  # head of use-list (phi/call operands), 0 = none
+sv_argn: Array[65536, uint32]      # operand count
+
+sv_count: uint32 = 1               # vid 0 reserved as null
+sv_overflow: uint32 = 0
+
+# ----- use-list side arena (phi/call operands; 0 = null) ---------------
+arg_val: Array[131072, uint32]     # operand value vid (or call-arg value)
+arg_pred: Array[131072, uint32]    # phi: the predecessor bid this operand flows from
+arg_next: Array[131072, uint32]    # next operand (linked list; order-independent)
+arg_count: uint32 = 1
+
+# ----- block arena (index = bid; 0 = null) -----------------------------
+sb_first_val: Array[1024, uint32]
+sb_last_val: Array[1024, uint32]
+sb_term: Array[1024, uint32]       # terminator opcode (redundant w/ last, for validate)
+sb_nval: Array[1024, uint32]       # value count (position counter)
+sb_succ0: Array[1024, uint32]
+sb_succ1: Array[1024, uint32]
+sb_nsucc: Array[1024, uint32]
+sb_pred_head: Array[1024, uint32]  # head of predecessor list (side arena)
+sb_npred: Array[1024, uint32]
+sb_sealed: Array[1024, uint32]     # Braun: all preds known
+sb_idom: Array[1024, uint32]       # immediate dominator bid
+sb_ponum: Array[1024, uint32]      # postorder number (higher = closer to entry)
+sb_visited: Array[1024, uint32]
+
+# predecessor list side arena (parallel to blocks): each node = (pred bid, next)
+pl_bid: Array[8192, uint32]
+pl_next: Array[8192, uint32]
+pl_count: uint32 = 1
+
+sb_count: uint32 = 1               # bid 0 reserved as null
+sb_entry: uint32 = 0
+
+# RPO order (list of bids, reverse postorder).
+sb_rpo: Array[1024, uint32]
+sb_rpo_n: uint32 = 0
+# postorder scratch list
+sb_po: Array[1024, uint32]
+sb_po_n: uint32 = 0
+
+# ----- Braun current-definition + incomplete-phi maps ------------------
+# Indexed [block * NM_MAX + var]; 0 = undefined (vid 0 is null so unambiguous).
+ssa_curdef: Array[262144, uint32]      # SSA_BB_MAX * NM_MAX
+ssa_incphi: Array[262144, uint32]      # incomplete phis awaiting seal
+
+# ----- known-locals set (promotable scalars declared as param/var) -----
+ssa_islocal: Array[256, uint32]        # 1 => name id is a known promotable local
+
+# ----- loop context (break/continue targets) --------------------------
+SSA_LOOP_MAX: uint32 = 64
+ssa_brk_bb: Array[64, uint32]
+ssa_cont_bb: Array[64, uint32]
+ssa_loop_depth: uint32 = 0
+
+# ----- per-function bail / stats --------------------------------------
+ssa_bail: uint32 = 0                    # set on any non-subset construct
+ssa_bail_reason: uint32 = 0             # diagnostic code (SBR_*)
+
+SBR_OK: uint32 = 0
+SBR_OVERFLOW: uint32 = 1
+SBR_NONSUBSET_EXPR: uint32 = 2
+SBR_NONSUBSET_STMT: uint32 = 3
+SBR_NONLOCAL: uint32 = 4
+SBR_NONPROMOTABLE: uint32 = 5
+SBR_LOOPDEPTH: uint32 = 6
+SBR_CFG: uint32 = 7
+
+# aggregate program stats (driver lane)
+ssa_stat_funcs: uint32 = 0
+ssa_stat_accepted: uint32 = 0
+ssa_stat_fallback: uint32 = 0
+ssa_stat_verify_ok: uint32 = 0
+ssa_stat_verify_fail: uint32 = 0
+ssa_stat_values: uint32 = 0
+ssa_stat_blocks: uint32 = 0
+ssa_stat_phis: uint32 = 0
+ssa_stat_fail_code: uint32 = 0    # last verifier failure code
+
+# gating flag (2.6 / 6.1)
+ssa_enabled: uint32 = 0
+
+
+def ssa_enable():
+    ssa_enabled = 1
+
+
+def ssa_is_enabled() -> uint32:
+    return ssa_enabled
+
+
+# =======================================================================
+# arena allocators
+# =======================================================================
+def ssa_reset():
+    sv_count = 1
+    arg_count = 1
+    sb_count = 1
+    pl_count = 1
+    sb_entry = 0
+    ssa_loop_depth = 0
+    sv_overflow = 0
+    ssa_bail = 0
+    ssa_bail_reason = SBR_OK
+    sb_rpo_n = 0
+    sb_po_n = 0
+
+
+def sv_new(op: uint32) -> uint32:
+    if sv_count >= SSA_VAL_MAX:
+        sv_overflow = 1
+        ssa_set_bail(SBR_OVERFLOW)
+        return 0
+    id: uint32 = sv_count
+    sv_count = sv_count + 1
+    sv_op[id] = op
+    sv_type[id] = SVT_I64
+    sv_a[id] = 0
+    sv_b[id] = 0
+    sv_c[id] = 0
+    sv_aux[id] = 0
+    sv_imm[id] = 0
+    sv_block[id] = 0
+    sv_ast[id] = 0
+    sv_next[id] = 0
+    sv_prev[id] = 0
+    sv_pos[id] = 0
+    sv_arg_head[id] = 0
+    sv_argn[id] = 0
+    return id
+
+
+def ssa_set_bail(reason: uint32):
+    if ssa_bail == 0:
+        ssa_bail = 1
+        ssa_bail_reason = reason
+
+
+def bb_new_ssa() -> uint32:
+    if sb_count >= SSA_BB_MAX:
+        ssa_set_bail(SBR_OVERFLOW)
+        return 0
+    id: uint32 = sb_count
+    sb_count = sb_count + 1
+    sb_first_val[id] = 0
+    sb_last_val[id] = 0
+    sb_term[id] = 0
+    sb_nval[id] = 0
+    sb_succ0[id] = 0
+    sb_succ1[id] = 0
+    sb_nsucc[id] = 0
+    sb_pred_head[id] = 0
+    sb_npred[id] = 0
+    sb_sealed[id] = 0
+    sb_idom[id] = 0
+    sb_ponum[id] = 0
+    sb_visited[id] = 0
+    # Zero this block's Braun current-def / incomplete-phi row so no stale
+    # mapping from a previously-built function leaks in (the maps are indexed
+    # [block * NM_MAX + var] and are NOT globally cleared per function).
+    base: uint32 = id * NM_MAX
+    j: uint32 = 0
+    while j < NM_MAX:
+        ssa_curdef[base + j] = 0
+        ssa_incphi[base + j] = 0
+        j = j + 1
+    return id
+
+
+# Append value `v` to the end of block `bb`'s intrusive list.
+def bb_append(bb: uint32, v: uint32):
+    if bb == 0 or v == 0:
+        return
+    sv_block[v] = bb
+    sv_pos[v] = sb_nval[bb]
+    sb_nval[bb] = sb_nval[bb] + 1
+    if sb_first_val[bb] == 0:
+        sb_first_val[bb] = v
+        sb_last_val[bb] = v
+        sv_prev[v] = 0
+        sv_next[v] = 0
+        return
+    last: uint32 = sb_last_val[bb]
+    sv_next[last] = v
+    sv_prev[v] = last
+    sv_next[v] = 0
+    sb_last_val[bb] = v
+
+
+# Prepend value `v` to the head of block `bb` (phis go at block head).
+def bb_prepend(bb: uint32, v: uint32):
+    if bb == 0 or v == 0:
+        return
+    sv_block[v] = bb
+    sb_nval[bb] = sb_nval[bb] + 1
+    if sb_first_val[bb] == 0:
+        sb_first_val[bb] = v
+        sb_last_val[bb] = v
+        sv_prev[v] = 0
+        sv_next[v] = 0
+        sv_pos[v] = 0
+        ssa_renumber_block(bb)
+        return
+    first: uint32 = sb_first_val[bb]
+    sv_prev[first] = v
+    sv_next[v] = first
+    sv_prev[v] = 0
+    sb_first_val[bb] = v
+    ssa_renumber_block(bb)
+
+
+# Re-stamp sv_pos across a block (after a head insert) so positions stay dense.
+def ssa_renumber_block(bb: uint32):
+    p: uint32 = 0
+    cur: uint32 = sb_first_val[bb]
+    while cur != 0:
+        sv_pos[cur] = p
+        p = p + 1
+        cur = sv_next[cur]
+
+
+# Add an edge bb -> succ (records succ on bb, pushes bb onto succ's pred list).
+def ssa_add_edge(bb: uint32, succ: uint32):
+    if bb == 0 or succ == 0:
+        return
+    if sb_nsucc[bb] == 0:
+        sb_succ0[bb] = succ
+        sb_nsucc[bb] = 1
+    elif sb_nsucc[bb] == 1:
+        sb_succ1[bb] = succ
+        sb_nsucc[bb] = 2
+    # record predecessor
+    if pl_count >= 8192:
+        ssa_set_bail(SBR_OVERFLOW)
+        return
+    node: uint32 = pl_count
+    pl_count = pl_count + 1
+    pl_bid[node] = bb
+    pl_next[node] = sb_pred_head[succ]
+    sb_pred_head[succ] = node
+    sb_npred[succ] = sb_npred[succ] + 1
+
+
+# =======================================================================
+# 3.1 / 3.2  Braun on-the-fly SSA construction + mem2reg.
+# =======================================================================
+def curdef_get(bb: uint32, var: uint32) -> uint32:
+    return ssa_curdef[bb * NM_MAX + var]
+
+
+def curdef_set(bb: uint32, var: uint32, v: uint32):
+    ssa_curdef[bb * NM_MAX + var] = v
+
+
+def incphi_get(bb: uint32, var: uint32) -> uint32:
+    return ssa_incphi[bb * NM_MAX + var]
+
+
+def incphi_set(bb: uint32, var: uint32, v: uint32):
+    ssa_incphi[bb * NM_MAX + var] = v
+
+
+# writeVariable(var, block, value)
+def ssa_write_var(var: uint32, bb: uint32, v: uint32):
+    curdef_set(bb, var, v)
+
+
+# Append a (pred, val) operand onto phi `phi`.
+def phi_add_operand(phi: uint32, pred: uint32, v: uint32):
+    if arg_count >= SSA_ARG_MAX:
+        ssa_set_bail(SBR_OVERFLOW)
+        return
+    a: uint32 = arg_count
+    arg_count = arg_count + 1
+    arg_val[a] = v
+    arg_pred[a] = pred
+    arg_next[a] = sv_arg_head[phi]
+    sv_arg_head[phi] = a
+    sv_argn[phi] = sv_argn[phi] + 1
+
+
+# addPhiOperands: fill phi with one operand per predecessor of its block.
+def ssa_add_phi_operands(var: uint32, phi: uint32):
+    bb: uint32 = sv_block[phi]
+    node: uint32 = sb_pred_head[bb]
+    while node != 0:
+        p: uint32 = pl_bid[node]
+        v: uint32 = ssa_read_var(var, p)
+        phi_add_operand(phi, p, v)
+        node = pl_next[node]
+
+
+# readVariableRecursive
+def ssa_read_var_recursive(var: uint32, bb: uint32) -> uint32:
+    if sb_sealed[bb] == 0:
+        # incomplete CFG: place an operandless phi, fill it on seal.
+        phi: uint32 = sv_new(SVO_PHI)
+        if phi == 0:
+            return 0
+        bb_prepend(bb, phi)
+        incphi_set(bb, var, phi)
+        ssa_write_var(var, bb, phi)
+        return phi
+    if sb_npred[bb] == 1:
+        # single predecessor: no phi needed, forward the read.
+        p: uint32 = pl_bid[sb_pred_head[bb]]
+        val: uint32 = ssa_read_var(var, p)
+        ssa_write_var(var, bb, val)
+        return val
+    # multiple predecessors: break potential cycles with a phi, then fill.
+    phi2: uint32 = sv_new(SVO_PHI)
+    if phi2 == 0:
+        return 0
+    bb_prepend(bb, phi2)
+    ssa_write_var(var, bb, phi2)
+    ssa_add_phi_operands(var, phi2)
+    return phi2
+
+
+# readVariable(var, block): current def, else recurse.
+def ssa_read_var(var: uint32, bb: uint32) -> uint32:
+    v: uint32 = curdef_get(bb, var)
+    if v != 0:
+        return v
+    return ssa_read_var_recursive(var, bb)
+
+
+# sealBlock: all predecessors are now known; fill deferred phis.
+def ssa_seal_block(bb: uint32):
+    var: uint32 = 0
+    while var < nm_count:
+        phi: uint32 = incphi_get(bb, var)
+        if phi != 0:
+            ssa_add_phi_operands(var, phi)
+            incphi_set(bb, var, 0)
+        var = var + 1
+    sb_sealed[bb] = 1
+
+
+# =======================================================================
+# expression lowering: AST expr -> SSA value vid (0 on bail).
+# =======================================================================
+# Classify a binop as arithmetic (SVO_BINOP), compare (SVO_ICMP), or unsupported.
+def ssa_binop_is_arith(op: uint32) -> uint32:
+    if op == BINOP_ADD or op == BINOP_SUB or op == BINOP_MUL:
+        return 1
+    if op == BINOP_DIV or op == BINOP_IDIV or op == BINOP_MOD:
+        return 1
+    if op == BINOP_BIT_OR or op == BINOP_BIT_AND or op == BINOP_BIT_XOR:
+        return 1
+    if op == BINOP_SHL or op == BINOP_SHR:
+        return 1
+    return 0
+
+
+def ssa_binop_is_cmp(op: uint32) -> uint32:
+    if op == BINOP_EQ or op == BINOP_NEQ:
+        return 1
+    if op == BINOP_LT or op == BINOP_LTE:
+        return 1
+    if op == BINOP_GT or op == BINOP_GTE:
+        return 1
+    return 0
+
+
+# Promotability of a local name id: address never taken, slot never read directly
+# (reuses cfg.ad's cl_build outputs — §2.5).
+def ssa_name_promotable(nid: uint32) -> uint32:
+    if nid >= NM_MAX:
+        return 0
+    if cl_set[nid] != 0:
+        return 0
+    if nm_slotread[nid] != 0:
+        return 0
+    return 1
+
+
+def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
+    if ssa_bail != 0:
+        return 0
+    if node == 0:
+        return 0
+    k: uint32 = nd_kind[node]
+
+    if k == ND_INT_LIT or k == ND_CHAR_LIT or k == ND_BOOL_LIT:
+        v: uint32 = sv_new(SVO_CONST)
+        if v == 0:
+            return 0
+        sv_imm[v] = nd_num[node]
+        sv_ast[v] = node
+        if k == ND_BOOL_LIT:
+            sv_type[v] = SVT_I1
+        bb_append(bb, v)
+        return v
+
+    if k == ND_IDENT:
+        nid: uint32 = nm_intern(nd_name_off[node], nd_name_len[node])
+        if nid >= NM_MAX:
+            ssa_set_bail(SBR_OVERFLOW)
+            return 0
+        if ssa_islocal[nid] == 0:
+            # unknown / global / function name read as a value -> bail.
+            ssa_set_bail(SBR_NONLOCAL)
+            return 0
+        if ssa_name_promotable(nid) == 0:
+            ssa_set_bail(SBR_NONPROMOTABLE)
+            return 0
+        return ssa_read_var(nid, bb)
+
+    if k == ND_BINARY:
+        op: uint32 = nd_aux[node]
+        if op == BINOP_AND or op == BINOP_OR:
+            # short-circuit control flow, not a value op in Ph1.
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
+        arith: uint32 = ssa_binop_is_arith(op)
+        cmp: uint32 = ssa_binop_is_cmp(op)
+        if arith == 0 and cmp == 0:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
+        la: uint32 = ssa_lower_expr(nd_a[node], bb)
+        if la == 0:
+            return 0
+        rb: uint32 = ssa_lower_expr(nd_b[node], bb)
+        if rb == 0:
+            return 0
+        vop: uint32 = SVO_BINOP
+        if cmp != 0:
+            vop = SVO_ICMP
+        v3: uint32 = sv_new(vop)
+        if v3 == 0:
+            return 0
+        sv_aux[v3] = op
+        sv_a[v3] = la
+        sv_b[v3] = rb
+        sv_ast[v3] = node
+        if cmp != 0:
+            sv_type[v3] = SVT_I1
+        bb_append(bb, v3)
+        return v3
+
+    if k == ND_UNARY:
+        uop: uint32 = nd_aux[node]
+        vop2: uint32 = 0
+        if uop == UNOP_NEG:
+            vop2 = SVO_NEG
+        elif uop == UNOP_NOT:
+            vop2 = SVO_NOT
+        elif uop == UNOP_BIT_NOT:
+            vop2 = SVO_BITNOT
+        else:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)   # deref / addr-of -> bail
+            return 0
+        oa: uint32 = ssa_lower_expr(nd_a[node], bb)
+        if oa == 0:
+            return 0
+        v4: uint32 = sv_new(vop2)
+        if v4 == 0:
+            return 0
+        sv_a[v4] = oa
+        sv_ast[v4] = node
+        bb_append(bb, v4)
+        return v4
+
+    if k == ND_CALL:
+        # Direct call to a named function only.  Callee (nd_a) must be a bare
+        # ident that is NOT a local (a function symbol); args are lowered values.
+        callee: uint32 = nd_a[node]
+        if callee == 0 or nd_kind[callee] != ND_IDENT:
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
+        cid: uint32 = nm_intern(nd_name_off[callee], nd_name_len[callee])
+        if cid < NM_MAX and ssa_islocal[cid] != 0:
+            # calling through a local (fn-pointer) -> bail (indirect not modeled).
+            ssa_set_bail(SBR_NONSUBSET_EXPR)
+            return 0
+        cv: uint32 = sv_new(SVO_CALL)
+        if cv == 0:
+            return 0
+        sv_ast[cv] = node
+        # lower args left-to-right; store on the use-list (order-independent for
+        # verification; the call node retains argument AST for future lowering).
+        arg: uint32 = nd_b[node]
+        argc: uint32 = 0
+        while arg != 0:
+            av: uint32 = ssa_lower_expr(arg, bb)
+            if av == 0:
+                return 0
+            phi_add_operand(cv, 0, av)
+            argc = argc + 1
+            arg = nd_next[arg]
+        sv_aux[cv] = argc
+        bb_append(bb, cv)
+        return cv
+
+    # float literal, index, member, slice, cast, conditional, etc. -> bail.
+    ssa_set_bail(SBR_NONSUBSET_EXPR)
+    return 0
+
+
+# =======================================================================
+# statement lowering: threads the current block; returns fallthrough block
+# (0 == control cannot fall through, e.g. after return/break/continue).
+# =======================================================================
+def ssa_intern_local(off: uint32, len_: uint32) -> uint32:
+    nid: uint32 = nm_intern(off, len_)
+    if nid >= NM_MAX:
+        ssa_set_bail(SBR_OVERFLOW)
+        return NM_MAX
+    if ssa_name_promotable(nid) == 0:
+        ssa_set_bail(SBR_NONPROMOTABLE)
+        return NM_MAX
+    ssa_islocal[nid] = 1
+    return nid
+
+
+def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
+    if ssa_bail != 0:
+        return 0
+    if bb == 0:
+        return 0
+    k: uint32 = nd_kind[stmt]
+
+    if k == ND_PASS:
+        return bb
+
+    if k == ND_VAR_DECL:
+        nid: uint32 = ssa_intern_local(nd_name_off[stmt], nd_name_len[stmt])
+        if nid >= NM_MAX:
+            return bb
+        val: uint32 = 0
+        if nd_b[stmt] != 0:
+            val = ssa_lower_expr(nd_b[stmt], bb)
+            if val == 0:
+                return bb
+        else:
+            # declaration without initializer -> undef value.
+            val = sv_new(SVO_UNDEF)
+            if val == 0:
+                return bb
+            bb_append(bb, val)
+        ssa_write_var(nid, bb, val)
+        return bb
+
+    if k == ND_ASSIGN:
+        target: uint32 = nd_a[stmt]
+        if nd_kind[target] != ND_IDENT:
+            # store through index/member/deref -> memory, outside Ph1 subset.
+            ssa_set_bail(SBR_NONSUBSET_STMT)
+            return bb
+        tid: uint32 = nm_intern(nd_name_off[target], nd_name_len[target])
+        if tid >= NM_MAX:
+            ssa_set_bail(SBR_OVERFLOW)
+            return bb
+        if ssa_islocal[tid] == 0:
+            # assignment to a name never declared local (global) -> bail.
+            ssa_set_bail(SBR_NONLOCAL)
+            return bb
+        if ssa_name_promotable(tid) == 0:
+            ssa_set_bail(SBR_NONPROMOTABLE)
+            return bb
+        aug: uint32 = nd_aux[stmt]
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+        if rhs == 0:
+            return bb
+        if aug != 0:
+            # x op= e  ==>  x = (x op e)
+            cur: uint32 = ssa_read_var(tid, bb)
+            if cur == 0:
+                return bb
+            v5: uint32 = sv_new(SVO_BINOP)
+            if v5 == 0:
+                return bb
+            sv_aux[v5] = aug
+            sv_a[v5] = cur
+            sv_b[v5] = rhs
+            sv_ast[v5] = stmt
+            bb_append(bb, v5)
+            ssa_write_var(tid, bb, v5)
+        else:
+            ssa_write_var(tid, bb, rhs)
+        return bb
+
+    if k == ND_EXPR_STMT:
+        ssa_lower_expr(nd_a[stmt], bb)   # value discarded; may be a call side-effect
+        return bb
+
+    if k == ND_RETURN:
+        rv: uint32 = 0
+        if nd_a[stmt] != 0:
+            rv = ssa_lower_expr(nd_a[stmt], bb)
+            if rv == 0 and ssa_bail != 0:
+                return 0
+        ret: uint32 = sv_new(SVO_RET)
+        if ret == 0:
+            return 0
+        sv_a[ret] = rv
+        sv_ast[ret] = stmt
+        bb_append(bb, ret)
+        sb_term[bb] = SVO_RET
+        return 0
+
+    if k == ND_BREAK:
+        if ssa_loop_depth == 0:
+            ssa_set_bail(SBR_NONSUBSET_STMT)
+            return 0
+        tgt: uint32 = ssa_brk_bb[ssa_loop_depth - 1]
+        ssa_terminate_br(bb, tgt)
+        return 0
+
+    if k == ND_CONTINUE:
+        if ssa_loop_depth == 0:
+            ssa_set_bail(SBR_NONSUBSET_STMT)
+            return 0
+        tgt2: uint32 = ssa_cont_bb[ssa_loop_depth - 1]
+        ssa_terminate_br(bb, tgt2)
+        return 0
+
+    if k == ND_IF:
+        return ssa_lower_if(bb, stmt)
+
+    if k == ND_WHILE:
+        return ssa_lower_while(bb, stmt)
+
+    if k == ND_DO_WHILE:
+        return ssa_lower_do_while(bb, stmt)
+
+    # for/match/try/with/defer/yield/global/... -> bail.
+    ssa_set_bail(SBR_NONSUBSET_STMT)
+    return 0
+
+
+# Emit an unconditional-branch terminator bb -> tgt.
+def ssa_terminate_br(bb: uint32, tgt: uint32):
+    if bb == 0 or tgt == 0:
+        return
+    br: uint32 = sv_new(SVO_BR)
+    if br == 0:
+        return
+    sv_a[br] = tgt
+    bb_append(bb, br)
+    sb_term[bb] = SVO_BR
+    ssa_add_edge(bb, tgt)
+
+
+# Emit a conditional-branch terminator bb -?-> then/else.
+def ssa_terminate_condbr(bb: uint32, cond: uint32, then_bb: uint32, else_bb: uint32):
+    if bb == 0:
+        return
+    cb: uint32 = sv_new(SVO_CONDBR)
+    if cb == 0:
+        return
+    sv_a[cb] = cond
+    sv_b[cb] = then_bb
+    sv_c[cb] = else_bb
+    bb_append(bb, cb)
+    sb_term[bb] = SVO_CONDBR
+    ssa_add_edge(bb, then_bb)
+    ssa_add_edge(bb, else_bb)
+
+
+# Lower a statement chain, threading the current block.  Returns the fallthrough
+# block (0 if control cannot fall through the chain).
+def ssa_lower_chain(bb: uint32, head: uint32) -> uint32:
+    cur: uint32 = bb
+    s: uint32 = head
+    while s != 0:
+        if ssa_bail != 0:
+            return 0
+        if cur == 0:
+            # unreachable code after a terminator: drop it (structured CFG keeps
+            # semantics; a fresh dead block is unnecessary for Ph1's subset).
+            return 0
+        cur = ssa_lower_stmt(cur, s)
+        s = nd_next[s]
+    return cur
+
+
+# --- if / elif / else --------------------------------------------------
+#
+# Edge-first (Braun-safe): every block's predecessor edges are wired BEFORE the
+# block is sealed, so a variable read inside a block resolves against the correct
+# predecessor set.  The enclosing branch's edges are added, then the arm body is
+# sealed + lowered.
+def ssa_lower_if(bb: uint32, stmt: uint32) -> uint32:
+    cond: uint32 = ssa_lower_expr(nd_a[stmt], bb)
+    if cond == 0:
+        return 0
+    join: uint32 = bb_new_ssa()
+    if join == 0:
+        return 0
+    then_bb: uint32 = bb_new_ssa()
+    if then_bb == 0:
+        return 0
+    has_alt: uint32 = 0
+    if nd_c[stmt] != 0 or nd_d[stmt] != 0:
+        has_alt = 1
+    else_bb: uint32 = join
+    if has_alt != 0:
+        else_bb = bb_new_ssa()
+        if else_bb == 0:
+            return 0
+    # wire the branch edges FIRST (bb -> then_bb, bb -> else_bb).
+    ssa_terminate_condbr(bb, cond, then_bb, else_bb)
+    # then arm.
+    ssa_seal_block(then_bb)
+    then_tail: uint32 = ssa_lower_chain(then_bb, nd_b[stmt])
+    if then_tail != 0:
+        ssa_terminate_br(then_tail, join)
+    # alternative path (elif chain / else); else_bb's incoming edge is already
+    # wired above, so alts can seal + lower it safely.
+    if has_alt != 0:
+        ssa_lower_if_alts(else_bb, nd_c[stmt], nd_d[stmt], join)
+    if ssa_bail != 0:
+        return 0
+    ssa_seal_block(join)
+    return join
+
+
+# Lower the alternative path into `entry_bb` (already created + incoming edge
+# wired by the caller).  Wires all edges to `join`.
+def ssa_lower_if_alts(entry_bb: uint32, elif_head: uint32, else_head: uint32,
+                      join: uint32):
+    if ssa_bail != 0:
+        return
+    ssa_seal_block(entry_bb)              # single known pred (the enclosing branch)
+    if elif_head != 0:
+        cond: uint32 = ssa_lower_expr(nd_a[elif_head], entry_bb)
+        if cond == 0:
+            return
+        body_bb: uint32 = bb_new_ssa()
+        if body_bb == 0:
+            return
+        more: uint32 = 0
+        if nd_next[elif_head] != 0 or else_head != 0:
+            more = 1
+        next_bb: uint32 = join
+        if more != 0:
+            next_bb = bb_new_ssa()
+            if next_bb == 0:
+                return
+        ssa_terminate_condbr(entry_bb, cond, body_bb, next_bb)
+        ssa_seal_block(body_bb)
+        bt: uint32 = ssa_lower_chain(body_bb, nd_b[elif_head])
+        if bt != 0:
+            ssa_terminate_br(bt, join)
+        if more != 0:
+            ssa_lower_if_alts(next_bb, nd_next[elif_head], else_head, join)
+        return
+    if else_head != 0:
+        et: uint32 = ssa_lower_chain(entry_bb, else_head)
+        if et != 0:
+            ssa_terminate_br(et, join)
+        return
+    # no elif, no else: fall straight to join.
+    ssa_terminate_br(entry_bb, join)
+
+
+# --- while -------------------------------------------------------------
+def ssa_lower_while(bb: uint32, stmt: uint32) -> uint32:
+    header: uint32 = bb_new_ssa()
+    if header == 0:
+        return 0
+    ssa_terminate_br(bb, header)          # pred #1 (pre-loop) wired
+    # header is NOT sealed yet: the back-edge pred is still unknown.
+    cond: uint32 = ssa_lower_expr(nd_a[stmt], header)
+    if cond == 0:
+        return 0
+    body_bb: uint32 = bb_new_ssa()
+    if body_bb == 0:
+        return 0
+    exit_bb: uint32 = bb_new_ssa()
+    if exit_bb == 0:
+        return 0
+    ssa_terminate_condbr(header, cond, body_bb, exit_bb)
+    ssa_seal_block(body_bb)               # body's only entry pred is the header
+    if ssa_loop_depth >= SSA_LOOP_MAX:
+        ssa_set_bail(SBR_LOOPDEPTH)
+        return 0
+    ssa_brk_bb[ssa_loop_depth] = exit_bb
+    ssa_cont_bb[ssa_loop_depth] = header
+    ssa_loop_depth = ssa_loop_depth + 1
+    body_tail: uint32 = ssa_lower_chain(body_bb, nd_b[stmt])
+    ssa_loop_depth = ssa_loop_depth - 1
+    if body_tail != 0:
+        ssa_terminate_br(body_tail, header)   # back-edge pred wired
+    # all header predecessors now known -> seal (fills the loop-carried phis).
+    ssa_seal_block(header)
+    ssa_seal_block(exit_bb)
+    return exit_bb
+
+
+# --- do-while ----------------------------------------------------------
+def ssa_lower_do_while(bb: uint32, stmt: uint32) -> uint32:
+    body_bb: uint32 = bb_new_ssa()
+    if body_bb == 0:
+        return 0
+    ssa_terminate_br(bb, body_bb)         # pred #1 (pre-loop) wired
+    cond_bb: uint32 = bb_new_ssa()
+    if cond_bb == 0:
+        return 0
+    exit_bb: uint32 = bb_new_ssa()
+    if exit_bb == 0:
+        return 0
+    # body_bb is unsealed: its back-edge pred (from cond) is still unknown.
+    if ssa_loop_depth >= SSA_LOOP_MAX:
+        ssa_set_bail(SBR_LOOPDEPTH)
+        return 0
+    ssa_brk_bb[ssa_loop_depth] = exit_bb
+    ssa_cont_bb[ssa_loop_depth] = cond_bb
+    ssa_loop_depth = ssa_loop_depth + 1
+    body_tail: uint32 = ssa_lower_chain(body_bb, nd_b[stmt])
+    ssa_loop_depth = ssa_loop_depth - 1
+    if body_tail != 0:
+        ssa_terminate_br(body_tail, cond_bb)
+    ssa_seal_block(cond_bb)               # cond's preds (body tail + continues) known
+    cond: uint32 = ssa_lower_expr(nd_a[stmt], cond_bb)
+    if cond == 0:
+        return 0
+    ssa_terminate_condbr(cond_bb, cond, body_bb, exit_bb)  # back-edge to body wired
+    ssa_seal_block(body_bb)               # now all body preds known
+    ssa_seal_block(exit_bb)
+    return exit_bb
+
+
+# =======================================================================
+# whole-function build.  Returns the entry bid, or 0 on bail/overflow.
+# =======================================================================
+def ssa_build_function(fn: uint32) -> uint32:
+    # Reuse cfg.ad's name interning + escape scan for the promotability test.
+    ok: uint32 = cfg_build_function(fn)
+    if ok == 0:
+        return 0                          # cfg overflow -> escape hatch
+    cl_build(fn)
+
+    ssa_reset()
+    # clear the known-locals set for this function.
+    i: uint32 = 0
+    while i < NM_MAX:
+        ssa_islocal[i] = 0
+        i = i + 1
+    # Braun current-def / incomplete-phi rows are cleared per block in bb_new_ssa
+    # (indexed [block * NM_MAX + var]), so no stale mapping leaks between funcs.
+
+    entry: uint32 = bb_new_ssa()
+    if entry == 0:
+        return 0
+    sb_entry = entry
+    sb_sealed[entry] = 1                  # entry has no predecessors
+
+    # Parameters become SVO_PARAM values written in the entry block.  Each param
+    # must be a promotable scalar (else escape-hatch bail).
+    p: uint32 = nd_a[fn]
+    pidx: uint32 = 0
+    while p != 0:
+        if nd_kind[p] == ND_PARAM:
+            nid: uint32 = ssa_intern_local(nd_name_off[p], nd_name_len[p])
+            if nid >= NM_MAX:
+                return 0
+            pv: uint32 = sv_new(SVO_PARAM)
+            if pv == 0:
+                return 0
+            sv_aux[pv] = pidx
+            sv_ast[pv] = p
+            bb_append(entry, pv)
+            ssa_write_var(nid, entry, pv)
+        pidx = pidx + 1
+        p = nd_next[p]
+
+    if ssa_bail != 0:
+        return 0
+
+    tail: uint32 = ssa_lower_chain(entry, nd_c[fn])
+    if ssa_bail != 0:
+        return 0
+    # implicit return at the fallthrough tail (void or default).
+    if tail != 0:
+        ret: uint32 = sv_new(SVO_RET)
+        if ret == 0:
+            return 0
+        sv_a[ret] = 0
+        bb_append(tail, ret)
+        sb_term[tail] = SVO_RET
+
+    if ssa_bail != 0:
+        return 0
+    return entry
+
+
+# =======================================================================
+# 3.1  dominator tree (computed AFTER construction, as analysis).
+# =======================================================================
+# Recursive DFS postorder over successor edges from entry.
+def ssa_dfs_post(bb: uint32):
+    if bb == 0 or sb_visited[bb] != 0:
+        return
+    sb_visited[bb] = 1
+    if sb_nsucc[bb] >= 1:
+        ssa_dfs_post(sb_succ0[bb])
+    if sb_nsucc[bb] >= 2:
+        ssa_dfs_post(sb_succ1[bb])
+    sb_ponum[bb] = sb_po_n
+    sb_po[sb_po_n] = bb
+    sb_po_n = sb_po_n + 1
+
+
+def ssa_build_rpo():
+    b: uint32 = 0
+    while b < sb_count:
+        sb_visited[b] = 0
+        sb_ponum[b] = 0
+        b = b + 1
+    sb_po_n = 0
+    ssa_dfs_post(sb_entry)
+    # reverse postorder = reverse of postorder list.
+    sb_rpo_n = sb_po_n
+    i: uint32 = 0
+    while i < sb_po_n:
+        sb_rpo[i] = sb_po[sb_po_n - 1 - i]
+        i = i + 1
+
+
+# Cooper-Harvey-Kennedy intersect using postorder numbers (higher = nearer entry).
+def ssa_dom_intersect(a: uint32, b: uint32) -> uint32:
+    x: uint32 = a
+    y: uint32 = b
+    while x != y:
+        while sb_ponum[x] < sb_ponum[y]:
+            x = sb_idom[x]
+        while sb_ponum[y] < sb_ponum[x]:
+            y = sb_idom[y]
+    return x
+
+
+def ssa_build_domtree():
+    ssa_build_rpo()
+    b: uint32 = 0
+    while b < sb_count:
+        sb_idom[b] = 0
+        b = b + 1
+    sb_idom[sb_entry] = sb_entry
+    changed: uint32 = 1
+    while changed != 0:
+        changed = 0
+        i: uint32 = 0
+        while i < sb_rpo_n:
+            bb: uint32 = sb_rpo[i]
+            if bb != sb_entry:
+                newidom: uint32 = 0
+                node: uint32 = sb_pred_head[bb]
+                while node != 0:
+                    p: uint32 = pl_bid[node]
+                    if sb_idom[p] != 0:
+                        if newidom == 0:
+                            newidom = p
+                        else:
+                            newidom = ssa_dom_intersect(p, newidom)
+                    node = pl_next[node]
+                if newidom != 0 and sb_idom[bb] != newidom:
+                    sb_idom[bb] = newidom
+                    changed = 1
+            i = i + 1
+
+
+# Does block `a` dominate block `b`?  Walk the idom chain up from b to entry.
+def ssa_dominates(a: uint32, b: uint32) -> uint32:
+    x: uint32 = b
+    while x != 0:
+        if x == a:
+            return 1
+        nx: uint32 = sb_idom[x]
+        if nx == x:
+            return 0                       # reached entry (idom self)
+        x = nx
+    return 0
+
+
+# =======================================================================
+# 3.4  ssa_verify — SSA well-formedness.  Returns SSAV_OK or a failure code.
+# =======================================================================
+SSAV_OK: uint32 = 0
+SSAV_NO_TERM: uint32 = 1          # block has no terminator
+SSAV_TERM_NOT_LAST: uint32 = 2   # a terminator is not the last value in its block
+SSAV_MID_TERM: uint32 = 3        # a non-last value is a terminator
+SSAV_USE_NOT_DOM: uint32 = 4     # a use is not dominated by its def
+SSAV_PHI_PRED_MISMATCH: uint32 = 5  # phi operand count != predecessor count
+SSAV_PHI_NOT_HEAD: uint32 = 6    # phi not at block head
+SSAV_PHI_BAD_PRED: uint32 = 7    # phi operand's pred is not a predecessor
+SSAV_BAD_EDGE: uint32 = 8        # edge endpoint does not exist
+SSAV_NO_DEF: uint32 = 9          # a use references an undefined value id
+
+# deliberate-break switch (mirrors ir_castcall_break_flag / lr_holes_break):
+# armed by --ssa-break, corrupts one phi's operand count so the verifier MUST
+# catch it — proving the verifier actually guards soundness.
+ssa_break_flag: uint32 = 0
+
+
+def ssa_set_break(v: uint32):
+    ssa_break_flag = v
+
+
+# Corrupt the IR when armed: drop one operand from the first phi found, so its
+# operand count no longer matches its predecessor count.  If no phi exists, drop
+# a block's terminator instead.  Called after a successful build in the demo.
+def ssa_break_apply():
+    if ssa_break_flag == 0:
+        return
+    v: uint32 = 1
+    while v < sv_count:
+        if sv_op[v] == SVO_PHI and sv_arg_head[v] != 0:
+            sv_arg_head[v] = arg_next[sv_arg_head[v]]   # unlink one operand
+            sv_argn[v] = sv_argn[v] - 1
+            return
+        v = v + 1
+    # no phi: corrupt a terminator (clear the entry block's terminator record).
+    if sb_entry != 0:
+        sb_term[sb_entry] = 0
+        sb_last_val[sb_entry] = 0
+
+
+# Is value id `v` a real, defined value?
+def ssa_val_defined(v: uint32) -> uint32:
+    if v == 0:
+        return 0
+    if v >= sv_count:
+        return 0
+    return 1
+
+
+# Check that operand value `use` (used at position `pos` in block `ub`) is
+# dominated by its definition.  Returns 1 if OK.
+def ssa_check_use_dom(use: uint32, ub: uint32, pos: uint32) -> uint32:
+    if ssa_val_defined(use) == 0:
+        return 0
+    db: uint32 = sv_block[use]
+    if db == ub:
+        return sv_pos[use] < pos           # def before use in the same block
+    return ssa_dominates(db, ub)
+
+
+def ssa_verify() -> uint32:
+    ssa_build_domtree()
+    # 1. every block has exactly one terminator, last in its list.
+    b: uint32 = 1
+    while b < sb_count:
+        # skip unreachable blocks (not in RPO) — they carry no obligations.
+        if sb_visited[b] != 0:
+            last: uint32 = sb_last_val[b]
+            if last == 0 or ssa_is_terminator(sv_op[last]) == 0:
+                ssa_stat_fail_code = SSAV_NO_TERM
+                return SSAV_NO_TERM
+            # no terminator may appear before the last value.
+            cur: uint32 = sb_first_val[b]
+            while cur != 0:
+                if cur != last and ssa_is_terminator(sv_op[cur]) != 0:
+                    ssa_stat_fail_code = SSAV_MID_TERM
+                    return SSAV_MID_TERM
+                cur = sv_next[cur]
+        b = b + 1
+
+    # 2. per-value checks: phi placement/operands + use dominance.
+    b = 1
+    while b < sb_count:
+        if sb_visited[b] != 0:
+            first: uint32 = sb_first_val[b]
+            seen_nonphi: uint32 = 0
+            cur2: uint32 = first
+            while cur2 != 0:
+                op: uint32 = sv_op[cur2]
+                if op == SVO_PHI:
+                    if seen_nonphi != 0:
+                        ssa_stat_fail_code = SSAV_PHI_NOT_HEAD
+                        return SSAV_PHI_NOT_HEAD
+                    rc: uint32 = ssa_verify_phi(cur2, b)
+                    if rc != SSAV_OK:
+                        ssa_stat_fail_code = rc
+                        return rc
+                else:
+                    seen_nonphi = 1
+                    rc2: uint32 = ssa_verify_uses(cur2, b)
+                    if rc2 != SSAV_OK:
+                        ssa_stat_fail_code = rc2
+                        return rc2
+                cur2 = sv_next[cur2]
+        b = b + 1
+    ssa_stat_fail_code = SSAV_OK
+    return SSAV_OK
+
+
+def ssa_is_terminator(op: uint32) -> uint32:
+    if op == SVO_BR or op == SVO_CONDBR or op == SVO_RET:
+        return 1
+    return 0
+
+
+# Verify a phi: exactly one operand per predecessor, each operand's value
+# dominates its incoming predecessor's terminator, each pred is a real pred.
+def ssa_verify_phi(phi: uint32, bb: uint32) -> uint32:
+    if sv_argn[phi] != sb_npred[bb]:
+        return SSAV_PHI_PRED_MISMATCH
+    node: uint32 = sv_arg_head[phi]
+    while node != 0:
+        p: uint32 = arg_pred[node]
+        v: uint32 = arg_val[node]
+        if ssa_block_is_pred(p, bb) == 0:
+            return SSAV_PHI_BAD_PRED
+        if ssa_val_defined(v) == 0:
+            return SSAV_NO_DEF
+        # incoming value must be available at the end of pred p.
+        vb: uint32 = sv_block[v]
+        if vb != p and ssa_dominates(vb, p) == 0:
+            return SSAV_USE_NOT_DOM
+        node = arg_next[node]
+    return SSAV_OK
+
+
+def ssa_block_is_pred(p: uint32, bb: uint32) -> uint32:
+    node: uint32 = sb_pred_head[bb]
+    while node != 0:
+        if pl_bid[node] == p:
+            return 1
+        node = pl_next[node]
+    return 0
+
+
+# Verify the operand uses of a non-phi value are dominated by their defs.
+def ssa_verify_uses(v: uint32, bb: uint32) -> uint32:
+    op: uint32 = sv_op[v]
+    pos: uint32 = sv_pos[v]
+    # SVO_BR/SVO_CONDBR carry block ids in sv_a/sv_b/sv_c that are NOT values.
+    if op == SVO_BINOP or op == SVO_ICMP or op == SVO_FCMP or op == SVO_GEP or op == SVO_STORE:
+        if ssa_check_use_dom(sv_a[v], bb, pos) == 0:
+            return SSAV_USE_NOT_DOM
+        if ssa_check_use_dom(sv_b[v], bb, pos) == 0:
+            return SSAV_USE_NOT_DOM
+        return SSAV_OK
+    if op == SVO_NEG or op == SVO_NOT or op == SVO_BITNOT or op == SVO_LOAD:
+        if ssa_check_use_dom(sv_a[v], bb, pos) == 0:
+            return SSAV_USE_NOT_DOM
+        return SSAV_OK
+    if op == SVO_TRUNC or op == SVO_ZEXT or op == SVO_SEXT or op == SVO_BITCAST or op == SVO_I2F or op == SVO_F2I:
+        if ssa_check_use_dom(sv_a[v], bb, pos) == 0:
+            return SSAV_USE_NOT_DOM
+        return SSAV_OK
+    if op == SVO_CONDBR:
+        if ssa_check_use_dom(sv_a[v], bb, pos) == 0:
+            return SSAV_USE_NOT_DOM
+        return SSAV_OK
+    if op == SVO_RET:
+        if sv_a[v] != 0:
+            if ssa_check_use_dom(sv_a[v], bb, pos) == 0:
+                return SSAV_USE_NOT_DOM
+        return SSAV_OK
+    if op == SVO_CALL:
+        node: uint32 = sv_arg_head[v]
+        while node != 0:
+            if ssa_check_use_dom(arg_val[node], bb, pos) == 0:
+                return SSAV_USE_NOT_DOM
+            node = arg_next[node]
+        return SSAV_OK
+    # const/param/undef/globaladdr/percpu/alloca: no value operands.
+    return SSAV_OK
+
+
+# =======================================================================
+# program-level driver lane (the --dump-ssa / ADDER_OPT2 analysis pass).
+# Builds + verifies SSA for every function; accumulates stats; NEVER emits
+# code and NEVER mutates the AST, so it cannot perturb codegen output.
+# =======================================================================
+def ssa_stats_reset():
+    ssa_stat_funcs = 0
+    ssa_stat_accepted = 0
+    ssa_stat_fallback = 0
+    ssa_stat_verify_ok = 0
+    ssa_stat_verify_fail = 0
+    ssa_stat_values = 0
+    ssa_stat_blocks = 0
+    ssa_stat_phis = 0
+    ssa_stat_fail_code = 0
+
+
+# Count phis in the current function (post-build).
+def ssa_count_phis() -> uint32:
+    n: uint32 = 0
+    v: uint32 = 1
+    while v < sv_count:
+        if sv_op[v] == SVO_PHI:
+            n = n + 1
+        v = v + 1
+    return n
+
+
+# Build+verify SSA for one function.  Returns 1 if accepted+verified, 0 if it
+# fell back (escape hatch) or failed verification.
+def ssa_process_function(fn: uint32) -> uint32:
+    ssa_stat_funcs = ssa_stat_funcs + 1
+    entry: uint32 = ssa_build_function(fn)
+    if entry == 0 or ssa_bail != 0:
+        ssa_stat_fallback = ssa_stat_fallback + 1
+        return 0
+    ssa_stat_accepted = ssa_stat_accepted + 1
+    ssa_stat_values = ssa_stat_values + (sv_count - 1)
+    ssa_stat_blocks = ssa_stat_blocks + (sb_count - 1)
+    ssa_stat_phis = ssa_stat_phis + ssa_count_phis()
+    ssa_break_apply()                     # inert unless --ssa-break armed
+    rc: uint32 = ssa_verify()
+    if rc == SSAV_OK:
+        ssa_stat_verify_ok = ssa_stat_verify_ok + 1
+        return 1
+    ssa_stat_verify_fail = ssa_stat_verify_fail + 1
+    return 0
+
+
+# Walk the program's ND_FUNCTION decl chain (ND_PROGRAM: b = decl chain head).
+def ssa_run_program(prog: uint32):
+    ssa_stats_reset()
+    if prog == 0:
+        return
+    cur: uint32 = nd_b[prog]
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            ssa_process_function(cur)
+        cur = nd_next[cur]
+
+
+# Parse ADDER_OPT2 from the process environment (mirrors opt_parse_disable_env).
+# ADDER_OPT2=1 (or any non-empty value) arms ssa_enabled.  Unset => stays off =>
+# byte-identical default path.
+def ssa_str_prefix_len(e: Ptr[uint8], pfx: Ptr[uint8]) -> uint32:
+    j: uint32 = 0
+    while pfx[j] != 0:
+        if e[j] != pfx[j]:
+            return 0
+        j = j + 1
+    return j
+
+
+def ssa_parse_env(argc: int32, argv: Ptr[uint64]):
+    ei: uint32 = cast[uint32](argc) + 1
+    while argv[ei] != 0:
+        e: Ptr[uint8] = cast[Ptr[uint8]](argv[ei])
+        klen: uint32 = ssa_str_prefix_len(e, "ADDER_OPT2=")
+        if klen != 0:
+            # any non-empty value past the '=' arms the gate.
+            if e[klen] != 0:
+                ssa_enabled = 1
+        ei = ei + 1
