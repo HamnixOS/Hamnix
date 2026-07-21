@@ -128,6 +128,33 @@ echo "[fuzz_adder_diff] unsafe-liveness result: $REGU_OUT (expect 'ok/ok off=333
 [ "$REGU_OUT" = "ok/ok off=333 on=333" ] \
     || fail "codegen.ad --opt miscompiled the unsafe-block liveness fixture: $REGU_OUT"
 
+# ---- Regression: MATCH-BODY LIVENESS (tests/fuzz/regress_match_liveness.ad).
+#      The GENERAL form of the same --opt clobber: the CFG's opaque-statement
+#      fallback routes `match` (and try/with/defer) through a single opaque
+#      instruction whose body chains were scanned with cfg_scan_uses — which
+#      threads nd_next only of a node's a/b children, so a use living in the
+#      SECOND match arm's body was MISSED, truncating a promoted local's live
+#      range (two overlapping locals then shared one register). FIX: the fallback
+#      now uses cfg_scan_uses_deep, a chain-aware full-subtree use scan. Enum
+#      `match` is the one fallback-routed chain-body construct codegen.ad
+#      actually compiles, so it is the runnable guard for the whole class. Both
+#      opt ON and OFF must print 333 (pre-fix --opt printed 444: x got y's reg).
+echo "[fuzz_adder_diff] regression: regress_match_liveness.ad (opt ON+OFF)"
+REGM_OUT="$(python3 - <<'PY'
+import sys; sys.path.insert(0, "tests/fuzz")
+import ad_codegen_host as h
+from pathlib import Path
+wd = Path("build/fuzz_ad_codegen")
+body = open("tests/fuzz/regress_match_liveness.ad").read()
+off = h.run_through_codegen_ad("regrm_off", body, wd, opt=False)
+on  = h.run_through_codegen_ad("regrm_on",  body, wd, opt=True)
+print(f"{off.kind}/{on.kind} off={off.stdout} on={on.stdout}")
+PY
+)"
+echo "[fuzz_adder_diff] match-liveness result: $REGM_OUT (expect 'ok/ok off=333 on=333')"
+[ "$REGM_OUT" = "ok/ok off=333 on=333" ] \
+    || fail "codegen.ad --opt miscompiled the match-body liveness fixture: $REGM_OUT"
+
 # ---- Seeded differential batch -----------------------------------------
 echo "[fuzz_adder_diff] differential: count=$FUZZ_COUNT seed=$FUZZ_SEED"
 python3 tests/fuzz/adder_fuzzer.py --ad-codegen \
