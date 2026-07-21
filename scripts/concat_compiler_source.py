@@ -355,6 +355,18 @@ def main(argv):
         # guest) is unaffected.
         if DRIVER_MAIN == HOST_DRIVER_MAIN:
             modules += ["opt.ad"]
+            # Phase-4 SSA optimizer/allocator pipeline. Fused in ONLY for the
+            # host driver (like opt.ad), gated at RUNTIME behind ADDER_OPT2 in
+            # fused_driver_host_main.ad — with the env unset the SSA path is
+            # never entered and host_ac.elf output is byte-identical. Dependency
+            # order: ssa.ad references codegen/ir/cfg/parser/lexer (all already
+            # ahead of it); ssa_opt.ad references ssa; ssa_emit.ad references
+            # ssa + ssa_opt + codegen — so append ssa, ssa_opt, ssa_emit AFTER
+            # codegen/elf_emit/opt. NOTE: deliberately NOT added to the frozen
+            # Python seed (compiler/adder.py MODULES) — the seed stays the
+            # untouched bootstrap oracle; only the self-hosted host_ac.elf links
+            # the SSA code.
+            modules += ["ssa.ad", "ssa_opt.ad", "ssa_emit.ad"]
 
     chunks = []
     header = (
