@@ -212,10 +212,26 @@ syscall_entry:
     popq    %r12                      /* -40 user %r12 */
     popq    %r13                      /* -32 user %r13 */
 
-    /* Restore syscall-control regs and the (natural) user RSP. Everything
-     * here reads the KERNEL stack, so no user-stack access and no SMAP
-     * window is needed — the last popq loads the user RSP straight into
-     * %rsp and SYSRETQ returns to CPL=3. */
+    /* CRITICAL (double-fault fix): mask interrupts before restoring the
+     * user RSP. The very next `popq %rsp` loads the user stack pointer while
+     * we are still at CPL=0, so from that instruction until SYSRETQ we run
+     * kernel-privileged ON THE USER STACK. If a maskable IRQ (timer / kbd —
+     * frequent under heavy typing) is delivered in that window, the CPU takes
+     * it with NO privilege change and therefore pushes the interrupt frame
+     * onto %rsp, which is now the user stack. That CPL=0 store to a US=1 page
+     * trips SMAP -> #PF, and delivering the #PF re-pushes onto the same bad
+     * stack -> #DF (observed: vec=0x08, rip=syscall_entry+0xa9 == this
+     * SYSRETQ, rsp = a USER VA inside the task's stack). do_syscall re-enables
+     * IF on several paths (nanosleep/blocking-read sti+hlt+cli, fork's
+     * local_irq_save/restore), so IF is NOT reliably 0 on return here; force
+     * it off ourselves. SYSRETQ reloads RFLAGS (incl. IF=1) from %r11 at the
+     * ring transition, so the user still returns with interrupts enabled —
+     * this CLI only closes the CPL0-on-user-stack window. Non-maskable events
+     * (NMI/MCE) must use an IST stack; that is a separate, orthogonal concern.
+     *
+     * Everything below reads the KERNEL stack until the last popq, which
+     * loads the user RSP straight into %rsp; SYSRETQ then returns to CPL=3. */
+    cli                               /* no IRQ delivery on the user stack */
     popq    %rcx                      /* -24 user RIP    */
     popq    %r11                      /* -16 user RFLAGS */
     popq    %rsp                      /* -8  user RSP (natural) */
