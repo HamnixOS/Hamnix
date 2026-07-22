@@ -140,6 +140,7 @@ from compiler.codegen import (
     type_is_unsigned,
     binop_use_signed,
     rel_setcc,
+    syscall_builtin_args,
     glob_lookup,
     glob_offset,
     glob_elem_size,
@@ -1127,20 +1128,30 @@ def ssa_deref_esgn(expr: uint32) -> uint32:
     return ssa_ptr_esgn[nid]
 
 
-# Lower `&operand` to the operand's ADDRESS value (no load).  Scoped to LOCAL
-# memory (the point of this widening):
+# Lower `&operand` to the operand's ADDRESS value (no load).  LLVM path only
+# (the sole caller gates on ssa_mem_model != 0).  Modeled forms:
 #   &local            (a memory-modeled scalar/array local -> its alloca addr)
 #   &arr[i]           (a memory-array LOCAL -> element addr)
-# Address-of a GLOBAL (scalar or array element) is deliberately NOT modeled here
-# — it is not local memory, and emitting it would make address-taking prelude
-# helpers (e.g. a global-buffer print routine) fall INTO the subset and clash
-# with a linked runtime.  Returns 0 on bail.
+#   &global           (a scalar/array GLOBAL -> the LLVM symbol's address; the
+#                      emitter recovers the [N x i8] symbol from (offset,is_bss))
+#   &global[i]        (a 1-D scalar-element global array -> element addr)
+# On the native path (ssa_mem_model==0) this is never reached, so the native
+# subset is unchanged.  Returns 0 on bail.
 def ssa_lower_addr_of(operand: uint32) -> uint32:
     k: uint32 = nd_kind[operand]
     if k == ND_IDENT:
         nid: uint32 = nm_intern(nd_name_off[operand], nd_name_len[operand])
-        if nid < NM_MAX and ssa_islocal[nid] != 0 and ssa_ismem[nid] != 0:
-            return ssa_mem_addr[nid]
+        if nid < NM_MAX and ssa_islocal[nid] != 0:
+            if ssa_ismem[nid] != 0:
+                return ssa_mem_addr[nid]
+            ssa_set_bail(SBR_MEMORY)
+            return 0
+        # &global (scalar or aggregate): the RIP-relative symbol address.  Any
+        # non-percpu global qualifies — ssa_globaladdr encodes (byte-offset,
+        # is_bss), which the emitter reverse-maps to the [N x i8] @symbol.
+        gi: uint32 = glob_lookup(nd_name_off[operand], nd_name_len[operand])
+        if gi != 0 and glob_is_percpu[gi - 1] == 0:
+            return ssa_globaladdr(gi, ssa_cur_bb)
         ssa_set_bail(SBR_MEMORY)
         return 0
     if k == ND_INDEX:
@@ -1151,6 +1162,12 @@ def ssa_lower_addr_of(operand: uint32) -> uint32:
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
         if bnid < NM_MAX and ssa_islocal[bnid] != 0 and ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
             return ssa_local_index_addr(bnid, nd_b[operand])
+        # &global[i] : element address of a 1-D scalar-element global array,
+        # built as base(GLOBALADDR) + idx*elem_size (the same shape a global
+        # array rvalue index uses).
+        ggi: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
+        if ggi != 0:
+            return ssa_index_addr(ggi, nd_b[operand])
         ssa_set_bail(SBR_MEMORY)
         return 0
     ssa_set_bail(SBR_MEMORY)
@@ -1286,6 +1303,15 @@ def ssa_lower_call(node: uint32, result_used: uint32) -> uint32:
         # calling through a local (fn-pointer) -> bail (indirect not modeled).
         ssa_set_bail(SBR_NONSUBSET_EXPR)
         return 0
+    # `__syscallN(num, a1..aN)` is an INLINE builtin that codegen.ad lowers to a
+    # raw x86 `syscall` — there is no linkable symbol for it, so the LLVM emit
+    # path (which would emit a `call @__syscallN` to a nonexistent symbol) must
+    # bail.  LLVM-path only (ssa_mem_model != 0); the native path is unchanged.
+    # (Before the &global widening this was unreachable — the address argument
+    # bailed first — so an emittable print/IO helper stays a runtime `declare`.)
+    if ssa_mem_model != 0 and syscall_builtin_args(nd_name_off[callee], nd_name_len[callee]) != 0:
+        ssa_set_bail(SBR_CALL)
+        return 0
     # When the result IS consumed, the call lands in %rax full-width; it is only
     # correct if the callee is an in-unit function returning a full-width non-float
     # integer.  Extern / narrow / float / unknown callees bail.  When the result
@@ -1317,8 +1343,11 @@ def ssa_lower_call(node: uint32, result_used: uint32) -> uint32:
         phi_add_operand(cv, 0, av)
         argc = argc + 1
         arg = nd_next[arg]
-    # Phase-1b: >6 register args would need stack marshalling; bail those.
-    if argc > 6:
+    # >6 args need SysV stack marshalling (args 7+ on the stack).  The native
+    # hand-x86 path only spills the 6 register args, so it still bails.  On the
+    # LLVM path (ssa_mem_model != 0) LLVM's calling-convention lowering handles
+    # any arity, so the SVO_CALL is emitted with all operands.
+    if argc > 6 and ssa_mem_model == 0:
         ssa_set_bail(SBR_MANYARGS)
         return 0
     sv_aux[cv] = argc
@@ -2383,9 +2412,11 @@ def ssa_build_function(fn: uint32) -> uint32:
     pidx: uint32 = 0
     while p != 0:
         if nd_kind[p] == ND_PARAM:
-            # Phase-1b: >6 params would need stack-arg spill; bail those (the
-            # trivial round-trip only spills the 6 SysV register args).
-            if pidx >= 6:
+            # >6 params need SysV stack-arg spill (args 7+ arrive on the stack).
+            # The native round-trip only spills the 6 register args, so it bails.
+            # On the LLVM path (ssa_mem_model != 0) LLVM lowers the calling
+            # convention, so any param arity is accepted (SVO_PARAM per index).
+            if pidx >= 6 and ssa_mem_model == 0:
                 ssa_set_bail(SBR_MANYARGS)
                 return 0
             nid: uint32 = ssa_intern_local(nd_name_off[p], nd_name_len[p], nd_a[p])
