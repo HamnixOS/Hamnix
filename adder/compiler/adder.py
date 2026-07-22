@@ -715,6 +715,22 @@ def assemble_and_link_x86_64_linux(asm_file: Path, output: Path,
                   file=sys.stderr)
             return False
 
+    # Stamp EI_OSABI = ELFOSABI_LINUX (3) into e_ident[7] of the linked image.
+    # `ld` emits ELFOSABI_SYSV (0) by default, which the Hamnix loader
+    # (fs/elf.ad::elf_is_linux_binary) would classify as a NATIVE binary and
+    # dispatch under the native ABI — wrong for an image (e.g. host_ac.elf)
+    # that issues Linux syscall numbers. Setting OSABI=3 makes the on-device
+    # loader route it through the linux_abi shim (like busybox/apt) so it runs
+    # correctly inside the Debian/Linux namespace. This mirrors elf_emit.ad's
+    # elf_osabi=3 for --target=x86_64-linux. The x86_64-adder-user target
+    # (assemble_and_link_x86_user) is untouched and keeps OSABI=0. This changes
+    # exactly one header byte; the executable content is unchanged and it still
+    # runs identically on a developer host Linux kernel (OSABI is advisory to
+    # the host loader).
+    with open(output, "r+b") as _fh:
+        _fh.seek(7)  # e_ident[EI_OSABI]
+        _fh.write(b"\x03")
+
     return True
 
 
