@@ -87,5 +87,18 @@ else
     echo "[hb-ib] FAIL SEGCTRL kinds '${kinds}' want '1 2 2 '"; fail=1
 fi
 
+# (4) The AI Mode chip is a `<button ... border-radius:100px>` — a PILL. A
+# <button> must honour its author border-radius (it previously took the geometry
+# path that dropped border/radius, so the chip painted as a SQUARE box). Its
+# SEGCTRL line must carry a large radius (the 100px author value), proving the
+# painter rounds it into a pill rather than the UA 3px default.
+airad=$(grep -E '^SEGCTRL 2 ' "$D" | head -1 | sed -E 's/.* rad ([0-9-]+).*/\1/')
+echo "[hb-ib] AI Mode chip btnrad: ${airad:-<none>}"
+if [ -n "$airad" ] && [ "$airad" -ge 50 ]; then
+    echo "[hb-ib] PASS AI Mode <button> honours border-radius:100px (pill, rad=$airad)"
+else
+    echo "[hb-ib] FAIL AI Mode <button> radius '${airad}' — expected >=50 (border-radius:100px dropped -> square chip)"; fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then echo "[hb-ib] RESULT: FAIL"; exit 1; fi
 echo "[hb-ib] RESULT: PASS — icon-only button suppressed, AI Mode compact, empty-input fallback intact"

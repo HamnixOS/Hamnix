@@ -80,6 +80,13 @@ assert_grep  '^IMGSEG slot 0 w 24 h 24 '  "viewBox-only <svg> keeps 24x24 (perce
 assert_grep  '^IMGSEG slot 1 w 24 h 24 '  "width=24 attr <svg> keeps 24x24 under svg{width:100%}"
 # 3: a FIXED-length CSS size still upscales the viewBox to 300x200.
 assert_grep  '^IMGSEG slot 2 w 300 h 200 ' "fixed-length CSS width:300px still upscales the viewBox"
+# 4: an UNSIZED large-viewBox <svg> (no width/height attr, no fixed CSS px, the
+# global svg{width:100%} declined) falls back to a 24x24 inline-icon default —
+# it must NOT balloon to the 960 viewBox extent and must NOT shrink to 0/vanish.
+assert_grep  '^IMGSEG slot 3 w 24 h 24 ' \
+    "unsized 960-viewBox <svg> defaults to 24x24 (no balloon, no vanish)"
+assert_no_grep '^IMGSEG slot 3 w 0 ' "unsized <svg> is not shrunk to width 0"
+assert_no_grep '^IMGSEG slot 3 w 960 ' "unsized <svg> does not balloon to the 960 viewBox extent"
 # Guard: NO inline <svg> ballooned toward the ~600px content column.
 assert_no_grep '^IMGSEG slot [0-9]+ w (6[0-9][0-9]|[0-9]{4,}) ' \
     "no inline <svg> balloons to the content column width"
