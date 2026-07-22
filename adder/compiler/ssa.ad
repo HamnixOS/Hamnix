@@ -69,6 +69,7 @@ from compiler.parser import (
     ND_CALL,
     ND_CAST,
     ND_TYPE,
+    ND_ARRAY_TYPE,
     ND_INDEX,
     ND_MEMBER,
     ND_VAR_DECL,
@@ -144,6 +145,7 @@ from compiler.codegen import (
     glob_is_signed,
     glob_is_bss,
     glob_signedness,
+    glob_type_node,
 )
 
 from compiler.lexer import (
@@ -316,6 +318,17 @@ ssa_enabled: uint32 = 0
 # return-type gate (Phase 1b) can resolve a direct call's return width.
 ssa_prog_decls: uint32 = 0
 
+# CURRENT block for expression lowering.  Most expressions materialize their
+# value in the block they started in, but a short-circuit `and`/`or` splits the
+# CFG and moves control into a fresh join block.  Because ssa_lower_expr returns
+# only a value id, the "where control now is" fact is threaded through this
+# module global instead: EVERY caller sets ssa_cur_bb before lowering an
+# expression and re-reads it (bb = ssa_cur_bb) afterward, and ssa_lower_expr
+# uses ssa_cur_bb — never its stale `bb` argument — for all appends, variable
+# reads, and recursive lowering.  For straight-line expressions ssa_cur_bb never
+# moves, so this is byte-inert vs the pre-short-circuit behaviour.
+ssa_cur_bb: uint32 = 0
+
 
 def ssa_enable():
     ssa_enabled = 1
@@ -407,6 +420,16 @@ def ssa_expr_sgn(node: uint32) -> uint32:
         callee: uint32 = nd_a[node]
         if callee != 0 and nd_kind[callee] == ND_IDENT:
             return ssa_callee_rettype_sgn(nd_name_off[callee], nd_name_len[callee])
+        return 0
+    if k == ND_INDEX:
+        # arr[i] : the element type's signedness (mirrors codegen expr_signedness
+        # -> index_elem_signed for the 1-D scalar-element global-array case we
+        # actually lower; any other base is unknown/unlowered -> 0).
+        ibase: uint32 = nd_a[node]
+        if ibase != 0 and nd_kind[ibase] == ND_IDENT:
+            igi: uint32 = ssa_global_array_1d(nd_name_off[ibase], nd_name_len[ibase])
+            if igi != 0:
+                return ssa_array_elem_sgn(igi)
         return 0
     return 0
 
@@ -804,6 +827,99 @@ def ssa_global_store(gi: uint32, val: uint32, bb: uint32):
     bb_append(bb, st)
 
 
+# Return the 1-based global index if `off/len` names an EMITTABLE 1-D
+# scalar-element array global, else 0.  A 1-D array is indexed as
+# base + idx*elem_size with a sized load/store.  Multi-dimensional globals
+# (whose flat glob_elem_size records the INNERMOST width, not the row stride),
+# pointer globals (glob_elem_size == 0) and percpu globals are all rejected so
+# only the flat single-index case reaches ssa_index_addr.
+def ssa_global_array_1d(off: uint32, len_: uint32) -> uint32:
+    gi: uint32 = glob_lookup(off, len_)
+    if gi == 0:
+        return 0
+    es: uint32 = glob_elem_size[gi - 1]
+    if es != 1 and es != 2 and es != 4 and es != 8:
+        return 0                              # scalar (0) or non-machine width
+    if glob_is_percpu[gi - 1] != 0:
+        return 0
+    tn: uint32 = glob_type_node[gi - 1]
+    if tn == 0 or nd_kind[tn] != ND_ARRAY_TYPE:
+        return 0
+    if nd_kind[nd_a[tn]] == ND_ARRAY_TYPE:
+        return 0                              # multi-dimensional -> defer
+    return gi
+
+
+# Element signedness tristate (0 unknown / 1 unsigned / 2 signed) of 1-D array
+# global `gi` — the declared element type's signedness (mirrors codegen
+# expr_signedness -> index_elem_signed for the flat-global case).
+def ssa_array_elem_sgn(gi: uint32) -> uint32:
+    return type_signedness(nd_a[glob_type_node[gi - 1]])
+
+
+# Byte address of `gi[idxnode]` for a 1-D scalar-array global: idx is lowered
+# (may advance ssa_cur_bb across a short-circuit), then base = GLOBALADDR(gi) and
+# addr = base + idx*elem_size are built as PURE pointer arithmetic in the current
+# block, reusing the existing globaladdr / BINOP emit paths.  Returns 0 on bail.
+def ssa_index_addr(gi: uint32, idxnode: uint32) -> uint32:
+    idxv: uint32 = ssa_lower_expr(idxnode, ssa_cur_bb)
+    if idxv == 0:
+        return 0
+    base: uint32 = ssa_globaladdr(gi, ssa_cur_bb)
+    if base == 0:
+        return 0
+    es: uint32 = glob_elem_size[gi - 1]
+    scaled: uint32 = idxv
+    if es != 1:
+        sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](es))
+        if sc == 0:
+            return 0
+        mul: uint32 = sv_new(SVO_BINOP)
+        if mul == 0:
+            return 0
+        sv_aux[mul] = BINOP_MUL
+        sv_a[mul] = idxv
+        sv_b[mul] = sc
+        bb_append(ssa_cur_bb, mul)
+        scaled = mul
+    addv: uint32 = sv_new(SVO_BINOP)
+    if addv == 0:
+        return 0
+    sv_aux[addv] = BINOP_ADD
+    sv_a[addv] = base
+    sv_b[addv] = scaled
+    sv_type[addv] = SVT_PTR
+    bb_append(ssa_cur_bb, addv)
+    return addv
+
+
+# Emit a sized SVO_LOAD of width `es` (signedness `sgn` tristate) from address
+# value `addr` into the current block.
+def ssa_load_at(addr: uint32, es: uint32, sgn: uint32) -> uint32:
+    ld: uint32 = sv_new(SVO_LOAD)
+    if ld == 0:
+        return 0
+    sv_a[ld] = addr
+    sv_aux[ld] = es
+    if es < 8 and sgn == 2:
+        sv_c[ld] = 1                          # signed sub-word load (movsx)
+    else:
+        sv_c[ld] = 0                          # zero-extend / full-width load
+    bb_append(ssa_cur_bb, ld)
+    return ld
+
+
+# Emit a sized SVO_STORE of width `es` of value `val` to address value `addr`.
+def ssa_store_at(addr: uint32, val: uint32, es: uint32):
+    st: uint32 = sv_new(SVO_STORE)
+    if st == 0:
+        return
+    sv_a[st] = addr
+    sv_b[st] = val
+    sv_aux[st] = es
+    bb_append(ssa_cur_bb, st)
+
+
 # Build the SVO_BINOP for an augmented assignment `x op= e` == `x op e`, setting
 # the div/mod/shr signedness hint (sv_c) from the operand AST nodes exactly as the
 # ND_BINARY path does (lnode = the target value operand, rnode = the RHS expr).
@@ -827,11 +943,98 @@ def ssa_build_aug_binop(aug: uint32, cur: uint32, rhs: uint32, lnode: uint32,
     return v5
 
 
+# Emit a full-width integer constant `imm` into block `bb`, returning its vid.
+def ssa_const_in(bb: uint32, imm: uint64) -> uint32:
+    c: uint32 = sv_new(SVO_CONST)
+    if c == 0:
+        return 0
+    sv_imm[c] = imm
+    bb_append(bb, c)
+    return c
+
+
+# Lower a short-circuit `L and R` / `L or R` to control flow + a join phi that
+# yields the 0/1 BOOLEAN result — matching the legacy backend's gen_short_circuit
+# exactly (result is 0/1, NOT the operand value, and R is evaluated ONLY when L
+# does not already decide the result).  Advances ssa_cur_bb to the join block.
+#
+# Layout (both forms): eval L in the current block bL; a two-way branch on L's
+# truthiness; eval R in rbb (its own current block bR) under a second truthiness
+# branch; a `true` block (const 1) and a `false` block (const 0) merge at `join`
+# via a phi.  For `and`, L-false shortcuts to the false block; for `or`, L-true
+# shortcuts to the true block.
+def ssa_lower_shortcircuit(node: uint32, op: uint32) -> uint32:
+    lv: uint32 = ssa_lower_expr(nd_a[node], ssa_cur_bb)
+    if lv == 0:
+        return 0
+    bL: uint32 = ssa_cur_bb                       # block L's value landed in
+    rbb: uint32 = bb_new_ssa()
+    if rbb == 0:
+        return 0
+    tbb: uint32 = bb_new_ssa()
+    if tbb == 0:
+        return 0
+    fbb: uint32 = bb_new_ssa()
+    if fbb == 0:
+        return 0
+    join: uint32 = bb_new_ssa()
+    if join == 0:
+        return 0
+    if op == BINOP_AND:
+        # L truthy -> evaluate R; L falsy -> result false.
+        ssa_terminate_condbr(bL, lv, rbb, fbb)
+    else:
+        # L truthy -> result true; L falsy -> evaluate R.
+        ssa_terminate_condbr(bL, lv, tbb, rbb)
+    # R arm.
+    ssa_seal_block(rbb)                           # single pred: bL
+    ssa_cur_bb = rbb
+    rv: uint32 = ssa_lower_expr(nd_b[node], rbb)
+    if rv == 0:
+        return 0
+    bR: uint32 = ssa_cur_bb                       # block R's value landed in
+    # R truthy -> true block; R falsy -> false block (both forms).
+    ssa_terminate_condbr(bR, rv, tbb, fbb)
+    if ssa_bail != 0:
+        return 0
+    # true block: const 1 -> join.
+    ssa_seal_block(tbb)
+    c1: uint32 = ssa_const_in(tbb, cast[uint64](1))
+    if c1 == 0:
+        return 0
+    sv_type[c1] = SVT_I1
+    ssa_terminate_br(tbb, join)
+    # false block: const 0 -> join.
+    ssa_seal_block(fbb)
+    c0: uint32 = ssa_const_in(fbb, cast[uint64](0))
+    if c0 == 0:
+        return 0
+    sv_type[c0] = SVT_I1
+    ssa_terminate_br(fbb, join)
+    if ssa_bail != 0:
+        return 0
+    # join: phi selects 1 (true path) or 0 (false path).
+    ssa_seal_block(join)
+    phi: uint32 = sv_new(SVO_PHI)
+    if phi == 0:
+        return 0
+    bb_prepend(join, phi)
+    sv_type[phi] = SVT_I1
+    phi_add_operand(phi, tbb, c1)
+    phi_add_operand(phi, fbb, c0)
+    ssa_cur_bb = join
+    return phi
+
+
 def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
     if ssa_bail != 0:
         return 0
     if node == 0:
         return 0
+    # The block a subexpression's value lands in is ssa_cur_bb (threaded across
+    # short-circuit CFG splits), NOT the stale `bb` argument.  Callers seed
+    # ssa_cur_bb; recursion below passes ssa_cur_bb so a nested short-circuit that
+    # advanced control is observed by the parent.
     k: uint32 = nd_kind[node]
 
     if k == ND_INT_LIT or k == ND_CHAR_LIT or k == ND_BOOL_LIT:
@@ -842,7 +1045,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         sv_ast[v] = node
         if k == ND_BOOL_LIT:
             sv_type[v] = SVT_I1
-        bb_append(bb, v)
+        bb_append(ssa_cur_bb, v)
         return v
 
     if k == ND_IDENT:
@@ -855,20 +1058,19 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             # anything else (array/percpu global, function name, unknown) bails.
             gi: uint32 = ssa_scalar_global(nd_name_off[node], nd_name_len[node])
             if gi != 0:
-                return ssa_global_load(gi, bb)
+                return ssa_global_load(gi, ssa_cur_bb)
             ssa_set_bail(SBR_NONLOCAL)
             return 0
         if ssa_name_promotable(nid) == 0:
             ssa_set_bail(SBR_NONPROMOTABLE)
             return 0
-        return ssa_read_var(nid, bb)
+        return ssa_read_var(nid, ssa_cur_bb)
 
     if k == ND_BINARY:
         op: uint32 = nd_aux[node]
         if op == BINOP_AND or op == BINOP_OR:
-            # short-circuit control flow, not a value op in Ph1.
-            ssa_set_bail(SBR_SHORTCIRCUIT)
-            return 0
+            # short-circuit `and`/`or` -> control flow + join phi (§ short-circuit).
+            return ssa_lower_shortcircuit(node, op)
         # div/mod (idiv vs div) and arithmetic-shift-right (sar vs shr) and the
         # ordered compares (< <= > >=, signed vs unsigned setcc) select their x86
         # instruction from operand SIGNEDNESS — now tracked per value via the
@@ -884,10 +1086,10 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         # (lowering does not mutate the AST, but read them plainly).
         lnode: uint32 = nd_a[node]
         rnode: uint32 = nd_b[node]
-        la: uint32 = ssa_lower_expr(lnode, bb)
+        la: uint32 = ssa_lower_expr(lnode, ssa_cur_bb)
         if la == 0:
             return 0
-        rb: uint32 = ssa_lower_expr(rnode, bb)
+        rb: uint32 = ssa_lower_expr(rnode, ssa_cur_bb)
         if rb == 0:
             return 0
         vop: uint32 = SVO_BINOP
@@ -915,7 +1117,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
                 sv_c[v3] = 1
             else:
                 sv_c[v3] = 0
-        bb_append(bb, v3)
+        bb_append(ssa_cur_bb, v3)
         return v3
 
     if k == ND_UNARY:
@@ -930,7 +1132,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         else:
             ssa_set_bail(SBR_MEMORY)   # deref / addr-of -> bail
             return 0
-        oa: uint32 = ssa_lower_expr(nd_a[node], bb)
+        oa: uint32 = ssa_lower_expr(nd_a[node], ssa_cur_bb)
         if oa == 0:
             return 0
         v4: uint32 = sv_new(vop2)
@@ -938,7 +1140,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             return 0
         sv_a[v4] = oa
         sv_ast[v4] = node
-        bb_append(bb, v4)
+        bb_append(ssa_cur_bb, v4)
         return v4
 
     if k == ND_CALL:
@@ -968,7 +1170,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         arg: uint32 = nd_b[node]
         argc: uint32 = 0
         while arg != 0:
-            av: uint32 = ssa_lower_expr(arg, bb)
+            av: uint32 = ssa_lower_expr(arg, ssa_cur_bb)
             if av == 0:
                 return 0
             phi_add_operand(cv, 0, av)
@@ -979,7 +1181,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             ssa_set_bail(SBR_MANYARGS)
             return 0
         sv_aux[cv] = argc
-        bb_append(bb, cv)
+        bb_append(ssa_cur_bb, cv)
         return cv
 
     if k == ND_CAST:
@@ -997,7 +1199,7 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         if type_float_width(tnode) != 0:
             ssa_set_bail(SBR_FLOAT)      # float destination -> SSE
             return 0
-        opv: uint32 = ssa_lower_expr(nd_b[node], bb)
+        opv: uint32 = ssa_lower_expr(nd_b[node], ssa_cur_bb)
         if opv == 0:
             return 0
         dsz: uint32 = 8
@@ -1016,17 +1218,86 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             sv_c[cv2] = 1                          # signed dest -> sign-extend (movsx)
         else:
             sv_c[cv2] = 0                          # unsigned dest -> zero-extend (movzx)
-        bb_append(bb, cv2)
+        bb_append(ssa_cur_bb, cv2)
         return cv2
 
-    # float literal, index, member, slice, conditional, etc. -> bail.
+    if k == ND_INDEX:
+        # `arr[i]` rvalue.  Only a 1-D scalar-element GLOBAL array indexed by an
+        # in-subset integer expression is accepted; the element is loaded at the
+        # computed byte address.  Local arrays (need alloca), pointer/struct/
+        # multi-dim bases, etc. fall back.
+        base: uint32 = nd_a[node]
+        if nd_kind[base] != ND_IDENT:
+            ssa_set_bail(SBR_MEMORY)
+            return 0
+        bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
+        if bnid < NM_MAX and ssa_islocal[bnid] != 0:
+            ssa_set_bail(SBR_MEMORY)              # local array -> needs alloca
+            return 0
+        gia: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
+        if gia == 0:
+            ssa_set_bail(SBR_MEMORY)
+            return 0
+        addr: uint32 = ssa_index_addr(gia, nd_b[node])
+        if addr == 0:
+            return 0
+        return ssa_load_at(addr, glob_elem_size[gia - 1], ssa_array_elem_sgn(gia))
+
+    # float literal, member, slice, conditional, etc. -> bail.
     if k == ND_FLOAT_LIT:
         ssa_set_bail(SBR_FLOAT)
-    elif k == ND_INDEX or k == ND_MEMBER:
+    elif k == ND_MEMBER:
         ssa_set_bail(SBR_MEMORY)
     else:
         ssa_set_bail(SBR_NONSUBSET_EXPR)
     return 0
+
+
+# Lower `arr[idx] = rhs` / `arr[idx] op= rhs` for a 1-D scalar-element GLOBAL
+# array.  Returns the (unchanged-through-a-store) fallthrough block.  Callers seed
+# ssa_cur_bb; this re-reads it after each lowered subexpression.
+def ssa_lower_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
+    base: uint32 = nd_a[target]
+    if nd_kind[base] != ND_IDENT:
+        ssa_set_bail(SBR_MEMORY)
+        return bb
+    bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
+    if bnid < NM_MAX and ssa_islocal[bnid] != 0:
+        ssa_set_bail(SBR_MEMORY)                  # local array -> needs alloca
+        return bb
+    gi: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
+    if gi == 0:
+        ssa_set_bail(SBR_MEMORY)
+        return bb
+    es: uint32 = glob_elem_size[gi - 1]
+    aug: uint32 = nd_aux[stmt]
+    if aug != 0:
+        # arr[i] op= e  ==  arr[i] = (arr[i] op e): compute the address ONCE (so
+        # the index is evaluated once), load, combine, store back to the SAME
+        # address value.
+        addr: uint32 = ssa_index_addr(gi, nd_b[target])
+        if addr == 0:
+            return ssa_cur_bb
+        cur: uint32 = ssa_load_at(addr, es, ssa_array_elem_sgn(gi))
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at(addr, comb, es)
+        return ssa_cur_bb
+    # plain store: lower the RHS, then the address, then store.
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    addr2: uint32 = ssa_index_addr(gi, nd_b[target])
+    if addr2 == 0:
+        return ssa_cur_bb
+    ssa_store_at(addr2, rhsv, es)
+    return ssa_cur_bb
 
 
 # =======================================================================
@@ -1085,6 +1356,10 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
         return 0
     if bb == 0:
         return 0
+    # Seed the expression-lowering current block; a short-circuit inside any RHS
+    # advances ssa_cur_bb, so every handler re-reads bb = ssa_cur_bb after lowering
+    # before it appends stores / terminators.
+    ssa_cur_bb = bb
     k: uint32 = nd_kind[stmt]
 
     if k == ND_PASS:
@@ -1099,6 +1374,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             val = ssa_lower_expr(nd_b[stmt], bb)
             if val == 0:
                 return bb
+            bb = ssa_cur_bb                          # RHS may have split control
             val = ssa_trunc_to_local(nid, val, bb)   # narrow-local store truncation
             if val == 0:
                 return bb
@@ -1113,8 +1389,11 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
 
     if k == ND_ASSIGN:
         target: uint32 = nd_a[stmt]
+        if nd_kind[target] == ND_INDEX:
+            # store into a 1-D scalar-element GLOBAL array element.
+            return ssa_lower_index_store(bb, stmt, target)
         if nd_kind[target] != ND_IDENT:
-            # store through index/member/deref -> memory, outside Ph1 subset.
+            # store through member/deref -> memory, outside the current subset.
             ssa_set_bail(SBR_MEMORY)
             return bb
         tid: uint32 = nm_intern(nd_name_off[target], nd_name_len[target])
@@ -1132,6 +1411,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             rhsg: uint32 = ssa_lower_expr(nd_b[stmt], bb)
             if rhsg == 0:
                 return bb
+            bb = ssa_cur_bb                          # RHS may have split control
             if aug != 0:
                 # g op= e == g = (g op e): read the global, combine, store back.
                 curg: uint32 = ssa_global_load(gi, bb)
@@ -1150,6 +1430,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
         rhs: uint32 = ssa_lower_expr(nd_b[stmt], bb)
         if rhs == 0:
             return bb
+        bb = ssa_cur_bb                              # RHS may have split control
         if aug != 0:
             # x op= e  ==>  x = (x op e)
             cur: uint32 = ssa_read_var(tid, bb)
@@ -1171,7 +1452,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
 
     if k == ND_EXPR_STMT:
         ssa_lower_expr(nd_a[stmt], bb)   # value discarded; may be a call side-effect
-        return bb
+        return ssa_cur_bb                # a short-circuit may have split control
 
     if k == ND_RETURN:
         rv: uint32 = 0
@@ -1179,6 +1460,7 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             rv = ssa_lower_expr(nd_a[stmt], bb)
             if rv == 0 and ssa_bail != 0:
                 return 0
+        bb = ssa_cur_bb                  # return value may have split control
         ret: uint32 = sv_new(SVO_RET)
         if ret == 0:
             return 0
@@ -1274,9 +1556,11 @@ def ssa_lower_chain(bb: uint32, head: uint32) -> uint32:
 # predecessor set.  The enclosing branch's edges are added, then the arm body is
 # sealed + lowered.
 def ssa_lower_if(bb: uint32, stmt: uint32) -> uint32:
+    ssa_cur_bb = bb
     cond: uint32 = ssa_lower_expr(nd_a[stmt], bb)
     if cond == 0:
         return 0
+    cbb: uint32 = ssa_cur_bb              # a short-circuit condition splits control
     join: uint32 = bb_new_ssa()
     if join == 0:
         return 0
@@ -1291,8 +1575,8 @@ def ssa_lower_if(bb: uint32, stmt: uint32) -> uint32:
         else_bb = bb_new_ssa()
         if else_bb == 0:
             return 0
-    # wire the branch edges FIRST (bb -> then_bb, bb -> else_bb).
-    ssa_terminate_condbr(bb, cond, then_bb, else_bb)
+    # wire the branch edges FIRST (cbb -> then_bb, cbb -> else_bb).
+    ssa_terminate_condbr(cbb, cond, then_bb, else_bb)
     # then arm.
     ssa_seal_block(then_bb)
     then_tail: uint32 = ssa_lower_chain(then_bb, nd_b[stmt])
@@ -1316,9 +1600,11 @@ def ssa_lower_if_alts(entry_bb: uint32, elif_head: uint32, else_head: uint32,
         return
     ssa_seal_block(entry_bb)              # single known pred (the enclosing branch)
     if elif_head != 0:
+        ssa_cur_bb = entry_bb
         cond: uint32 = ssa_lower_expr(nd_a[elif_head], entry_bb)
         if cond == 0:
             return
+        cbb: uint32 = ssa_cur_bb          # a short-circuit condition splits control
         body_bb: uint32 = bb_new_ssa()
         if body_bb == 0:
             return
@@ -1330,7 +1616,7 @@ def ssa_lower_if_alts(entry_bb: uint32, elif_head: uint32, else_head: uint32,
             next_bb = bb_new_ssa()
             if next_bb == 0:
                 return
-        ssa_terminate_condbr(entry_bb, cond, body_bb, next_bb)
+        ssa_terminate_condbr(cbb, cond, body_bb, next_bb)
         ssa_seal_block(body_bb)
         bt: uint32 = ssa_lower_chain(body_bb, nd_b[elif_head])
         if bt != 0:
@@ -1354,16 +1640,18 @@ def ssa_lower_while(bb: uint32, stmt: uint32) -> uint32:
         return 0
     ssa_terminate_br(bb, header)          # pred #1 (pre-loop) wired
     # header is NOT sealed yet: the back-edge pred is still unknown.
+    ssa_cur_bb = header
     cond: uint32 = ssa_lower_expr(nd_a[stmt], header)
     if cond == 0:
         return 0
+    chb: uint32 = ssa_cur_bb              # a short-circuit condition splits control
     body_bb: uint32 = bb_new_ssa()
     if body_bb == 0:
         return 0
     exit_bb: uint32 = bb_new_ssa()
     if exit_bb == 0:
         return 0
-    ssa_terminate_condbr(header, cond, body_bb, exit_bb)
+    ssa_terminate_condbr(chb, cond, body_bb, exit_bb)
     ssa_seal_block(body_bb)               # body's only entry pred is the header
     if ssa_loop_depth >= SSA_LOOP_MAX:
         ssa_set_bail(SBR_LOOPDEPTH)
@@ -1405,10 +1693,12 @@ def ssa_lower_do_while(bb: uint32, stmt: uint32) -> uint32:
     if body_tail != 0:
         ssa_terminate_br(body_tail, cond_bb)
     ssa_seal_block(cond_bb)               # cond's preds (body tail + continues) known
+    ssa_cur_bb = cond_bb
     cond: uint32 = ssa_lower_expr(nd_a[stmt], cond_bb)
     if cond == 0:
         return 0
-    ssa_terminate_condbr(cond_bb, cond, body_bb, exit_bb)  # back-edge to body wired
+    ccb: uint32 = ssa_cur_bb              # a short-circuit condition splits control
+    ssa_terminate_condbr(ccb, cond, body_bb, exit_bb)  # back-edge to body wired
     ssa_seal_block(body_bb)               # now all body preds known
     ssa_seal_block(exit_bb)
     return exit_bb
