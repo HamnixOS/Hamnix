@@ -74,16 +74,33 @@ assert_grep '^SEG [0-9]+ (5|6|7)[0-9][0-9] #[0-9a-f]+ b1 u[0-9] s[0-9] l-1 bg#eb
     "float:right infobox pinned to the right edge (large x) with its bg"
 
 # --- body text wraps to the LEFT of the right float ------------------
-# BODYONE flows at the left margin (x=158) on an early row that OVERLAPS the
-# infobox's rows (proving beside-flow, not a stack below it).
-assert_grep '^SEG 2 158 #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYONE' \
-    "body paragraph flows on the LEFT of the right float, same top row"
+# BODYONE flows at the UA left content edge (x=8) on the SAME early row (2) the
+# infobox occupies — proving beside-flow, not a stack below it. This matches
+# Chrome: for a `float:right`, the following paragraph's left edge stays at the
+# left margin (measured Chrome for this fixture at 900px: P.left = 8) and only
+# its line-box RIGHT is shortened by the float. (The prior expectation of x=158
+# predated the float:right left-edge fix; Chrome puts it at 8.)
+assert_grep '^SEG 2 8 #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYONE' \
+    "body paragraph flows on the LEFT of the right float, same top row (x=8, Chrome=8)"
 
 # --- float:left figure indents the following paragraph ---------------
-# FIGBOX box on the left; BODYTHREE's left edge pushed to ~x=326 beside it.
+# FIGBOX (float:left width:160) box on the left; BODYTHREE's left edge is pushed
+# RIGHT to x=176 (fig 160 + 8 gap + 8 margin) beside it, on the float's top row.
+# Measured Chrome for this fixture at 900px: the fig box is x=8..170, so the
+# beside text begins at ~170; the engine's 176 matches within a gutter cell.
+# (The prior 3xx expectation over-indented; Chrome sits the text at ~170.)
 assert_grep '.FIGBOX a tabby cat.'  "float:left figure box rendered"
-assert_grep '^SEG 1[0-9] (3|4)[0-9][0-9] #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYTHREE' \
-    "paragraph after a float:left is indented to its RIGHT (beside it)"
+assert_grep '^SEG [0-9]+ 176 #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .BODYTHREE' \
+    "paragraph after a float:left is indented to its RIGHT (beside it) (x=176, Chrome~170)"
+
+# --- NARROW float:left (< old 48px floor) still floats ----------------
+# A 40px `float:left` score box (the lobste.rs voter-score / slim icon-gutter
+# pattern) must be taken out of flow so the following headline wraps BESIDE it,
+# not stack below. Pre-fix the engine rejected any float narrower than 6 cells
+# (48px) and it fell back to a full-width in-flow block, dropping SCORELINE to
+# the left margin on a LATER row. Post-fix SCORELINE flows beside at x >= 48.
+assert_grep '^SEG [0-9]+ (4[89]|[5-9][0-9]|1[0-9][0-9]) #[0-9a-f]+ b0 u0 s[0-9] l-1 bg- .SCORELINE' \
+    "headline flows BESIDE a narrow 40px float:left (not stacked below)"
 
 echo "[hb-float] compiling native hambrowse for x86_64-adder-user (no regress) ..."
 if ! python3 -m compiler.adder compile --target=x86_64-adder-user \
