@@ -1,0 +1,843 @@
+# adder/compiler/ssa_llvm.ad
+#
+# OPTIONAL "release/fast" LLVM backend for the self-hosted Adder compiler (a
+# SPIKE, not the default). It walks the Phase-1 SSA IR (ssa.ad) — the value/
+# instruction model documented there as "the LLVM subset" — and emits TEXTUAL
+# LLVM IR (.ll) for every function the SSA path accepts. The .ll is then handed
+# to clang-19 / llc (no libLLVM linkage), which runs LLVM's optimizer and code
+# generator, exactly like Rust's MIR->LLVM lowering.
+#
+# ISOLATION
+# ---------
+# codegen.ad (the seed backend) is UNCHANGED and stays the DEFAULT + the self-
+# hosting bootstrap. ssa.ad is UNCHANGED — this module only READS its arenas
+# (sv_*, sb_*, arg_*) after ssa_build_function() populates them, and CALLS the
+# codegen global/enum/class layout helpers to populate the globals table so the
+# SSA array/scalar-global paths resolve. It never emits machine code and never
+# mutates the AST, so with this module unreferenced the default path is byte-
+# identical. It is reached only through the dedicated --emit-llvm driver lane
+# (tests/fuzz/ssa_llvm_dump_driver.ad).
+#
+# VALUE MODEL / TYPING
+# --------------------
+# LLVM is strongly typed; the SSA IR is mostly i64 with i1 for compares/bools and
+# integer-modelled addresses. Canonical rule: every emitted %vN register is i64
+# EXCEPT SVO_ICMP results and explicitly-i1 (SVT_I1) values, which are i1.
+#   * SVO_CONST / SVO_UNDEF: no instruction — inlined as a literal / `undef`.
+#   * SVO_LOAD of a sub-word width: `load iW` then zext/sext to i64 -> %vN is i64.
+#   * SVO_STORE of a sub-word width: `trunc i64 -> iW` then `store iW`.
+#   * SVO_TRUNC (narrowing cast / narrow-local write): `trunc i64 -> iW` then
+#     zext/sext back to i64 (models the legacy sized-store + extended-load).
+#   * Addresses (SVO_GLOBALADDR + base+idx*scale arithmetic) are i64; LOAD/STORE
+#     `inttoptr` them to iW* at the point of access — a pure byte-addressed model
+#     that matches the SSA's integer address arithmetic exactly.
+#   * SVO_CONDBR coerces a non-i1 condition with `icmp ne i64 cond, 0`.
+# Globals become opaque `[BYTES x i8]` symbols; a GLOBALADDR is `ptrtoint` of the
+# symbol, recovered from (byte-offset, is_bss) via a reverse scan of the globals
+# table (the SSA erased the symbol into an offset).
+
+from compiler.parser import (
+    nd_kind,
+    nd_a,
+    nd_name_off,
+    nd_name_len,
+    nd_b,
+    nd_next,
+    ND_FUNCTION,
+    BINOP_ADD,
+    BINOP_SUB,
+    BINOP_MUL,
+    BINOP_DIV,
+    BINOP_IDIV,
+    BINOP_MOD,
+    BINOP_BIT_OR,
+    BINOP_BIT_AND,
+    BINOP_BIT_XOR,
+    BINOP_SHL,
+    BINOP_SHR,
+)
+
+from compiler.lexer import (
+    strbuf,
+)
+
+from compiler.ssa import (
+    sv_op,
+    sv_type,
+    sv_a,
+    sv_b,
+    sv_c,
+    sv_aux,
+    sv_imm,
+    sv_ast,
+    sv_next,
+    sv_arg_head,
+    sv_argn,
+    sv_count,
+    sb_first_val,
+    sb_rpo,
+    sb_rpo_n,
+    arg_val,
+    arg_pred,
+    arg_next,
+    ssa_build_function,
+    ssa_build_domtree,
+    ssa_bail,
+    ssa_bail_reason,
+    ssa_prog_decls,
+    SVT_I1,
+    SVO_CONST,
+    SVO_UNDEF,
+    SVO_PARAM,
+    SVO_BINOP,
+    SVO_NEG,
+    SVO_NOT,
+    SVO_BITNOT,
+    SVO_ICMP,
+    SVO_TRUNC,
+    SVO_GLOBALADDR,
+    SVO_LOAD,
+    SVO_STORE,
+    SVO_BR,
+    SVO_CONDBR,
+    SVO_RET,
+    SVO_PHI,
+    SVO_CALL,
+)
+
+from compiler.codegen import (
+    cg_init,
+    cg_prog_decls,
+    layout_classes,
+    register_enums,
+    layout_globals,
+    glob_count,
+    glob_name_off,
+    glob_name_len,
+    glob_offset,
+    glob_elem_size,
+    glob_scalar_size,
+    glob_is_bss,
+    glob_is_percpu,
+    glob_type_node,
+    type_size_of,
+    gdata,
+)
+
+# =======================================================================
+# Output buffer.  The driver flushes llvm_out[0 .. llvm_out_len) via sys_write.
+# =======================================================================
+LL_OUT_CAP: uint32 = 4194304
+llvm_out: Array[4194304, uint8]
+llvm_out_len: uint32 = 0
+
+# defined-function name set (accepted functions) + called-function set.
+LL_NAME_MAX: uint32 = 2048
+dn_off: Array[2048, uint32]
+dn_len: Array[2048, uint32]
+dn_count: uint32 = 0
+
+ce_off: Array[2048, uint32]
+ce_len: Array[2048, uint32]
+ce_argc: Array[2048, uint32]
+ce_count: uint32 = 0
+
+# per-function fresh-temp counter (LLVM %tN, disjoint from %vN value names).
+llvm_tmp: uint32 = 0
+
+# program stats
+llvm_stat_funcs: uint32 = 0
+llvm_stat_emitted: uint32 = 0
+llvm_stat_bailed: uint32 = 0
+
+
+# =======================================================================
+# low-level text emit
+# =======================================================================
+def ll_putc(c: uint32):
+    if llvm_out_len < LL_OUT_CAP:
+        llvm_out[llvm_out_len] = cast[uint8](c & 255)
+        llvm_out_len = llvm_out_len + 1
+
+
+def ll_puts(s: Ptr[uint8]):
+    i: uint32 = 0
+    while s[i] != 0:
+        ll_putc(cast[uint32](s[i]))
+        i = i + 1
+
+
+def ll_put_name(off: uint32, len_: uint32):
+    i: uint32 = 0
+    while i < len_:
+        ll_putc(cast[uint32](strbuf[off + i]))
+        i = i + 1
+
+
+def ll_put_u64_dec(v: uint64):
+    if v == cast[uint64](0):
+        ll_putc(48)
+        return
+    tmp: Array[24, uint8]
+    n: uint32 = 0
+    x: uint64 = v
+    while x > cast[uint64](0):
+        d: uint64 = x % cast[uint64](10)
+        tmp[n] = cast[uint8](d + cast[uint64](48))
+        n = n + 1
+        x = x / cast[uint64](10)
+    while n > 0:
+        n = n - 1
+        ll_putc(cast[uint32](tmp[n]))
+
+
+def ll_put_u32(v: uint32):
+    ll_put_u64_dec(cast[uint64](v))
+
+
+# Print the 64-bit pattern `bits` as a SIGNED decimal (LLVM-friendly for i64).
+def ll_put_i64(bits: uint64):
+    v: int64 = cast[int64](bits)
+    if v < 0:
+        ll_putc(45)                       # '-'
+        mag: uint64 = cast[uint64](0) - bits
+        ll_put_u64_dec(mag)
+        return
+    ll_put_u64_dec(bits)
+
+
+# =======================================================================
+# operand + type helpers
+# =======================================================================
+# Is value `v` an i1 (compare result / explicitly-bool value)?
+def llvm_is_i1(v: uint32) -> uint32:
+    if v == 0:
+        return 0
+    if sv_op[v] == SVO_ICMP:
+        return 1
+    if sv_type[v] == SVT_I1:
+        return 1
+    return 0
+
+
+# Render `v` as an operand token: a constant/undef inlines its literal, every
+# other value prints its SSA register name %vN.
+def ll_put_operand(v: uint32):
+    if v == 0:
+        ll_putc(48)                       # '0'
+        return
+    op: uint32 = sv_op[v]
+    if op == SVO_CONST:
+        ll_put_i64(sv_imm[v])
+        return
+    if op == SVO_UNDEF:
+        ll_puts("undef")
+        return
+    ll_putc(37)                           # '%'
+    ll_putc(118)                          # 'v'
+    ll_put_u32(v)
+
+
+# Print `%vN = ` (the result binding for value v).
+def ll_put_result(v: uint32):
+    ll_puts("  %v")
+    ll_put_u32(v)
+    ll_puts(" = ")
+
+
+def ll_new_tmp() -> uint32:
+    t: uint32 = llvm_tmp
+    llvm_tmp = llvm_tmp + 1
+    return t
+
+
+def ll_put_tmp(t: uint32):
+    ll_putc(37)                           # '%'
+    ll_putc(116)                          # 't'
+    ll_put_u32(t)
+
+
+# Print an LLVM integer type `iBITS` for a byte width `w` (1->i8 .. 8->i64).
+# The SSA carries load/store/trunc widths in BYTES; LLVM types are in BITS.
+def ll_put_ity(w: uint32):
+    ll_putc(105)                          # 'i'
+    ll_put_u32(w * 8)
+
+
+# integer arithmetic/bitwise mnemonic for a BINOP (`signed_`=1 selects the
+# signed division / arithmetic-shift form).
+def ll_put_binop_mnem(op: uint32, signed_: uint32):
+    if op == BINOP_ADD:
+        ll_puts("add")
+        return
+    if op == BINOP_SUB:
+        ll_puts("sub")
+        return
+    if op == BINOP_MUL:
+        ll_puts("mul")
+        return
+    if op == BINOP_DIV or op == BINOP_IDIV:
+        if signed_ != 0:
+            ll_puts("sdiv")
+        else:
+            ll_puts("udiv")
+        return
+    if op == BINOP_MOD:
+        if signed_ != 0:
+            ll_puts("srem")
+        else:
+            ll_puts("urem")
+        return
+    if op == BINOP_BIT_AND:
+        ll_puts("and")
+        return
+    if op == BINOP_BIT_OR:
+        ll_puts("or")
+        return
+    if op == BINOP_BIT_XOR:
+        ll_puts("xor")
+        return
+    if op == BINOP_SHL:
+        ll_puts("shl")
+        return
+    if op == BINOP_SHR:
+        if signed_ != 0:
+            ll_puts("ashr")
+        else:
+            ll_puts("lshr")
+        return
+    ll_puts("add")                        # unreachable in-subset
+
+
+# LLVM icmp predicate from the resolved x86 setcc opcode byte (sv_c on an ICMP).
+def ll_put_icmp_pred(cc: uint32):
+    if cc == 0x94:
+        ll_puts("eq")
+        return
+    if cc == 0x95:
+        ll_puts("ne")
+        return
+    if cc == 0x9C:
+        ll_puts("slt")
+        return
+    if cc == 0x92:
+        ll_puts("ult")
+        return
+    if cc == 0x9E:
+        ll_puts("sle")
+        return
+    if cc == 0x96:
+        ll_puts("ule")
+        return
+    if cc == 0x9F:
+        ll_puts("sgt")
+        return
+    if cc == 0x97:
+        ll_puts("ugt")
+        return
+    if cc == 0x9D:
+        ll_puts("sge")
+        return
+    if cc == 0x93:
+        ll_puts("uge")
+        return
+    ll_puts("ne")
+
+
+# =======================================================================
+# globals
+# =======================================================================
+# Total byte size of global `gi` (1-based): the full (possibly nested) array
+# size, or the scalar width.
+def llvm_glob_bytes(gi: uint32) -> uint32:
+    if glob_elem_size[gi - 1] != 0:
+        tn: uint32 = glob_type_node[gi - 1]
+        if tn != 0:
+            return type_size_of(tn)
+        return glob_elem_size[gi - 1]
+    ss: uint32 = glob_scalar_size[gi - 1]
+    if ss == 0:
+        return 8
+    return ss
+
+
+# 1-based global index whose (byte-offset, is_bss) matches — the reverse of the
+# GLOBALADDR encoding (percpu globals are excluded; they never reach here).
+def llvm_glob_for(off: uint32, is_bss: uint32) -> uint32:
+    i: uint32 = 0
+    while i < glob_count:
+        if glob_is_percpu[i] == 0:
+            if glob_offset[i] == off and glob_is_bss[i] == is_bss:
+                return i + 1
+        i = i + 1
+    return 1
+
+
+def llvm_emit_data_init(gi: uint32, b: uint32):
+    off: uint32 = glob_offset[gi - 1]
+    ll_putc(91)                           # '['
+    i: uint32 = 0
+    while i < b:
+        if i > 0:
+            ll_puts(", ")
+        ll_puts("i8 ")
+        ll_put_u32(cast[uint32](gdata[off + i]))
+        i = i + 1
+    ll_putc(93)                           # ']'
+
+
+def llvm_emit_globals():
+    gi: uint32 = 0
+    while gi < glob_count:
+        if glob_is_percpu[gi] == 0:
+            b: uint32 = llvm_glob_bytes(gi + 1)
+            ll_putc(64)                   # '@'
+            ll_put_name(glob_name_off[gi], glob_name_len[gi])
+            ll_puts(" = internal global [")
+            ll_put_u32(b)
+            ll_puts(" x i8] ")
+            if glob_is_bss[gi] != 0:
+                ll_puts("zeroinitializer")
+            else:
+                llvm_emit_data_init(gi + 1, b)
+            ll_puts(", align 16\n")
+        gi = gi + 1
+    ll_putc(10)
+
+
+# =======================================================================
+# defined / called name sets
+# =======================================================================
+def llvm_name_eq(o1: uint32, l1: uint32, o2: uint32, l2: uint32) -> uint32:
+    if l1 != l2:
+        return 0
+    i: uint32 = 0
+    while i < l1:
+        if strbuf[o1 + i] != strbuf[o2 + i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def llvm_name_in_defined(off: uint32, len_: uint32) -> uint32:
+    i: uint32 = 0
+    while i < dn_count:
+        if llvm_name_eq(dn_off[i], dn_len[i], off, len_) != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def llvm_record_defined(off: uint32, len_: uint32):
+    if llvm_name_in_defined(off, len_) != 0:
+        return
+    if dn_count >= LL_NAME_MAX:
+        return
+    dn_off[dn_count] = off
+    dn_len[dn_count] = len_
+    dn_count = dn_count + 1
+
+
+def llvm_record_callee(off: uint32, len_: uint32, argc: uint32):
+    i: uint32 = 0
+    while i < ce_count:
+        if llvm_name_eq(ce_off[i], ce_len[i], off, len_) != 0:
+            return
+        i = i + 1
+    if ce_count >= LL_NAME_MAX:
+        return
+    ce_off[ce_count] = off
+    ce_len[ce_count] = len_
+    ce_argc[ce_count] = argc
+    ce_count = ce_count + 1
+
+
+# Walk the just-built SSA of an accepted function, recording every direct call
+# target so callees not defined in-unit get an external `declare`.
+def llvm_collect_callees():
+    v: uint32 = 1
+    while v < sv_count:
+        if sv_op[v] == SVO_CALL:
+            callnode: uint32 = sv_ast[v]
+            callee: uint32 = nd_a[callnode]
+            llvm_record_callee(nd_name_off[callee], nd_name_len[callee], sv_argn[v])
+        v = v + 1
+
+
+def llvm_emit_declares():
+    i: uint32 = 0
+    while i < ce_count:
+        if llvm_name_in_defined(ce_off[i], ce_len[i]) == 0:
+            ll_puts("declare i64 @")
+            ll_put_name(ce_off[i], ce_len[i])
+            ll_putc(40)                    # '('
+            j: uint32 = 0
+            while j < ce_argc[i]:
+                if j > 0:
+                    ll_puts(", ")
+                ll_puts("i64")
+                j = j + 1
+            ll_puts(")\n")
+        i = i + 1
+    ll_putc(10)
+
+
+# =======================================================================
+# per-value emission
+# =======================================================================
+def llvm_emit_value(v: uint32):
+    op: uint32 = sv_op[v]
+    # constants / params / undef never materialise an instruction.
+    if op == SVO_PARAM or op == SVO_CONST or op == SVO_UNDEF:
+        return
+
+    if op == SVO_BINOP:
+        ll_put_result(v)
+        ll_put_binop_mnem(sv_aux[v], sv_c[v])
+        ll_puts(" i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(", ")
+        ll_put_operand(sv_b[v])
+        ll_putc(10)
+        return
+
+    if op == SVO_ICMP:
+        ll_put_result(v)
+        ll_puts("icmp ")
+        ll_put_icmp_pred(sv_c[v])
+        ll_puts(" i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(", ")
+        ll_put_operand(sv_b[v])
+        ll_putc(10)
+        return
+
+    if op == SVO_NEG:
+        ll_put_result(v)
+        ll_puts("sub i64 0, ")
+        ll_put_operand(sv_a[v])
+        ll_putc(10)
+        return
+
+    if op == SVO_BITNOT:
+        ll_put_result(v)
+        ll_puts("xor i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(", -1")
+        ll_putc(10)
+        return
+
+    if op == SVO_NOT:
+        t: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(t)
+        ll_puts(" = icmp eq i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(", 0\n")
+        ll_put_result(v)
+        ll_puts("zext i1 ")
+        ll_put_tmp(t)
+        ll_puts(" to i64\n")
+        return
+
+    if op == SVO_TRUNC:
+        w: uint32 = sv_aux[v]
+        t: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(t)
+        ll_puts(" = trunc i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(" to ")
+        ll_put_ity(w)
+        ll_putc(10)
+        ll_put_result(v)
+        if sv_c[v] != 0:
+            ll_puts("sext ")
+        else:
+            ll_puts("zext ")
+        ll_put_ity(w)
+        ll_puts(" ")
+        ll_put_tmp(t)
+        ll_puts(" to i64\n")
+        return
+
+    if op == SVO_GLOBALADDR:
+        gi: uint32 = llvm_glob_for(cast[uint32](sv_imm[v]), sv_c[v])
+        b: uint32 = llvm_glob_bytes(gi)
+        ll_put_result(v)
+        ll_puts("ptrtoint [")
+        ll_put_u32(b)
+        ll_puts(" x i8]* @")
+        ll_put_name(glob_name_off[gi - 1], glob_name_len[gi - 1])
+        ll_puts(" to i64\n")
+        return
+
+    if op == SVO_LOAD:
+        w: uint32 = sv_aux[v]
+        p: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(p)
+        ll_puts(" = inttoptr i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(" to ")
+        ll_put_ity(w)
+        ll_puts("*\n")
+        if w == 8:
+            ll_put_result(v)
+            ll_puts("load i64, i64* ")
+            ll_put_tmp(p)
+            ll_putc(10)
+        else:
+            r: uint32 = ll_new_tmp()
+            ll_puts("  ")
+            ll_put_tmp(r)
+            ll_puts(" = load ")
+            ll_put_ity(w)
+            ll_puts(", ")
+            ll_put_ity(w)
+            ll_puts("* ")
+            ll_put_tmp(p)
+            ll_putc(10)
+            ll_put_result(v)
+            if sv_c[v] != 0:
+                ll_puts("sext ")
+            else:
+                ll_puts("zext ")
+            ll_put_ity(w)
+            ll_puts(" ")
+            ll_put_tmp(r)
+            ll_puts(" to i64\n")
+        return
+
+    if op == SVO_STORE:
+        w: uint32 = sv_aux[v]
+        p: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(p)
+        ll_puts(" = inttoptr i64 ")
+        ll_put_operand(sv_a[v])
+        ll_puts(" to ")
+        ll_put_ity(w)
+        ll_puts("*\n")
+        if w == 8:
+            ll_puts("  store i64 ")
+            ll_put_operand(sv_b[v])
+            ll_puts(", i64* ")
+            ll_put_tmp(p)
+            ll_putc(10)
+        else:
+            t: uint32 = ll_new_tmp()
+            ll_puts("  ")
+            ll_put_tmp(t)
+            ll_puts(" = trunc i64 ")
+            ll_put_operand(sv_b[v])
+            ll_puts(" to ")
+            ll_put_ity(w)
+            ll_putc(10)
+            ll_puts("  store ")
+            ll_put_ity(w)
+            ll_puts(" ")
+            ll_put_tmp(t)
+            ll_puts(", ")
+            ll_put_ity(w)
+            ll_puts("* ")
+            ll_put_tmp(p)
+            ll_putc(10)
+        return
+
+    if op == SVO_CALL:
+        callnode: uint32 = sv_ast[v]
+        callee: uint32 = nd_a[callnode]
+        n: uint32 = sv_argn[v]
+        # operands live on the use-list in REVERSE (head = last arg); un-reverse.
+        ca: Array[8, uint32]
+        idx: int32 = cast[int32](n) - 1
+        node: uint32 = sv_arg_head[v]
+        while node != 0:
+            if idx >= 0:
+                ca[idx] = arg_val[node]
+            idx = idx - 1
+            node = arg_next[node]
+        ll_put_result(v)
+        ll_puts("call i64 @")
+        ll_put_name(nd_name_off[callee], nd_name_len[callee])
+        ll_putc(40)                       # '('
+        i: uint32 = 0
+        while i < n:
+            if i > 0:
+                ll_puts(", ")
+            ll_puts("i64 ")
+            ll_put_operand(ca[i])
+            i = i + 1
+        ll_puts(")\n")
+        return
+
+    if op == SVO_BR:
+        ll_puts("  br label %bb")
+        ll_put_u32(sv_a[v])
+        ll_putc(10)
+        return
+
+    if op == SVO_CONDBR:
+        cond: uint32 = sv_a[v]
+        if llvm_is_i1(cond) == 0:
+            t: uint32 = ll_new_tmp()
+            ll_puts("  ")
+            ll_put_tmp(t)
+            ll_puts(" = icmp ne i64 ")
+            ll_put_operand(cond)
+            ll_puts(", 0\n")
+            ll_puts("  br i1 ")
+            ll_put_tmp(t)
+        else:
+            ll_puts("  br i1 ")
+            ll_put_operand(cond)
+        ll_puts(", label %bb")
+        ll_put_u32(sv_b[v])
+        ll_puts(", label %bb")
+        ll_put_u32(sv_c[v])
+        ll_putc(10)
+        return
+
+    if op == SVO_RET:
+        if sv_a[v] == 0:
+            ll_puts("  ret i64 0\n")
+        else:
+            ll_puts("  ret i64 ")
+            ll_put_operand(sv_a[v])
+            ll_putc(10)
+        return
+
+    if op == SVO_PHI:
+        ll_put_result(v)
+        ll_puts("phi ")
+        if llvm_is_i1(v) != 0:
+            ll_puts("i1 ")
+        else:
+            ll_puts("i64 ")
+        node: uint32 = sv_arg_head[v]
+        first: uint32 = 1
+        while node != 0:
+            if first == 0:
+                ll_puts(", ")
+            first = 0
+            ll_puts("[ ")
+            ll_put_operand(arg_val[node])
+            ll_puts(", %bb")
+            ll_put_u32(arg_pred[node])
+            ll_puts(" ]")
+            node = arg_next[node]
+        ll_putc(10)
+        return
+
+
+# =======================================================================
+# per-function emission
+# =======================================================================
+def llvm_emit_function(fn: uint32, entry: uint32):
+    ll_puts("define i64 @")
+    ll_put_name(nd_name_off[fn], nd_name_len[fn])
+    ll_putc(40)                           # '('
+    # parameters: collect SVO_PARAM values from the entry block by param index.
+    pv: Array[8, uint32]
+    pcount: uint32 = 0
+    cur: uint32 = sb_first_val[entry]
+    while cur != 0:
+        if sv_op[cur] == SVO_PARAM:
+            ai: uint32 = sv_aux[cur]
+            if ai < 8:
+                pv[ai] = cur
+                if ai + 1 > pcount:
+                    pcount = ai + 1
+        cur = sv_next[cur]
+    i: uint32 = 0
+    while i < pcount:
+        if i > 0:
+            ll_puts(", ")
+        ll_puts("i64 %v")
+        ll_put_u32(pv[i])
+        i = i + 1
+    ll_puts(") {\n")
+
+    llvm_tmp = 1
+    ssa_build_domtree()                   # populates sb_rpo (entry first)
+    bi: uint32 = 0
+    while bi < sb_rpo_n:
+        bb: uint32 = sb_rpo[bi]
+        ll_puts("bb")
+        ll_put_u32(bb)
+        ll_puts(":\n")
+        v: uint32 = sb_first_val[bb]
+        while v != 0:
+            llvm_emit_value(v)
+            v = sv_next[v]
+        bi = bi + 1
+    ll_puts("}\n\n")
+
+
+# =======================================================================
+# program driver
+# =======================================================================
+def llvm_emit_program(prog: uint32):
+    llvm_out_len = 0
+    dn_count = 0
+    ce_count = 0
+    llvm_stat_funcs = 0
+    llvm_stat_emitted = 0
+    llvm_stat_bailed = 0
+    if prog == 0:
+        return
+    # Populate the codegen globals/enum/class tables so the SSA global-array /
+    # scalar-global paths resolve (mirrors gen_program_with_globals' prefix, but
+    # never emits code).
+    cg_init()
+    cg_prog_decls = nd_b[prog]
+    ssa_prog_decls = nd_b[prog]
+    layout_classes(prog)
+    register_enums(prog)
+    layout_globals(prog)
+
+    ll_puts("target triple = ")
+    ll_putc(34)
+    ll_puts("x86_64-pc-linux-gnu")
+    ll_putc(34)
+    ll_puts("\n\n")
+
+    # Pass A: discover accepted (defined) functions + their call targets.
+    cur: uint32 = nd_b[prog]
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            entry: uint32 = ssa_build_function(cur)
+            if entry != 0 and ssa_bail == 0:
+                llvm_record_defined(nd_name_off[cur], nd_name_len[cur])
+                llvm_collect_callees()
+        cur = nd_next[cur]
+
+    llvm_emit_globals()
+    llvm_emit_declares()
+
+    # Pass B: rebuild + emit each function (SSA build is pure/deterministic).
+    cur = nd_b[prog]
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            llvm_stat_funcs = llvm_stat_funcs + 1
+            entry2: uint32 = ssa_build_function(cur)
+            if entry2 != 0 and ssa_bail == 0:
+                llvm_emit_function(cur, entry2)
+                llvm_stat_emitted = llvm_stat_emitted + 1
+            else:
+                llvm_stat_bailed = llvm_stat_bailed + 1
+                ll_puts("; BAILED @")
+                ll_put_name(nd_name_off[cur], nd_name_len[cur])
+                ll_puts(" reason=")
+                ll_put_u32(ssa_bail_reason)
+                ll_putc(10)
+        cur = nd_next[cur]
+
+    ll_puts("; ADDER_STAT funcs=")
+    ll_put_u32(llvm_stat_funcs)
+    ll_puts(" emitted=")
+    ll_put_u32(llvm_stat_emitted)
+    ll_puts(" bailed=")
+    ll_put_u32(llvm_stat_bailed)
+    ll_putc(10)
