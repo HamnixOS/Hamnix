@@ -160,6 +160,10 @@ from compiler.codegen import (
     struct_lookup_by_node,
     struct_field_find,
     struct_field_elem,
+    struct_field_struct,
+    struct_field_elem_struct,
+    struct_field_type_node,
+    glob_ptr_size,
     st_total,
     SF_NOFIELD,
 )
@@ -658,6 +662,7 @@ def ssa_set_bail(reason: uint32):
             ssa_bail_hist[reason] = ssa_bail_hist[reason] + 1
 
 
+
 def bb_new_ssa() -> uint32:
     if sb_count >= SSA_BB_MAX:
         ssa_set_bail(SBR_OVERFLOW)
@@ -1076,6 +1081,12 @@ def ssa_global_array_1d(off: uint32, len_: uint32) -> uint32:
         return 0
     if nd_kind[nd_a[tn]] == ND_ARRAY_TYPE:
         return 0                              # multi-dimensional -> defer
+    # A STRUCT-element array (`Array[N, Rec]`) is NOT a flat machine-scalar
+    # array: glob_elem_size records the innermost scalar width, not the element
+    # stride (st_total), so treating it as a 1-D scalar array would index with
+    # the wrong stride.  Defer it to the struct-aware region resolver.
+    if struct_lookup_by_node(nd_a[tn]) != 0:
+        return 0
     return gi
 
 
@@ -1886,6 +1897,14 @@ def ssa_global_indexed_struct_base(nameoff: uint32, namelen: uint32, idxnode: ui
 def ssa_member_base_addr(obj: uint32, out_struct: Ptr[uint32]) -> uint32:
     out_struct[0] = 0
     k: uint32 = nd_kind[obj]
+    # Phase 4b recursive resolver: a NESTED-member (`a.b.field`) or deref
+    # (`(*p).field`) object base — neither is covered by the fast paths below.
+    if ssa_mem_model != 0 and (k == ND_MEMBER or (k == ND_UNARY and nd_aux[obj] == UNOP_DEREF)):
+        rb: uint32 = ssa_struct_base_rec(obj, out_struct)
+        if rb != 0:
+            return rb
+        ssa_set_bail(SBR_MEMORY)
+        return 0
     if k == ND_IDENT:
         nid: uint32 = nm_intern(nd_name_off[obj], nd_name_len[obj])
         if nid >= NM_MAX or ssa_islocal[nid] == 0 or ssa_local_struct[nid] == 0:
@@ -1957,6 +1976,12 @@ def ssa_member_base_addr(obj: uint32, out_struct: Ptr[uint32]) -> uint32:
             bb_append(ssa_cur_bb, cadd)
             return cadd
         if nd_kind[base] != ND_IDENT:
+            # Phase 4b: a COMPUTED index base — `base[i].field` where base is
+            # itself a member / index / deref (e.g. `g[i].stack[d].field`).
+            if ssa_mem_model != 0:
+                rc: uint32 = ssa_struct_base_rec(obj, out_struct)
+                if rc != 0:
+                    return rc
             ssa_set_bail(SBR_MEMORY)
             return 0
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
@@ -1967,6 +1992,12 @@ def ssa_member_base_addr(obj: uint32, out_struct: Ptr[uint32]) -> uint32:
                 gib: uint32 = ssa_global_indexed_struct_base(nd_name_off[base], nd_name_len[base], nd_b[obj], out_struct)
                 if gib != 0:
                     return gib
+            # Phase 4b: any other index-then-field base (local struct array,
+            # global Ptr[Struct], ...) via the recursive region resolver.
+            if ssa_mem_model != 0:
+                rd: uint32 = ssa_struct_base_rec(obj, out_struct)
+                if rd != 0:
+                    return rd
             ssa_set_bail(SBR_MEMORY)
             return 0
         si: uint32 = ssa_local_struct[bnid]
@@ -2077,9 +2108,17 @@ def ssa_member_ptr_index_addr(member: uint32, idxnode: uint32,
     faddr: uint32 = ssa_addr_plus(base, foff)
     if faddr == 0:
         return 0
-    ptrval: uint32 = ssa_load_at(faddr, 8, 0)
-    if ptrval == 0:
-        return 0
+    # An ARRAY field (`buf: Array[N, T]`) stores its elements INLINE — the field
+    # ADDRESS is element 0, so index it directly.  A POINTER field (`p: Ptr[T]`)
+    # holds an 8-byte address that must be LOADED first.  `struct_field_find`
+    # reports fsz==0 for an array field (it decays to its address) and fsz==8 for
+    # a pointer field; distinguish on that.  (Loading an array field as a pointer
+    # would deref buf[0] as an address — a silent miscompile.)
+    ptrval: uint32 = faddr
+    if fsz != 0:
+        ptrval = ssa_load_at(faddr, 8, 0)
+        if ptrval == 0:
+            return 0
     idxv: uint32 = ssa_lower_expr(idxnode, ssa_cur_bb)
     if idxv == 0:
         return 0
@@ -2125,6 +2164,334 @@ def ssa_lower_member(node: uint32) -> uint32:
     return ssa_load_at(addr, msz, msgn)
 
 
+# =======================================================================
+# RECURSIVE LVALUE-ADDRESS LOWERING  (Phase 4b; LLVM path only)
+# -----------------------------------------------------------------------
+# Compute the byte address of an ARBITRARY nested lvalue — `a.b.c`,
+# `e[i]`, `*p`, `&lvalue`, and their compositions — by resolving, at each
+# level, a struct-VALUE base + field offset, or a region base + idx*stride,
+# bottoming out at ident / global / cast.  The three functions below are
+# MUTUALLY RECURSIVE:
+#   ssa_region_base    — element-0 address (+ element type) of an indexable
+#                        container (array lvalue / pointer value).
+#   ssa_struct_base_rec— struct-VALUE base address (+ struct idx) of a
+#                        struct-denoting expr, for `obj.field`.
+#   ssa_addr_index     — region + idx*stride (leaf arithmetic).
+# Everything is gated on ssa_mem_model != 0 (callers gate); the native
+# --opt path never reaches them, so codegen.ad byte output is UNCHANGED.
+# A shape that cannot be STATICALLY resolved returns 0 WITHOUT setting the
+# bail flag (the caller then bails SBR_MEMORY) — a wrong address is a
+# silent miscompile, so anything uncertain must bail, never guess.
+# =======================================================================
+
+# region + lower(idxnode)*stride as pure pointer arithmetic.  Returns 0 on a
+# mid-lowering failure (idx already set the bail flag if it bailed).
+def ssa_addr_index(region: uint32, idxnode: uint32, stride: uint32) -> uint32:
+    idxv: uint32 = ssa_lower_expr(idxnode, ssa_cur_bb)
+    if idxv == 0:
+        return 0
+    scaled: uint32 = idxv
+    if stride != 1:
+        sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](stride))
+        if sc == 0:
+            return 0
+        mul: uint32 = sv_new(SVO_BINOP)
+        if mul == 0:
+            return 0
+        sv_aux[mul] = BINOP_MUL
+        sv_a[mul] = idxv
+        sv_b[mul] = sc
+        bb_append(ssa_cur_bb, mul)
+        scaled = mul
+    addv: uint32 = sv_new(SVO_BINOP)
+    if addv == 0:
+        return 0
+    sv_aux[addv] = BINOP_ADD
+    sv_a[addv] = region
+    sv_b[addv] = scaled
+    sv_type[addv] = SVT_PTR
+    bb_append(ssa_cur_bb, addv)
+    return addv
+
+
+# Element-0 byte address of the indexable container `base` (an array lvalue or a
+# pointer value), writing the element STRIDE (bytes) via out_stride and EITHER
+# the element struct index (+1) via out_struct (struct elements) OR the element
+# scalar width/signedness via out_esz/out_esgn (scalar elements).  Returns 0
+# (no bail) when `base` is not a statically-resolvable machine container.
+def ssa_region_base(base: uint32, out_stride: Ptr[uint32], out_struct: Ptr[uint32],
+                    out_esz: Ptr[uint32], out_esgn: Ptr[uint32]) -> uint32:
+    out_stride[0] = 0
+    out_struct[0] = 0
+    out_esz[0] = 0
+    out_esgn[0] = 0
+    k: uint32 = nd_kind[base]
+    if k == ND_IDENT:
+        nid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
+        if nid < NM_MAX and ssa_islocal[nid] != 0:
+            # local Ptr[Struct]: region = the pointer VALUE.
+            if ssa_local_struct[nid] != 0 and ssa_local_struct_is_ptr[nid] != 0:
+                si: uint32 = ssa_local_struct[nid]
+                out_struct[0] = si
+                out_stride[0] = st_total[si - 1]
+                if ssa_ismem[nid] != 0:
+                    return ssa_load_at(ssa_mem_addr[nid], 8, 0)
+                return ssa_read_var(nid, ssa_cur_bb)
+            # local scalar pointer: region = the pointer VALUE.
+            if ssa_ptr_esz[nid] != 0:
+                out_esz[0] = ssa_ptr_esz[nid]
+                out_esgn[0] = ssa_ptr_esgn[nid]
+                out_stride[0] = ssa_ptr_esz[nid]
+                if ssa_ismem[nid] != 0:
+                    return ssa_load_at(ssa_mem_addr[nid], 8, 0)
+                return ssa_read_var(nid, ssa_cur_bb)
+            # local scalar array: region = the alloca address.
+            if ssa_ismem[nid] != 0 and ssa_mem_isarr[nid] != 0:
+                out_esz[0] = ssa_mem_esz[nid]
+                out_esgn[0] = ssa_mem_esgn[nid]
+                out_stride[0] = ssa_mem_esz[nid]
+                return ssa_mem_addr[nid]
+            return 0
+        # GLOBAL container.
+        gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+        if gi == 0 or glob_is_percpu[gi - 1] != 0:
+            return 0
+        tn: uint32 = glob_type_node[gi - 1]
+        if tn != 0 and nd_kind[tn] == ND_ARRAY_TYPE:
+            elem: uint32 = nd_a[tn]
+            if nd_kind[elem] == ND_ARRAY_TYPE:
+                return 0                          # multi-dim -> defer
+            esi: uint32 = struct_lookup_by_node(elem)
+            if esi != 0:
+                out_struct[0] = esi
+                out_stride[0] = st_total[esi - 1]
+                return ssa_globaladdr(gi, ssa_cur_bb)
+            ges: uint32 = glob_elem_size[gi - 1]
+            if ges != 1 and ges != 2 and ges != 4 and ges != 8:
+                return 0
+            out_esz[0] = ges
+            out_esgn[0] = type_signedness(elem)
+            out_stride[0] = ges
+            return ssa_globaladdr(gi, ssa_cur_bb)
+        if tn != 0 and nd_kind[tn] == ND_PTR_TYPE:
+            pointee: uint32 = nd_a[tn]
+            psi: uint32 = struct_lookup_by_node(pointee)
+            pv: uint32 = ssa_global_load(gi, ssa_cur_bb)
+            if pv == 0:
+                return 0
+            if psi != 0:
+                out_struct[0] = psi
+                out_stride[0] = st_total[psi - 1]
+                return pv
+            gps: uint32 = glob_ptr_size[gi - 1]
+            if gps != 1 and gps != 2 and gps != 4 and gps != 8:
+                return 0
+            out_esz[0] = gps
+            out_esgn[0] = ssa_global_ptr_esgn(gi)
+            out_stride[0] = gps
+            return pv
+        return 0
+    if k == ND_MEMBER:
+        # container is a FIELD of struct(nd_a[base]) — an array-of-X field
+        # (region = field address) or a Ptr[X] field (region = loaded pointer).
+        sa: uint32 = 0
+        psba: uint32 = ssa_struct_base_rec(nd_a[base], &sa)
+        if psba == 0 or sa == 0:
+            return 0
+        foff: uint32 = 0
+        fsgn: uint32 = 0
+        fsz: uint32 = struct_field_find(sa, nd_name_off[base], nd_name_len[base], &foff, &fsgn)
+        if fsz == SF_NOFIELD:
+            return 0
+        faddr: uint32 = ssa_addr_plus(psba, foff)
+        if faddr == 0:
+            return 0
+        esgn2: uint32 = 0
+        esize: uint32 = struct_field_elem(sa, nd_name_off[base], nd_name_len[base], &esgn2)
+        estr: uint32 = struct_field_elem_struct(sa, nd_name_off[base], nd_name_len[base])
+        tnode: uint32 = struct_field_type_node(sa, nd_name_off[base], nd_name_len[base])
+        if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
+            # ARRAY field: the field address IS element 0.
+            if nd_kind[nd_a[tnode]] == ND_ARRAY_TYPE:
+                return 0                          # multi-dim member array -> defer
+            if estr != 0:
+                out_struct[0] = estr
+                out_stride[0] = st_total[estr - 1]
+                return faddr
+            if esize != 1 and esize != 2 and esize != 4 and esize != 8:
+                return 0
+            out_esz[0] = esize
+            if esgn2 != 0:
+                out_esgn[0] = esgn2
+            else:
+                out_esgn[0] = 1
+            out_stride[0] = esize
+            return faddr
+        if esize != 0:
+            # POINTER field (Ptr[X]): region = the loaded pointer value.
+            pv2: uint32 = ssa_load_at(faddr, 8, 0)
+            if pv2 == 0:
+                return 0
+            if estr != 0:
+                out_struct[0] = estr
+                out_stride[0] = st_total[estr - 1]
+                return pv2
+            if esize != 1 and esize != 2 and esize != 4 and esize != 8:
+                return 0
+            out_esz[0] = esize
+            if esgn2 != 0:
+                out_esgn[0] = esgn2
+            else:
+                out_esgn[0] = 1
+            out_stride[0] = esize
+            return pv2
+        return 0
+    if k == ND_CAST:
+        # cast[Ptr[X]](expr): region = the forwarded pointer value.
+        dt: uint32 = nd_a[base]
+        if dt == 0 or nd_kind[dt] != ND_PTR_TYPE:
+            return 0
+        cpointee: uint32 = nd_a[dt]
+        return ssa_region_from_ptr(base, cpointee, out_stride, out_struct, out_esz, out_esgn)
+    if k == ND_CALL:
+        # A call returning `Ptr[X]` (`_pgrp_ptr(p)[i].field`): region = the call
+        # VALUE (a pointer), typed by the callee's declared return pointee.
+        callee: uint32 = nd_a[base]
+        if callee == 0 or nd_kind[callee] != ND_IDENT:
+            return 0
+        rt: uint32 = ssa_callee_ret_node(nd_name_off[callee], nd_name_len[callee])
+        if rt == 0 or nd_kind[rt] != ND_PTR_TYPE:
+            return 0
+        return ssa_region_from_ptr(base, nd_a[rt], out_stride, out_struct, out_esz, out_esgn)
+    return 0
+
+
+# Shared tail for a POINTER-valued container expr `base` whose pointee type node
+# is `pointee`: lower `base` to its pointer value and classify the element
+# (struct / pointer / scalar).  Returns 0 (no bail) when the pointee is not a
+# machine-scalar / struct / pointer.
+def ssa_region_from_ptr(base: uint32, pointee: uint32, out_stride: Ptr[uint32],
+                        out_struct: Ptr[uint32], out_esz: Ptr[uint32],
+                        out_esgn: Ptr[uint32]) -> uint32:
+    if pointee == 0:
+        return 0
+    psi: uint32 = struct_lookup_by_node(pointee)
+    pv: uint32 = ssa_lower_expr(base, ssa_cur_bb)
+    if pv == 0:
+        return 0
+    if psi != 0:
+        out_struct[0] = psi
+        out_stride[0] = st_total[psi - 1]
+        return pv
+    if nd_kind[pointee] == ND_PTR_TYPE:
+        out_esz[0] = 8
+        out_esgn[0] = 1
+        out_stride[0] = 8
+        return pv
+    if type_float_width(pointee) != 0:
+        return 0
+    ps: uint32 = prim_type_size(pointee)
+    if ps != 1 and ps != 2 and ps != 4 and ps != 8:
+        return 0
+    out_esz[0] = ps
+    out_esgn[0] = type_signedness(pointee)
+    out_stride[0] = ps
+    return pv
+
+
+# Struct-VALUE base address of a struct-denoting expr `obj` (for `obj.field`),
+# writing the struct table index (+1) via out_struct.  For an in-place struct
+# lvalue this is its storage address; for a Ptr[Struct] this is the pointer
+# VALUE.  Recurses through nested members / indices / derefs.  Returns 0 (no
+# bail) when the struct type cannot be resolved.
+def ssa_struct_base_rec(obj: uint32, out_struct: Ptr[uint32]) -> uint32:
+    out_struct[0] = 0
+    k: uint32 = nd_kind[obj]
+    if k == ND_IDENT:
+        nid: uint32 = nm_intern(nd_name_off[obj], nd_name_len[obj])
+        if nid < NM_MAX and ssa_islocal[nid] != 0:
+            if ssa_local_struct[nid] == 0:
+                return 0
+            out_struct[0] = ssa_local_struct[nid]
+            if ssa_local_struct_is_ptr[nid] != 0:
+                if ssa_ismem[nid] != 0:
+                    return ssa_load_at(ssa_mem_addr[nid], 8, 0)
+                return ssa_read_var(nid, ssa_cur_bb)
+            if ssa_ismem[nid] != 0:
+                return ssa_mem_addr[nid]
+            return 0
+        # module-scope in-place `Struct` global (its symbol addr IS the base).
+        return ssa_global_struct_base(nd_name_off[obj], nd_name_len[obj], out_struct)
+    if k == ND_MEMBER:
+        # a.b : field b (an embedded struct value or a Ptr[Struct]) of struct(a).
+        sa: uint32 = 0
+        psba: uint32 = ssa_struct_base_rec(nd_a[obj], &sa)
+        if psba == 0 or sa == 0:
+            return 0
+        isptr: uint32 = 0
+        sfi: uint32 = struct_field_struct(sa, nd_name_off[obj], nd_name_len[obj], &isptr)
+        if sfi == 0:
+            return 0                              # field is not a struct/Ptr[struct]
+        foff: uint32 = 0
+        fsgn: uint32 = 0
+        struct_field_find(sa, nd_name_off[obj], nd_name_len[obj], &foff, &fsgn)
+        faddr: uint32 = ssa_addr_plus(psba, foff)
+        if faddr == 0:
+            return 0
+        out_struct[0] = sfi
+        if isptr != 0:
+            return ssa_load_at(faddr, 8, 0)       # Ptr[Struct] field -> pointer value
+        return faddr                              # embedded struct value -> its address
+    if k == ND_UNARY and nd_aux[obj] == UNOP_DEREF:
+        # (*p).field : p is Ptr[Struct]; the struct base is p's pointer VALUE.
+        stride: uint32 = 0
+        esz: uint32 = 0
+        esgn: uint32 = 0
+        region: uint32 = ssa_region_base(nd_a[obj], &stride, out_struct, &esz, &esgn)
+        if region == 0 or out_struct[0] == 0:
+            out_struct[0] = 0
+            return 0
+        return region
+    if k == ND_INDEX:
+        # base[i].field : base[i] is a struct ELEMENT of the container `base`.
+        stride2: uint32 = 0
+        esz2: uint32 = 0
+        esgn2: uint32 = 0
+        region2: uint32 = ssa_region_base(nd_a[obj], &stride2, out_struct, &esz2, &esgn2)
+        if region2 == 0 or out_struct[0] == 0:
+            out_struct[0] = 0
+            return 0
+        return ssa_addr_index(region2, nd_b[obj], stride2)
+    if k == ND_CAST:
+        # cast[Ptr[Struct]](x) used directly as a struct base.
+        dt: uint32 = nd_a[obj]
+        if dt == 0 or nd_kind[dt] != ND_PTR_TYPE:
+            return 0
+        csi: uint32 = struct_lookup_by_node(nd_a[dt])
+        if csi == 0:
+            return 0
+        cv: uint32 = ssa_lower_expr(obj, ssa_cur_bb)
+        if cv == 0:
+            return 0
+        out_struct[0] = csi
+        return cv
+    return 0
+
+
+# Byte address of a general ND_INDEX lvalue `node = base[i]` (any container),
+# for `&base[i]`.  Reuses the recursive region resolver.  Returns 0 (no bail)
+# when the container is not statically resolvable.
+def ssa_index_addr_general(node: uint32) -> uint32:
+    stride: uint32 = 0
+    si: uint32 = 0
+    esz: uint32 = 0
+    esgn: uint32 = 0
+    region: uint32 = ssa_region_base(nd_a[node], &stride, &si, &esz, &esgn)
+    if region == 0:
+        return 0
+    return ssa_addr_index(region, nd_b[node], stride)
+
+
 # Lower `&operand` to the operand's ADDRESS value (no load).  LLVM path only
 # (the sole caller gates on ssa_mem_model != 0).  Modeled forms:
 #   &local            (a memory-modeled scalar/array local -> its alloca addr)
@@ -2149,7 +2516,10 @@ def ssa_lower_addr_of(operand: uint32) -> uint32:
         gi: uint32 = glob_lookup(nd_name_off[operand], nd_name_len[operand])
         if gi != 0 and glob_is_percpu[gi - 1] == 0:
             return ssa_globaladdr(gi, ssa_cur_bb)
-        ssa_set_bail(SBR_MEMORY)
+        if gi != 0:
+            ssa_set_bail(SBR_MEMORY)                    # &percpu -> deliberately bails
+        else:
+            ssa_set_bail(SBR_MEMORY)                    # &function / unknown symbol
         return 0
     if k == ND_INDEX:
         base: uint32 = nd_a[operand]
@@ -2159,6 +2529,11 @@ def ssa_lower_addr_of(operand: uint32) -> uint32:
             if g2a != 0:
                 return ssa_index2_addr(g2a, operand)
         if nd_kind[base] != ND_IDENT:
+            # Phase 4b: `&expr[i]` with a computed / member / deref index base.
+            if ssa_mem_model != 0:
+                ga: uint32 = ssa_index_addr_general(operand)
+                if ga != 0:
+                    return ga
             ssa_set_bail(SBR_MEMORY)
             return 0
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
@@ -2178,6 +2553,34 @@ def ssa_lower_addr_of(operand: uint32) -> uint32:
         gpe2: uint32 = ssa_global_ptr_esz(nd_name_off[base], nd_name_len[base], &gpg2)
         if ssa_mem_model != 0 and gpe2 != 0:
             return ssa_global_ptr_index_addr(gpg2, nd_b[operand], gpe2)
+        # Phase 4b: `&g[i]` on any other recognised container (local struct
+        # array, global Ptr[Struct], ...) via the recursive region resolver.
+        if ssa_mem_model != 0:
+            ga2: uint32 = ssa_index_addr_general(operand)
+            if ga2 != 0:
+                return ga2
+        ssa_set_bail(SBR_MEMORY)
+        return 0
+    # Phase 4b: `&obj.field` — the member's field address (no load).  Works for
+    # scalar, array (decays), and nested-struct fields.
+    if ssa_mem_model != 0 and k == ND_MEMBER:
+        msz: uint32 = 0
+        msgn: uint32 = 0
+        maddr: uint32 = ssa_member_field_addr(operand, &msz, &msgn)
+        if maddr != 0:
+            return maddr
+        return 0                                  # member_field_addr set the bail
+    # Phase 4b: `&*p` == the pointer VALUE of a resolvable pointer expr.
+    if ssa_mem_model != 0 and k == ND_UNARY and nd_aux[operand] == UNOP_DEREF:
+        if ssa_deref_esz(nd_a[operand]) != 0:
+            return ssa_lower_expr(nd_a[operand], ssa_cur_bb)
+        st3: uint32 = 0
+        s3: uint32 = 0
+        e3: uint32 = 0
+        g3: uint32 = 0
+        rp: uint32 = ssa_region_base(nd_a[operand], &st3, &s3, &e3, &g3)
+        if rp != 0:
+            return rp
         ssa_set_bail(SBR_MEMORY)
         return 0
     ssa_set_bail(SBR_MEMORY)
