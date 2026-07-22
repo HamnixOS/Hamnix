@@ -55,7 +55,13 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 m.DRIVER_MAIN = "fused_driver_host_main.ad"
 raise SystemExit(m.main(["concat", "-o", "build/cutover/host_compiler.ad", "--with-driver"]))
 PY
-    ( cd "$root" && python3 -m compiler.adder compile --target=x86_64-linux \
+    # host_ac.elf is linked as ET_DYN/PIE (ADDER_X86_LINUX_PIE=1) so its
+    # ~474 MiB BSS lands at a HIGH vaddr on-device (loader rebase to >=4 GiB),
+    # clear of the kernel's low-identity direct map. The code is fully
+    # position-independent (RIP-relative, zero dynamic relocations), so this is
+    # behaviourally identical to the old ET_EXEC link on the host.
+    ( cd "$root" && ADDER_X86_LINUX_PIE=1 python3 -m compiler.adder compile \
+        --target=x86_64-linux \
         build/cutover/host_compiler.ad -o build/cutover/host_ac.elf ) \
         || { echo "[adder_cc] ERROR: host_ac.elf failed to build" >&2; return 1; }
     [ -x "$root/build/cutover/host_ac.elf" ] \

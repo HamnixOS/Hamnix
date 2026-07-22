@@ -669,8 +669,26 @@ def assemble_and_link_x86_64_linux(asm_file: Path, output: Path,
               f"user/linux-runtime.S)", file=sys.stderr)
         return False
 
+    # ET_DYN/PIE opt-in for the self-hosted host compiler (host_ac.elf). When
+    # ADDER_X86_LINUX_PIE=1 the image is linked as a position-independent
+    # ET_DYN based at vaddr 0 (user/linux-init-pie.lds) instead of the default
+    # ET_EXEC at the low base 0x400000 (user/linux-init.lds). The compiler
+    # emits fully position-independent code — every global is RIP-relative and
+    # there are NO absolute data pointers, so `-pie` produces ZERO dynamic
+    # relocations (verified with readelf -r); the image therefore runs at any
+    # load base with no relocator. WHY: host_ac's ~474 MiB writable/BSS PT_LOAD
+    # at the ET_EXEC low base spans into the on-device kernel's low-identity
+    # direct map (aliasing virtqueue rings / kstacks / slab / page tables). As
+    # ET_DYN the Hamnix loader (fs/elf.ad) rebases the whole image to a HIGH
+    # dyn_vbase (>= 4 GiB, above physical RAM via aslr_load_bias), sidestepping
+    # that collision class. Default (unset/0) keeps the ET_EXEC low-base link so
+    # every other x86_64-linux consumer (fuzz driver, aarch64 mirror, etc.) is
+    # byte-unchanged.
+    pie = os.environ.get("ADDER_X86_LINUX_PIE", "") == "1"
+
     runtime_s = project_root / "user/linux-runtime.S"
-    lds       = project_root / "user/linux-init.lds"
+    lds       = project_root / ("user/linux-init-pie.lds" if pie
+                                else "user/linux-init.lds")
     for required in (runtime_s, lds):
         if not required.exists():
             print(f"Error: missing {required}", file=sys.stderr)
@@ -704,11 +722,22 @@ def assemble_and_link_x86_64_linux(asm_file: Path, output: Path,
                   file=sys.stderr)
             return False
 
-        link_cmd = [
-            ld_cmd, "-m", "elf_x86_64", "-nostdlib", "-static", "-no-pie",
-            "-z", "noexecstack", "-T", str(lds), "-e", "_start",
-            "-o", str(output), str(runtime_o), str(main_o),
-        ]
+        if pie:
+            # ET_DYN/PIE: --no-dynamic-linker suppresses the PT_INTERP `ld`
+            # would otherwise synthesize for a -pie link (there is no dynamic
+            # loader — the image is self-contained with zero relocations).
+            link_cmd = [
+                ld_cmd, "-m", "elf_x86_64", "-nostdlib", "-pie",
+                "--no-dynamic-linker", "-z", "noexecstack",
+                "-T", str(lds), "-e", "_start",
+                "-o", str(output), str(runtime_o), str(main_o),
+            ]
+        else:
+            link_cmd = [
+                ld_cmd, "-m", "elf_x86_64", "-nostdlib", "-static", "-no-pie",
+                "-z", "noexecstack", "-T", str(lds), "-e", "_start",
+                "-o", str(output), str(runtime_o), str(main_o),
+            ]
         result = subprocess.run(link_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"Error linking (x86_64-linux):\n{result.stderr}",
