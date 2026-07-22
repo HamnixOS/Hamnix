@@ -430,3 +430,35 @@ queue_adder_compile adder/compiler/adder_cc_driver.ad    build/user/adder_cc.elf
 
 # --- Fan out every queued Adder compile across cores -----------------
 _run_compile_pool
+
+# --- OPT-IN: rebuild selected apps as NATIVE ELF64 (LLVM backend) -----
+# Set ADDER_ELF64_APPS to a space-separated list of app names (matching
+# build/user/<name>.elf) to OVERWRITE those binaries with a native ELF64
+# build via scripts/adder_cc_llvm_native64.sh (clang codegen of the LLVM
+# IR, real ELF64 EXEC, OSABI=SYSV, Hamnix native syscall ABI). This is the
+# execution-proof staging hook for the LLVM-native-ELF64 track: e.g.
+#   ADDER_ELF64_APPS="echo" bash scripts/build_user.sh
+# rebuilds /bin/echo as a native ELF64 so a normal boot exercises the
+# loader's native-ELF64 path (fs/elf.ad: EI_CLASS==2 + OSABI=SYSV ->
+# native syscall routing). DEFAULT-OFF: with the var unset this block is a
+# no-op, so every existing image build stays byte-for-byte the ELF32
+# native path — native-safe.
+if [ -n "${ADDER_ELF64_APPS:-}" ]; then
+    for _e64 in $ADDER_ELF64_APPS; do
+        _src="user/${_e64}.ad"
+        if [ ! -f "$_src" ] && [ -f "tests/${_e64}.ad" ]; then
+            _src="tests/${_e64}.ad"
+        fi
+        if [ ! -f "$_src" ]; then
+            echo "[build_user] ERROR: ELF64 app source not found: $_e64" >&2
+            exit 1
+        fi
+        echo "[build_user] ELF64: rebuilding $_e64 as native ELF64 (LLVM backend)"
+        if ! ADDER_HOST_AC="${ADDER_HOST_AC:-build/cutover/host_ac.elf}" \
+                bash scripts/adder_cc_llvm_native64.sh "$_src" "build/user/${_e64}.elf"; then
+            echo "[build_user] ERROR: ELF64 build FAILED for $_e64" >&2
+            exit 1
+        fi
+        file "build/user/${_e64}.elf"
+    done
+fi
