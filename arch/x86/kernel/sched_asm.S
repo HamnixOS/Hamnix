@@ -103,9 +103,21 @@ kthread_bootstrap:
     popq    %rax
     addq    $16, %rsp                  /* drop vec + error_code      */
 
-    /* %rsp now points at the 5-qword iret frame. Zero %r15 so the
-     * user task wakes with r15 = 0, then iretq into the task entry. */
-    xorq    %r15, %r15                 /* user wakes with r15 = 0    */
+    /* %rsp now points at the 5-qword iret frame. Do NOT clobber %r15
+     * here. __switch_to_asm just popped the six callee-saved regs
+     * (rbp/rbx/r12/r13/r14/r15) from this task's initial frame — which
+     * _build_initial_kstack ZEROES for a from-scratch task (so r15 is
+     * already 0 for exec/spawn/kthread entry), but which do_clone /
+     * do_rfork SEED with the PARENT's values for a forked child (so it
+     * resumes the C/asm caller with callee-saved intact — a syscall
+     * preserves them, so a caller may legally keep a live value in
+     * %r15 across fork+rfork). A blanket `xorq %r15,%r15` here silently
+     * violated that for r15 alone: clang's LLVM-backend lib/p9.ad::
+     * _spawn_flags keeps the exec `path` in %r15 across sys_rfork, so
+     * the spawned child exec'd execve(path=0,...) -> exit 127 (the
+     * "LLVM-compiled panel can't launch its apps" #99-class bug). r15
+     * now carries the seeded value like the other five callee-saved,
+     * then iretq into the task entry. */
     /* MDS mitigation (task #87): CLEAR_CPU_BUFFERS iff this first dispatch
      * lands in CPL3. A kernel thread bootstraps with CS=0x08 (CPL0) and
      * skips the flush; a user task's initial entry frame carries a CPL3
