@@ -139,6 +139,30 @@ assert_grep '^FIELDNAV id=q idx=[0-9]+ textfield=1' "$D5" \
 assert_grep '^FIELDNAV NAV /search\?q=plan\+9\+os' "$D5" \
     "type+submit on a name-only field navigates to /search?q=plan+9+os (real-google shape)"
 
+# (h) BIG-PAGE SOURCE CAP (desktop google.com renders BLANK regression): the
+# full desktop google.com is ~1.5 MB because it ships ~1.1 MB of inline JS
+# BEFORE the visible <body>. The engine's working-source buffer (_strip_comments
+# cs_buf) used to cap at 256 KiB, so everything past byte 262144 — including the
+# entire rendered body — was silently truncated away. With JS on this looked
+# exactly like "the script wiped the DOM" (textrows 0) while the JS-stripped page
+# (small enough to fit) rendered fine. The fix raises the source cap to 4 MiB.
+# This gate distills the pattern: a >256 KiB inline <script> followed by a
+# sentinel paragraph that MUST still render.
+BIG="$OUT/g_bigpage.html"
+{
+  printf '<!doctype html><html><head><title>Big</title>'
+  printf '<script>var _pad="'
+  # ~300 KiB of filler inside a string literal (well past the old 256 KiB cap)
+  yes 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123' \
+    | head -c 300000 | tr -d '\n'
+  printf '";window._ok=1;</script></head><body>'
+  printf '<p>BIGPAGE_SENTINEL_TEXT_VISIBLE</p></body></html>'
+} > "$BIG"
+D6="$OUT/g_bigpage.txt"
+"$BIN" "$BIG" 880 >"$D6" 2>&1
+assert_grep 'BIGPAGE_SENTINEL_TEXT_VISIBLE' "$D6" \
+    "content AFTER a >256 KiB inline script still renders (source not truncated)"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-google] RESULT: FAIL"; exit 1
 fi
