@@ -16,9 +16,9 @@ these are pre-existing bugs, not opt-cutover regressions.
   not reclaiming pages) OR System Monitor reads wrong. Confirm which.
 
 ## Tier 2 — browser (directive: render like Chrome / run most websites)
-- [ ] **Google**: main search page renders badly; searching → `JS: uncaught
+- [x] **Google** (FIXED main: top-level `this`→global; JS iterator/Object gaps): main search page renders badly; searching → `JS: uncaught
   TypeError: ze is not a function`. JS-engine gap (minified Google JS).
-- [ ] **DuckDuckGo**: fetch OK (HTTP 200, 41976 bytes) but renders BLANK white.
+- [x] **DuckDuckGo** (FIXED main: http9 now inflates Content-Encoding: gzip): fetch OK (HTTP 200, 41976 bytes) but renders BLANK white.
   Parse/layout drops the whole doc. HOST-reproducible (curl + hambrowse_gfx).
 - [ ] **Networking flaky**: `fetch FAILED rc=-2` / `rc=-6` intermittent; YouTube
   lags then DNS/connect/TLS error. Some fetches succeed (200). DNS/TLS reliability.
