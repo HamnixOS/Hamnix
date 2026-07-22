@@ -249,6 +249,15 @@ sv_prev: Array[65536, uint32]      # intrusive per-block list (backward)
 sv_pos: Array[65536, uint32]       # index within block (for intra-block dominance)
 sv_arg_head: Array[65536, uint32]  # head of use-list (phi/call operands), 0 = none
 sv_argn: Array[65536, uint32]      # operand count
+# %gs-relative percpu marker for SVO_LOAD/SVO_STORE (LLVM path only): 1 => the
+# access is a per-CPU slot whose pointer must be emitted in LLVM address space
+# 256 (`iW addrspace(256)*`), which clang lowers to a `%gs:`-segment-prefixed
+# load/store — NOT the absolute RIP-relative access a normal global uses.  Set
+# ONLY under ssa_mem_model != 0 (kernel LLVM lane); inert (0) for every other
+# value and on the native path (no percpu SVO_LOAD/STORE is ever built there),
+# so codegen.ad byte output is unchanged.  Read only by the LLVM emitter; no
+# optimizer pass inspects it (the LLVM lane runs no SSA passes).
+sv_as256: Array[65536, uint32]
 
 sv_count: uint32 = 1               # vid 0 reserved as null
 sv_overflow: uint32 = 0
@@ -636,6 +645,7 @@ def sv_new(op: uint32) -> uint32:
     sv_pos[id] = 0
     sv_arg_head[id] = 0
     sv_argn[id] = 0
+    sv_as256[id] = 0
     return id
 
 
@@ -974,6 +984,74 @@ def ssa_global_store(gi: uint32, val: uint32, bb: uint32):
     sv_a[st] = addr
     sv_b[st] = val
     sv_aux[st] = glob_scalar_size[gi - 1]     # store width
+    bb_append(bb, st)
+
+
+# =======================================================================
+# %gs-relative percpu scalar access (kernel LLVM lane; ssa_mem_model != 0)
+# =======================================================================
+# A `Percpu[T]` global lives per-CPU at `%gs:offset`, NOT at a linear RIP
+# address (native codegen.ad emits `movq %gs:offset, %rax`; the percpu template
+# offset is glob_offset, flagged by glob_is_percpu).  On the LLVM path clang
+# models `%gs`-relative memory as address space 256, so a percpu scalar access
+# is `inttoptr i64 <offset> to iW addrspace(256)*` + a load/store through that
+# pointer — which clang lowers to the `%gs:`-prefixed instruction, reading the
+# SAME per-CPU slot the native `%gs:offset` access does.
+#
+# The bare-load/store path here handles ONLY the machine-width SCALAR percpu
+# slot (glob_elem_size == 0).  An aggregate percpu (`Percpu[Array/Struct]`,
+# elem_size != 0) is NOT modeled: the callers leave it to BAIL (SBR_NONLOCAL /
+# SBR_MEMORY) rather than emit a wrong absolute access — a bail is safe, a
+# silent miscompile is not.
+
+# Return the 1-based global index if `off/len` names a percpu SCALAR global
+# (a machine-width `Percpu[T]` slot), else 0 (non-percpu, aggregate percpu, or
+# unknown -> caller falls through / bails).  LLVM path only (sole callers gate
+# on ssa_mem_model != 0); the native path never builds a percpu SVO_LOAD/STORE.
+def ssa_percpu_scalar(off: uint32, len_: uint32) -> uint32:
+    gi: uint32 = glob_lookup(off, len_)
+    if gi == 0:
+        return 0
+    if glob_is_percpu[gi - 1] == 0:
+        return 0                              # not %gs-relative
+    if glob_elem_size[gi - 1] != 0:
+        return 0                              # aggregate percpu -> defer (bail)
+    return gi
+
+
+# Emit a percpu scalar LOAD for `gi` into `bb`: an SVO_LOAD marked addrspace(256)
+# whose address operand is the raw per-CPU template offset (a CONST, inlined as a
+# literal by the emitter).  Width/signedness mirror the scalar-global load; the
+# emitter switches on sv_as256 to produce `iW addrspace(256)*`.
+def ssa_percpu_load(gi: uint32, bb: uint32) -> uint32:
+    off: uint32 = ssa_const_in(bb, cast[uint64](glob_offset[gi - 1]))
+    if off == 0:
+        return 0
+    ld: uint32 = sv_new(SVO_LOAD)
+    if ld == 0:
+        return 0
+    sv_a[ld] = off
+    sv_aux[ld] = glob_scalar_size[gi - 1]     # load width (1/2/4/8)
+    sv_c[ld] = glob_is_signed[gi - 1]         # 1 => sized signed load (movsx)
+    sv_ast[ld] = 0
+    sv_as256[ld] = 1                          # %gs-relative (addrspace 256)
+    bb_append(bb, ld)
+    return ld
+
+
+# Emit a percpu scalar STORE of `val` for `gi` into `bb`: an SVO_STORE marked
+# addrspace(256) at the per-CPU template offset.
+def ssa_percpu_store(gi: uint32, val: uint32, bb: uint32):
+    off: uint32 = ssa_const_in(bb, cast[uint64](glob_offset[gi - 1]))
+    if off == 0:
+        return
+    st: uint32 = sv_new(SVO_STORE)
+    if st == 0:
+        return
+    sv_a[st] = off
+    sv_b[st] = val
+    sv_aux[st] = glob_scalar_size[gi - 1]     # store width
+    sv_as256[st] = 1                          # %gs-relative (addrspace 256)
     bb_append(bb, st)
 
 
@@ -2299,7 +2377,13 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             return 0
         if ssa_islocal[nid] == 0:
             # Not a known local: a scalar global reads via a RIP-relative load;
-            # anything else (array/percpu global, function name, unknown) bails.
+            # a percpu scalar reads via a %gs-relative (addrspace 256) load on
+            # the LLVM path; anything else (aggregate/array global, function
+            # name, unknown) bails.
+            if ssa_mem_model != 0:
+                pgi: uint32 = ssa_percpu_scalar(nd_name_off[node], nd_name_len[node])
+                if pgi != 0:
+                    return ssa_percpu_load(pgi, ssa_cur_bb)
             gi: uint32 = ssa_scalar_global(nd_name_off[node], nd_name_len[node])
             if gi != 0:
                 return ssa_global_load(gi, ssa_cur_bb)
@@ -3125,8 +3209,29 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             # store into a memory-modeled scalar local's slot.
             return ssa_lower_mem_scalar_store(bb, stmt, target, tid)
         if ssa_islocal[tid] == 0:
-            # Not a known local: a scalar global stores via a RIP-relative store;
-            # anything else (array/percpu global, unknown) bails.
+            # Not a known local.  A percpu scalar stores via a %gs-relative
+            # (addrspace 256) store on the LLVM path; a plain scalar global
+            # stores via a RIP-relative store; anything else (aggregate/array
+            # global, unknown) bails.
+            if ssa_mem_model != 0:
+                ptid: uint32 = ssa_percpu_scalar(nd_name_off[target], nd_name_len[target])
+                if ptid != 0:
+                    prhs: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+                    if prhs == 0:
+                        return bb
+                    bb = ssa_cur_bb                  # RHS may have split control
+                    if aug != 0:
+                        # g op= e == g = (g op e): read the slot, combine, store.
+                        pcur: uint32 = ssa_percpu_load(ptid, bb)
+                        if pcur == 0:
+                            return bb
+                        pvg: uint32 = ssa_build_aug_binop(aug, pcur, prhs, target, nd_b[stmt], stmt, bb)
+                        if pvg == 0:
+                            return bb
+                        ssa_percpu_store(ptid, pvg, bb)
+                    else:
+                        ssa_percpu_store(ptid, prhs, bb)
+                    return bb
             gi: uint32 = ssa_scalar_global(nd_name_off[target], nd_name_len[target])
             if gi == 0:
                 ssa_set_bail(SBR_NONLOCAL)
