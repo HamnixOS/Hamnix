@@ -699,6 +699,44 @@ def _plant_distro_provenance(distro: Path) -> None:
         encoding="ascii")
 
 
+def _stage_phase0b_hostac(distro: Path) -> bool:
+    """Phase-0b: stage the self-hosted compiler + a trivial .ad into #distro.
+
+    Gated behind HAMNIX_STAGE_HOSTAC=1 (default OFF, so normal images are
+    byte-unaffected). When set, copies the self-hosted host compiler
+    (build/cutover/host_ac.elf — an x86_64-linux static ELF, EI_OSABI=3)
+    to distro/host_ac and a trivial LLVM-subset program to distro/hello.ad.
+
+    This lets an on-device `enter linux { /host_ac --backend=llvm
+    /hello.ad /hello.ll }` prove the self-hosted compiler RUNS under the
+    linux_abi shim (like busybox/apt) and can EMIT textual LLVM IR there —
+    the single biggest unknown before staging the ~1 GB clang toolchain
+    (Phase 1). See scripts/test_ondevice_hostac_llvm.sh.
+    """
+    if os.environ.get("HAMNIX_STAGE_HOSTAC", "0") not in ("1", "on", "yes"):
+        return False
+    hostac_src = HERE / "build" / "cutover" / "host_ac.elf"
+    hello_src = HERE / "tests" / "phase0b_hello.ad"
+    if not hostac_src.is_file():
+        print(f"[build_rootfs_img] WARN: HAMNIX_STAGE_HOSTAC=1 but "
+              f"{hostac_src.relative_to(HERE)} absent — run "
+              f"scripts/_adder_cc.sh adder_cc_bootstrap first; NOT staged",
+              flush=True)
+        return False
+    if not hello_src.is_file():
+        print(f"[build_rootfs_img] WARN: HAMNIX_STAGE_HOSTAC=1 but "
+              f"{hello_src.relative_to(HERE)} absent; NOT staged", flush=True)
+        return False
+    hostac_dst = distro / "host_ac"
+    shutil.copy2(hostac_src, hostac_dst)
+    hostac_dst.chmod(0o755)
+    shutil.copy2(hello_src, distro / "hello.ad")
+    print(f"[build_rootfs_img] Phase-0b: staged host_ac.elf "
+          f"({hostac_dst.stat().st_size} bytes) -> distro/host_ac + "
+          f"hello.ad -> distro/hello.ad (HAMNIX_STAGE_HOSTAC=1)", flush=True)
+    return True
+
+
 def _stage_linux_demo_bin(distro: Path) -> bool:
     """Build + plant the tiny static-PIE Linux demo ELF at distro/bin.
 
@@ -1055,6 +1093,10 @@ def _stage_distro(distro: Path, live: bool = False) -> None:
               f"(busybox-only fallback — real closure absent/trimmed)",
               flush=True)
     _plant_distro_provenance(distro)
+    # Phase-0b (on-device LLVM build de-risking): optionally stage the
+    # self-hosted compiler + a trivial .ad so an on-device `enter linux`
+    # can prove host_ac runs under the shim and emits .ll. Default OFF.
+    _stage_phase0b_hostac(distro)
     # Plant a demonstrable freedesktop .desktop so the DE menu's "Linux"
     # section (scanned from /n/linux/usr/share/applications by
     # hampanelscene) is populated on EVERY build, even a busybox-only one
