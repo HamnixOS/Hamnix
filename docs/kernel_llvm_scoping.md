@@ -323,6 +323,68 @@ distinct expression/nonlocal patterns. Close per-pattern, native-gated, until
 `init/main.ad` emits 100% (or the residual is a deliberate, documented
 native-only set that `ld` still resolves from `.S`).
 
+### Phase 4 results (whole-kernel `init/main.ad` closure, 11061 funcs)
+
+The reason=11 MEMORY bail was NOT one shape but four; after Phases 0-3 the
+`cast[Ptr[Struct]](p)[i].field` LOCAL form was already handled, but the two
+biggest remaining sub-shapes were **module-scope (global) struct access**, which
+the app sweep never exercised:
+
+| reason=11 sub-shape (before) | count | site | status |
+|------------------------------|-------|------|--------|
+| `g[i].field` — global `Array[N, Struct]` indexed then field | 652 | member-base ND_INDEX, non-local base | **CLOSED** |
+| `g.field` — in-place `Struct` global | 305 | member-base ND_IDENT, non-local | **CLOSED** |
+| `&x` — x neither mem-local nor non-percpu global (percpu/other) | 107 | addr-of ND_IDENT | tail |
+| `&expr[i]` — index base not a bare ident (member/computed/2-D) | 63 | addr-of ND_INDEX | tail |
+| `base[i].field` — index base not ident/cast (member/call) | 56 | member-base ND_INDEX | tail |
+| `&obj.field` / `&*p` — addr-of member/deref | 16 | addr-of fall-through | tail |
+| `obj.field` — obj not ident/index (`a.b.field`, `(*p).field`) | 8 | member-base fall-through | tail |
+| misc singletons | ~4 | | tail |
+
+Closing the two global buckets is a bounded subset extension in
+`ssa.ad` (two new helpers, `ssa_global_struct_base` +
+`ssa_global_indexed_struct_base`, wired into `ssa_member_base_addr`), gated on
+`ssa_mem_model != 0` so the native `codegen.ad` path is byte-identical. Both use
+the existing global machinery (`glob_lookup`, `ssa_globaladdr`,
+`glob_struct_idx`, `glob_type_node`, `st_total`); the in-place struct global's
+symbol address IS the struct base, and the array-of-struct element is
+`symbol_addr + idx*st_total(Struct)`. The `Ptr[Struct]`-GLOBAL forms are
+deliberately left BAILING (no kernel site uses one — 0 measured — so no untested
+memory-emit path ships; a bail is safe).
+
+**Whole-kernel emit: 9759 → 10575 emitted (+816), 1302 → 486 bailed (−63%).**
+Per-reason after: **365 reason=11, 68 reason=4, 49 reason=2, 4 reason=0** (the
+non-11 counts rise slightly — 40→68, 46→49 — because functions that used to bail
+on the global-struct shape now emit further and surface a deeper blocker). Fully
+verified native-safe: fuzz 500/500 correct (native + `ADDER_OPT2`), kobjdiff 0
+divergences across 11061 funcs, bench_llvm 8/8 AGREE, and a native-vs-LLVM
+differential on `g.field` / `g[i].field` / sub-8-byte-field forms (identical
+output, clang `-O2` accepts the IR).
+
+**Documented remaining Phase-4 / Phase-5 tail (486 bails):**
+
+- **reason=11 (365)** — all "address of / member through a NON-bare-ident base":
+  `&x` for a percpu/non-addressable ident (112), `&expr[i]` where the index base
+  is a member/computed/2-D expr (95), `base[i].field` / `obj.field` where the
+  member base is itself a member/call/deref (94+10), `&g[i]` on an unrecognised
+  base (47), plus a few singletons. These all need the same broader IR feature:
+  **recursive lvalue-address lowering** (compute the byte address of an arbitrary
+  nested member/index/deref lvalue), not another bounded special-case. Left
+  bailing (safe) pending that feature.
+- **reason=4 NONLOCAL (68)** — reading a **non-scalar module-scope global**
+  (whole array/struct value, or a percpu scalar) in a promote context where only
+  a machine-width scalar global is modeled.
+- **reason=2 NONSUBSET_EXPR (49)** — **indirect / function-pointer calls** (`p()`
+  through a local fn-pointer, 48) plus one singleton. Needs indirect-call
+  lowering.
+- **reason=0 (4)** — functions whose SSA build returns no entry (pre-existing;
+  unrelated to the memory subset).
+
+Note for Phase 5: the whole-kernel `.ll` currently fails `llvm-as` on a
+`declare`/`define` name collision (e.g. `@kmod_linux_load_hook` is both
+declared as an extern and defined) — a link-unit concern orthogonal to the
+subset, to resolve when wiring the kernel link lane.
+
 **Phase 5 — kernel link lane + boot.**
 Add a `adder_cc_llvm_native64`-analog kernel lane: `-mcmodel=kernel`, link the
 whole-kernel LLVM `main.o` with `kernel.lds` + the 22 existing `.S` extras
