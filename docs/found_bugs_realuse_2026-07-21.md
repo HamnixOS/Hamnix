@@ -25,11 +25,11 @@ these are pre-existing bugs, not opt-cutover regressions.
   → AGENT (browser real-sites, HOST repro).
 
 ## Tier 3 — apps / UX
-- [ ] **Panel CPU applet = 0%** while System Monitor shows real CPU. Applet reads
+- [x] **Panel CPU applet = 0%** (FIXED main: shared lib/cpustat.ad reads /dev/stat) while System Monitor shows real CPU. Applet reads
   wrong source / not sampling.
-- [ ] **Software app**: apps show redundant `hamnix-` prefix; installed/available
+- [x] **Software app** (FIXED main: strip hamnix- display + detect installed via /bin/<cmd>): apps show redundant `hamnix-` prefix; installed/available
   counts wrong (221 all / 23 installed / 198 available — not detecting installed).
-- [ ] **hamterm**: `exit` ends the shell prompt but does NOT close the window;
+- [x] **hamterm** (FIXED main: waitpid reap + Ctrl-D close): `exit` ends the shell prompt but does NOT close the window;
   Ctrl+D also doesn't. Window should close on shell exit ([hamterm] logs
   "shell exited; closing window" in one case but leaves it in the GUI case).
 - [ ] **Middle-mouse paste** (X11 primary selection): mouse MIDDLE is seen
