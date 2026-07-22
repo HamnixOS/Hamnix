@@ -70,6 +70,7 @@ from compiler.parser import (
     ND_CAST,
     ND_TYPE,
     ND_ARRAY_TYPE,
+    ND_PTR_TYPE,
     ND_INDEX,
     ND_MEMBER,
     ND_VAR_DECL,
@@ -108,6 +109,8 @@ from compiler.parser import (
     UNOP_NEG,
     UNOP_NOT,
     UNOP_BIT_NOT,
+    UNOP_DEREF,
+    UNOP_ADDR,
 )
 
 from compiler.cfg import (
@@ -273,6 +276,26 @@ ssa_local_sgn: Array[256, uint32]
 # so no upper-byte observation can distinguish the two).
 ssa_local_size: Array[256, uint32]
 
+# ----- LOCAL MEMORY subset (address-taken scalars, local arrays, deref) -
+# Gated ON only for the LLVM backend (llvm_emit_program sets ssa_mem_model=1);
+# the native --opt path (ssa_emit_program) and the analysis lane leave it 0, so
+# their bail set — and therefore their byte output — is UNCHANGED.  A local whose
+# address is taken (`&x`), a local `Array[N,T]`, or a pointer deref is modeled as
+# a stack slot (SVO_ALLOCA) + SVO_LOAD/SVO_STORE through computed byte addresses
+# (base + idx*elem reusing the same pure BINOP arithmetic the global-array subset
+# uses — no new SVO_GEP op is required).
+ssa_mem_model: uint32 = 0               # 1 => model local memory (LLVM path)
+ssa_ismem: Array[256, uint32]           # 1 => name id is a memory-modeled local
+ssa_mem_addr: Array[256, uint32]        # its SVO_ALLOCA vid (the slot's i64 address)
+ssa_mem_esz: Array[256, uint32]         # scalar/element byte width (1/2/4/8)
+ssa_mem_esgn: Array[256, uint32]        # scalar/element signedness tristate
+ssa_mem_isarr: Array[256, uint32]       # 1 => array local (indexed access only)
+# Pointee width/signedness for a pointer local/param (0 width => not derefable in
+# subset).  Independent of ssa_ismem: a promotable pointer scalar still records
+# these so `*p` can pick the load width.
+ssa_ptr_esz: Array[256, uint32]
+ssa_ptr_esgn: Array[256, uint32]
+
 # ----- loop context (break/continue targets) --------------------------
 SSA_LOOP_MAX: uint32 = 64
 ssa_brk_bb: Array[64, uint32]
@@ -427,9 +450,17 @@ def ssa_expr_sgn(node: uint32) -> uint32:
         # actually lower; any other base is unknown/unlowered -> 0).
         ibase: uint32 = nd_a[node]
         if ibase != 0 and nd_kind[ibase] == ND_IDENT:
+            ibnid: uint32 = nm_intern(nd_name_off[ibase], nd_name_len[ibase])
+            if ibnid < NM_MAX and ssa_islocal[ibnid] != 0 and ssa_ismem[ibnid] != 0 and ssa_mem_isarr[ibnid] != 0:
+                return ssa_mem_esgn[ibnid]      # local array element signedness
             igi: uint32 = ssa_global_array_1d(nd_name_off[ibase], nd_name_len[ibase])
             if igi != 0:
                 return ssa_array_elem_sgn(igi)
+        return 0
+    if k == ND_UNARY:
+        # `*p` : the pointee signedness (0 if not a derefable pointer ident).
+        if nd_aux[node] == UNOP_DEREF and nd_kind[nd_a[node]] == ND_IDENT:
+            return ssa_deref_esgn(nd_a[node])
         return 0
     return 0
 
@@ -909,15 +940,157 @@ def ssa_load_at(addr: uint32, es: uint32, sgn: uint32) -> uint32:
     return ld
 
 
-# Emit a sized SVO_STORE of width `es` of value `val` to address value `addr`.
-def ssa_store_at(addr: uint32, val: uint32, es: uint32):
+# Emit a sized SVO_STORE of width `es` of value `val` to address value `addr`
+# into block `bb`.
+def ssa_store_at_in(addr: uint32, val: uint32, es: uint32, bb: uint32):
     st: uint32 = sv_new(SVO_STORE)
     if st == 0:
         return
     sv_a[st] = addr
     sv_b[st] = val
     sv_aux[st] = es
-    bb_append(ssa_cur_bb, st)
+    bb_append(bb, st)
+
+
+# Emit a sized SVO_STORE into the current block.
+def ssa_store_at(addr: uint32, val: uint32, es: uint32):
+    ssa_store_at_in(addr, val, es, ssa_cur_bb)
+
+
+# =======================================================================
+# LOCAL MEMORY subset helpers (address-taken scalars, local arrays, deref).
+# All modeling reuses the existing SVO_ALLOCA / SVO_LOAD / SVO_STORE ops plus
+# PURE base+idx*elem BINOP arithmetic — no new opcode beyond SVO_ALLOCA (which
+# only the LLVM emitter lowers, and which is only ever produced when
+# ssa_mem_model==1, i.e. the LLVM path; the native path never sees it).
+# =======================================================================
+# Ensure name id `nid` has a stack slot: create its SVO_ALLOCA (total byte size
+# `total`) in the ENTRY block on first request.  The alloca has no operands and
+# lives in entry (which dominates every block), so it is emitted before any use.
+# Callers MUST invoke this while the entry block is still open (param setup /
+# pre-alloca scan) so the alloca never lands after a terminator.
+def ssa_ensure_slot(nid: uint32, total: uint32) -> uint32:
+    if ssa_mem_addr[nid] != 0:
+        return ssa_mem_addr[nid]
+    a: uint32 = sv_new(SVO_ALLOCA)
+    if a == 0:
+        return 0
+    sv_imm[a] = cast[uint64](total)
+    sv_type[a] = SVT_PTR
+    bb_append(sb_entry, a)
+    ssa_mem_addr[nid] = a
+    return a
+
+
+# Record pointee width/signedness for a pointer local/param so `*p` can pick its
+# load/store width.  A pointer-to-pointer derefs to an 8-byte address; a pointer
+# to a machine-width scalar derefs to that width; anything else (float / array /
+# struct pointee) leaves esz=0 => `*p` bails.
+def ssa_record_ptr_info(nid: uint32, tnode: uint32):
+    if tnode == 0 or nd_kind[tnode] != ND_PTR_TYPE:
+        return
+    pointee: uint32 = nd_a[tnode]
+    if pointee == 0:
+        return
+    if nd_kind[pointee] == ND_PTR_TYPE:
+        ssa_ptr_esz[nid] = 8
+        ssa_ptr_esgn[nid] = 1
+        return
+    if nd_kind[pointee] == ND_TYPE:
+        if type_float_width(pointee) != 0:
+            return
+        ps: uint32 = prim_type_size(pointee)
+        if ps == 1 or ps == 2 or ps == 4 or ps == 8:
+            ssa_ptr_esz[nid] = ps
+            ssa_ptr_esgn[nid] = type_signedness(pointee)
+
+
+# Byte address of element `idxnode` of memory-array local `nid`: idx is lowered
+# (may advance ssa_cur_bb), base = the alloca's i64 address, addr = base +
+# idx*elem_size built as PURE pointer arithmetic in the current block — the exact
+# shape ssa_index_addr uses for a global array.  Returns 0 on bail.
+def ssa_local_index_addr(nid: uint32, idxnode: uint32) -> uint32:
+    idxv: uint32 = ssa_lower_expr(idxnode, ssa_cur_bb)
+    if idxv == 0:
+        return 0
+    base: uint32 = ssa_mem_addr[nid]
+    if base == 0:
+        ssa_set_bail(SBR_MEMORY)
+        return 0
+    es: uint32 = ssa_mem_esz[nid]
+    scaled: uint32 = idxv
+    if es != 1:
+        sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](es))
+        if sc == 0:
+            return 0
+        mul: uint32 = sv_new(SVO_BINOP)
+        if mul == 0:
+            return 0
+        sv_aux[mul] = BINOP_MUL
+        sv_a[mul] = idxv
+        sv_b[mul] = sc
+        bb_append(ssa_cur_bb, mul)
+        scaled = mul
+    addv: uint32 = sv_new(SVO_BINOP)
+    if addv == 0:
+        return 0
+    sv_aux[addv] = BINOP_ADD
+    sv_a[addv] = base
+    sv_b[addv] = scaled
+    sv_type[addv] = SVT_PTR
+    bb_append(ssa_cur_bb, addv)
+    return addv
+
+
+# Pointee load/store width of a `*expr` deref, or 0 if not derefable in-subset
+# (only a bare local/param pointer identifier with a machine-width scalar pointee
+# is accepted; every other operand bails).
+def ssa_deref_esz(expr: uint32) -> uint32:
+    if nd_kind[expr] != ND_IDENT:
+        return 0
+    nid: uint32 = nm_intern(nd_name_off[expr], nd_name_len[expr])
+    if nid >= NM_MAX:
+        return 0
+    if ssa_islocal[nid] == 0:
+        return 0
+    return ssa_ptr_esz[nid]
+
+
+def ssa_deref_esgn(expr: uint32) -> uint32:
+    nid: uint32 = nm_intern(nd_name_off[expr], nd_name_len[expr])
+    if nid >= NM_MAX:
+        return 0
+    return ssa_ptr_esgn[nid]
+
+
+# Lower `&operand` to the operand's ADDRESS value (no load).  Scoped to LOCAL
+# memory (the point of this widening):
+#   &local            (a memory-modeled scalar/array local -> its alloca addr)
+#   &arr[i]           (a memory-array LOCAL -> element addr)
+# Address-of a GLOBAL (scalar or array element) is deliberately NOT modeled here
+# — it is not local memory, and emitting it would make address-taking prelude
+# helpers (e.g. a global-buffer print routine) fall INTO the subset and clash
+# with a linked runtime.  Returns 0 on bail.
+def ssa_lower_addr_of(operand: uint32) -> uint32:
+    k: uint32 = nd_kind[operand]
+    if k == ND_IDENT:
+        nid: uint32 = nm_intern(nd_name_off[operand], nd_name_len[operand])
+        if nid < NM_MAX and ssa_islocal[nid] != 0 and ssa_ismem[nid] != 0:
+            return ssa_mem_addr[nid]
+        ssa_set_bail(SBR_MEMORY)
+        return 0
+    if k == ND_INDEX:
+        base: uint32 = nd_a[operand]
+        if nd_kind[base] != ND_IDENT:
+            ssa_set_bail(SBR_MEMORY)
+            return 0
+        bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
+        if bnid < NM_MAX and ssa_islocal[bnid] != 0 and ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
+            return ssa_local_index_addr(bnid, nd_b[operand])
+        ssa_set_bail(SBR_MEMORY)
+        return 0
+    ssa_set_bail(SBR_MEMORY)
+    return 0
 
 
 # Build the SVO_BINOP for an augmented assignment `x op= e` == `x op e`, setting
@@ -1112,6 +1285,12 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
                 return ssa_global_load(gi, ssa_cur_bb)
             ssa_set_bail(SBR_NONLOCAL)
             return 0
+        if ssa_ismem[nid] != 0:
+            # Memory-modeled local.  An array ident used as an rvalue decays to
+            # its slot address; a scalar ident loads its slot at its width.
+            if ssa_mem_isarr[nid] != 0:
+                return ssa_mem_addr[nid]
+            return ssa_load_at(ssa_mem_addr[nid], ssa_mem_esz[nid], ssa_mem_esgn[nid])
         if ssa_name_promotable(nid) == 0:
             ssa_set_bail(SBR_NONPROMOTABLE)
             return 0
@@ -1173,6 +1352,20 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
 
     if k == ND_UNARY:
         uop: uint32 = nd_aux[node]
+        # address-of / pointer deref: modeled only on the LLVM (memory) path; the
+        # native path keeps bailing (byte-identical).
+        if ssa_mem_model != 0 and uop == UNOP_ADDR:
+            return ssa_lower_addr_of(nd_a[node])
+        if ssa_mem_model != 0 and uop == UNOP_DEREF:
+            desz: uint32 = ssa_deref_esz(nd_a[node])
+            if desz == 0:
+                ssa_set_bail(SBR_MEMORY)          # unknown/aggregate pointee
+                return 0
+            dsgn: uint32 = ssa_deref_esgn(nd_a[node])
+            pv: uint32 = ssa_lower_expr(nd_a[node], ssa_cur_bb)
+            if pv == 0:
+                return 0
+            return ssa_load_at(pv, desz, dsgn)
         vop2: uint32 = 0
         if uop == UNOP_NEG:
             vop2 = SVO_NEG
@@ -1246,7 +1439,14 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
             return 0
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
         if bnid < NM_MAX and ssa_islocal[bnid] != 0:
-            ssa_set_bail(SBR_MEMORY)              # local array -> needs alloca
+            # Local array element load (LLVM path); a non-array local indexed like
+            # an array is outside the subset.
+            if ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
+                laddr: uint32 = ssa_local_index_addr(bnid, nd_b[node])
+                if laddr == 0:
+                    return 0
+                return ssa_load_at(laddr, ssa_mem_esz[bnid], ssa_mem_esgn[bnid])
+            ssa_set_bail(SBR_MEMORY)
             return 0
         gia: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
         if gia == 0:
@@ -1277,7 +1477,9 @@ def ssa_lower_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
         return bb
     bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
     if bnid < NM_MAX and ssa_islocal[bnid] != 0:
-        ssa_set_bail(SBR_MEMORY)                  # local array -> needs alloca
+        if ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
+            return ssa_lower_local_index_store(bb, stmt, target, bnid)
+        ssa_set_bail(SBR_MEMORY)                  # non-array local indexed
         return bb
     gi: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
     if gi == 0:
@@ -1314,6 +1516,99 @@ def ssa_lower_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
     return ssa_cur_bb
 
 
+# Lower `arr[idx] = rhs` / `arr[idx] op= rhs` for a LOCAL (alloca'd) 1-D array;
+# same discipline as the global path but the base is the local's slot address.
+def ssa_lower_local_index_store(bb: uint32, stmt: uint32, target: uint32,
+                                bnid: uint32) -> uint32:
+    es: uint32 = ssa_mem_esz[bnid]
+    aug: uint32 = nd_aux[stmt]
+    if aug != 0:
+        addr: uint32 = ssa_local_index_addr(bnid, nd_b[target])
+        if addr == 0:
+            return ssa_cur_bb
+        cur: uint32 = ssa_load_at(addr, es, ssa_mem_esgn[bnid])
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at(addr, comb, es)
+        return ssa_cur_bb
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    addr2: uint32 = ssa_local_index_addr(bnid, nd_b[target])
+    if addr2 == 0:
+        return ssa_cur_bb
+    ssa_store_at(addr2, rhsv, es)
+    return ssa_cur_bb
+
+
+# Lower `x = rhs` / `x op= rhs` for a memory-modeled scalar local `tid`: the
+# slot address is a fixed alloca value, so an augmented assignment loads once,
+# combines, and stores back to the same address.
+def ssa_lower_mem_scalar_store(bb: uint32, stmt: uint32, target: uint32,
+                               tid: uint32) -> uint32:
+    es: uint32 = ssa_mem_esz[tid]
+    addr: uint32 = ssa_mem_addr[tid]
+    aug: uint32 = nd_aux[stmt]
+    if aug != 0:
+        cur: uint32 = ssa_load_at(addr, es, ssa_mem_esgn[tid])
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at_in(addr, comb, es, ssa_cur_bb)
+        return ssa_cur_bb
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    ssa_store_at_in(addr, rhsv, es, ssa_cur_bb)
+    return ssa_cur_bb
+
+
+# Lower `*p = rhs` / `*p op= rhs`.  The pointer expression is evaluated to an
+# i64 address; an augmented form evaluates the pointer ONCE (so a side-effecting
+# pointer expr is not duplicated), loads, combines, and stores back.
+def ssa_lower_deref_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
+    esz: uint32 = ssa_deref_esz(nd_a[target])
+    if esz == 0:
+        ssa_set_bail(SBR_MEMORY)
+        return bb
+    esgn: uint32 = ssa_deref_esgn(nd_a[target])
+    aug: uint32 = nd_aux[stmt]
+    if aug != 0:
+        pv: uint32 = ssa_lower_expr(nd_a[target], ssa_cur_bb)
+        if pv == 0:
+            return ssa_cur_bb
+        cur: uint32 = ssa_load_at(pv, esz, esgn)
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at_in(pv, comb, esz, ssa_cur_bb)
+        return ssa_cur_bb
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    pv2: uint32 = ssa_lower_expr(nd_a[target], ssa_cur_bb)
+    if pv2 == 0:
+        return ssa_cur_bb
+    ssa_store_at_in(pv2, rhsv, esz, ssa_cur_bb)
+    return ssa_cur_bb
+
+
 # =======================================================================
 # statement lowering: threads the current block; returns fallthrough block
 # (0 == control cannot fall through, e.g. after return/break/continue).
@@ -1323,13 +1618,48 @@ def ssa_intern_local(off: uint32, len_: uint32, tnode: uint32) -> uint32:
     if nid >= NM_MAX:
         ssa_set_bail(SBR_OVERFLOW)
         return NM_MAX
-    if ssa_name_promotable(nid) == 0:
-        ssa_set_bail(SBR_NONPROMOTABLE)
-        return NM_MAX
+    # A memory local already classified (by the pre-alloca scan, or an earlier
+    # param) is reused as-is: never re-create its alloca (which would append to a
+    # possibly-terminated entry).  Promotable locals fall through and re-classify
+    # exactly as before (preserving redeclaration behaviour / byte-identity).
+    if ssa_ismem[nid] != 0:
+        return nid
+    # A pointer local/param records its pointee width so `*p` picks a load size;
+    # this is orthogonal to promotability (a plain pointer scalar stays SSA).
+    ssa_record_ptr_info(nid, tnode)
+    # ---- local Array[N, T]: a stack slot addressed by index (LLVM path) -------
+    if nd_kind[tnode] == ND_ARRAY_TYPE:
+        if ssa_mem_model == 0:
+            ssa_set_bail(SBR_MEMORY)          # native path: arrays stay bailed
+            return NM_MAX
+        elem: uint32 = nd_a[tnode]
+        if elem != 0 and nd_kind[elem] == ND_ARRAY_TYPE:
+            ssa_set_bail(SBR_MEMORY)          # multi-dimensional -> defer
+            return NM_MAX
+        if type_float_width(elem) != 0:
+            ssa_set_bail(SBR_FLOAT)
+            return NM_MAX
+        aesz: uint32 = prim_type_size(elem)
+        if aesz != 1 and aesz != 2 and aesz != 4 and aesz != 8:
+            ssa_set_bail(SBR_MEMORY)          # non-machine element -> defer
+            return NM_MAX
+        cnt: uint32 = cast[uint32](nd_num[tnode])
+        ssa_islocal[nid] = 1
+        ssa_ismem[nid] = 1
+        ssa_mem_isarr[nid] = 1
+        ssa_mem_esz[nid] = aesz
+        ssa_mem_esgn[nid] = type_signedness(elem)
+        ssa_local_sgn[nid] = 1                # a bare array ident decays to an addr
+        ssa_local_size[nid] = 8
+        if ssa_ensure_slot(nid, cnt * aesz) == 0:
+            ssa_set_bail(SBR_OVERFLOW)
+            return NM_MAX
+        return nid
+    # ---- scalar --------------------------------------------------------------
     # Non-float integer scalars only (float locals bail -> SSE).  A narrow
     # (1/2/4-byte) local is accepted and truncated on every write (see
-    # ssa_trunc_to_local); the aggregate/pointer case (prim_type_size not a
-    # machine width) also bails.
+    # ssa_trunc_to_local); the aggregate case (prim_type_size not a machine
+    # width) bails.
     if type_float_width(tnode) != 0:
         ssa_set_bail(SBR_FLOAT)
         return NM_MAX
@@ -1337,6 +1667,25 @@ def ssa_intern_local(off: uint32, len_: uint32, tnode: uint32) -> uint32:
     if sz != 1 and sz != 2 and sz != 4 and sz != 8:
         ssa_set_bail(SBR_NONPROMOTABLE)
         return NM_MAX
+    if ssa_name_promotable(nid) == 0:
+        # Address is taken (`&x`) or the slot is read directly: this scalar must
+        # live in memory.  On the native path that bails (unchanged); on the LLVM
+        # path it becomes an alloca'd slot with sized load/store at every use.
+        if ssa_mem_model == 0:
+            ssa_set_bail(SBR_NONPROMOTABLE)
+            return NM_MAX
+        ssa_islocal[nid] = 1
+        ssa_ismem[nid] = 1
+        ssa_mem_isarr[nid] = 0
+        ssa_mem_esz[nid] = sz
+        ssa_mem_esgn[nid] = type_signedness(tnode)
+        ssa_local_sgn[nid] = type_signedness(tnode)
+        ssa_local_size[nid] = sz
+        if ssa_ensure_slot(nid, sz) == 0:
+            ssa_set_bail(SBR_OVERFLOW)
+            return NM_MAX
+        return nid
+    # ---- promotable scalar (byte-identical to the pre-memory subset) ---------
     ssa_islocal[nid] = 1
     ssa_local_sgn[nid] = type_signedness(tnode)
     ssa_local_size[nid] = sz
@@ -1383,6 +1732,20 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
         nid: uint32 = ssa_intern_local(nd_name_off[stmt], nd_name_len[stmt], nd_a[stmt])
         if nid >= NM_MAX:
             return bb
+        if ssa_ismem[nid] != 0:
+            # Memory-modeled local: store the scalar initializer into its slot.
+            # An array with an aggregate initializer is out of the subset; a bare
+            # array decl (no initializer) just reserves the slot.
+            if nd_b[stmt] != 0:
+                if ssa_mem_isarr[nid] != 0:
+                    ssa_set_bail(SBR_MEMORY)
+                    return bb
+                mval: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+                if mval == 0:
+                    return bb
+                bb = ssa_cur_bb                      # RHS may have split control
+                ssa_store_at_in(ssa_mem_addr[nid], mval, ssa_mem_esz[nid], bb)
+            return bb
         val: uint32 = 0
         if nd_b[stmt] != 0:
             val = ssa_lower_expr(nd_b[stmt], bb)
@@ -1404,8 +1767,11 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
     if k == ND_ASSIGN:
         target: uint32 = nd_a[stmt]
         if nd_kind[target] == ND_INDEX:
-            # store into a 1-D scalar-element GLOBAL array element.
+            # store into a 1-D scalar-element GLOBAL or LOCAL array element.
             return ssa_lower_index_store(bb, stmt, target)
+        if ssa_mem_model != 0 and nd_kind[target] == ND_UNARY and nd_aux[target] == UNOP_DEREF:
+            # `*p = e` / `*p op= e`: store through a pointer (LLVM path).
+            return ssa_lower_deref_store(bb, stmt, target)
         if nd_kind[target] != ND_IDENT:
             # store through member/deref -> memory, outside the current subset.
             ssa_set_bail(SBR_MEMORY)
@@ -1415,6 +1781,9 @@ def ssa_lower_stmt(bb: uint32, stmt: uint32) -> uint32:
             ssa_set_bail(SBR_OVERFLOW)
             return bb
         aug: uint32 = nd_aux[stmt]
+        if tid < NM_MAX and ssa_ismem[tid] != 0:
+            # store into a memory-modeled scalar local's slot.
+            return ssa_lower_mem_scalar_store(bb, stmt, target, tid)
         if ssa_islocal[tid] == 0:
             # Not a known local: a scalar global stores via a RIP-relative store;
             # anything else (array/percpu global, unknown) bails.
@@ -1728,6 +2097,57 @@ def ssa_lower_do_while(bb: uint32, stmt: uint32) -> uint32:
 
 
 # =======================================================================
+# pre-alloca scan (LLVM/memory path only): reserve every memory-modeled local's
+# stack slot (SVO_ALLOCA) in the ENTRY block BEFORE statement lowering, while
+# entry is still open (no terminator).  This keeps every alloca dominating its
+# uses and never appends an instruction after a block terminator.  Only var
+# decls that classify as memory (array, or address-taken/slot-read scalar) are
+# interned here; promotable scalars are left for normal lowering (their
+# classification is byte-inert).  The walk mirrors the lowerable control-flow
+# subset (if / while / do-while); constructs that bail during lowering need no
+# pre-scan (the whole function bails).
+def ssa_prealloc_decl(stmt: uint32):
+    tnode: uint32 = nd_a[stmt]
+    nid0: uint32 = nm_intern(nd_name_off[stmt], nd_name_len[stmt])
+    if nid0 >= NM_MAX:
+        return
+    is_mem: uint32 = 0
+    if nd_kind[tnode] == ND_ARRAY_TYPE:
+        is_mem = 1
+    elif ssa_name_promotable(nid0) == 0:
+        is_mem = 1
+    if is_mem != 0:
+        ssa_intern_local(nd_name_off[stmt], nd_name_len[stmt], tnode)
+
+
+def ssa_prealloc_if_alts(elif_head: uint32, else_head: uint32):
+    e: uint32 = elif_head
+    while e != 0:
+        if ssa_bail != 0:
+            return
+        ssa_prealloc_scan(nd_b[e])
+        e = nd_next[e]
+    if else_head != 0:
+        ssa_prealloc_scan(else_head)
+
+
+def ssa_prealloc_scan(head: uint32):
+    s: uint32 = head
+    while s != 0:
+        if ssa_bail != 0:
+            return
+        k: uint32 = nd_kind[s]
+        if k == ND_VAR_DECL:
+            ssa_prealloc_decl(s)
+        elif k == ND_IF:
+            ssa_prealloc_scan(nd_b[s])
+            ssa_prealloc_if_alts(nd_c[s], nd_d[s])
+        elif k == ND_WHILE or k == ND_DO_WHILE:
+            ssa_prealloc_scan(nd_b[s])
+        s = nd_next[s]
+
+
+# =======================================================================
 # whole-function build.  Returns the entry bid, or 0 on bail/overflow.
 # =======================================================================
 def ssa_build_function(fn: uint32) -> uint32:
@@ -1744,6 +2164,13 @@ def ssa_build_function(fn: uint32) -> uint32:
         ssa_islocal[i] = 0
         ssa_local_sgn[i] = 0
         ssa_local_size[i] = 8
+        ssa_ismem[i] = 0
+        ssa_mem_addr[i] = 0
+        ssa_mem_esz[i] = 0
+        ssa_mem_esgn[i] = 0
+        ssa_mem_isarr[i] = 0
+        ssa_ptr_esz[i] = 0
+        ssa_ptr_esgn[i] = 0
         i = i + 1
     # Braun current-def / incomplete-phi rows are cleared per block in bb_new_ssa
     # (indexed [block * NM_MAX + var]), so no stale mapping leaks between funcs.
@@ -1774,18 +2201,35 @@ def ssa_build_function(fn: uint32) -> uint32:
             sv_aux[pv] = pidx
             sv_ast[pv] = p
             bb_append(entry, pv)
-            # A narrow parameter is truncated to its declared width on entry
-            # (the legacy sized param spill), so every read sees the truncated
-            # value regardless of the caller's upper argument-register bits.
-            pvt: uint32 = ssa_trunc_to_local(nid, pv, entry)
-            if pvt == 0:
-                return 0
-            ssa_write_var(nid, entry, pvt)
+            if ssa_ismem[nid] != 0:
+                # Address-taken param: spill the incoming argument register into
+                # the param's stack slot; every read loads from it.  (An array
+                # passed by value is not in the ABI subset.)
+                if ssa_mem_isarr[nid] != 0:
+                    ssa_set_bail(SBR_MEMORY)
+                    return 0
+                ssa_store_at_in(ssa_mem_addr[nid], pv, ssa_mem_esz[nid], entry)
+            else:
+                # A narrow parameter is truncated to its declared width on entry
+                # (the legacy sized param spill), so every read sees the truncated
+                # value regardless of the caller's upper argument-register bits.
+                pvt: uint32 = ssa_trunc_to_local(nid, pv, entry)
+                if pvt == 0:
+                    return 0
+                ssa_write_var(nid, entry, pvt)
         pidx = pidx + 1
         p = nd_next[p]
 
     if ssa_bail != 0:
         return 0
+
+    # Reserve memory-local stack slots in the entry block before lowering (LLVM
+    # path only; the native path leaves ssa_mem_model=0 and skips this, staying
+    # byte-identical).
+    if ssa_mem_model != 0:
+        ssa_prealloc_scan(nd_c[fn])
+        if ssa_bail != 0:
+            return 0
 
     tail: uint32 = ssa_lower_chain(entry, nd_c[fn])
     if ssa_bail != 0:
