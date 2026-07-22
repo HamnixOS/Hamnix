@@ -70,6 +70,10 @@ assert_grep "FLOW  WIN1252 — … ’ € •"          "Windows-1252 C1 remap 
 assert_grep 'FLOW  WIN1252HEX — …'             "hex C1 refs remap too (&#x97; -> —, &#x85; -> …)"
 # Lone surrogate (&#xD800;) and out-of-range (&#x110000;) -> U+FFFD (�).
 assert_grep 'FLOW  SURR � � end'               "surrogate / out-of-range numeric refs map to U+FFFD"
+# Astral-plane (>U+FFFF) numeric refs decode to a real 4-byte UTF-8 code point,
+# via BOTH decimal (&#127820; -> U+1F34C 🍌, &#128512; -> U+1F600 😀) and hex
+# (&#x1F3A8; -> U+1F3A8 🎨) — surrogate-pair-free full-Unicode coverage.
+assert_grep 'FLOW  ASTRAL 🍌 🎨 😀 end'         "astral-plane decimal + hex refs (&#127820;/&#x1F3A8;/&#128512;) decode to real code points"
 
 # 3. Legacy semicolon-less references + ambiguous-ampersand guard.
 assert_grep 'FLOW  LEGACY fish & chips © 2026' "legacy &amp / &copy (no ';', followed by space) decode"
