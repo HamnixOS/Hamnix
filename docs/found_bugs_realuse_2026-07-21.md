@@ -46,3 +46,6 @@ these are pre-existing bugs, not opt-cutover regressions.
 - Wave 1 (now): kernel #DF; browser real-sites (Google/DDG/JS/net).
 - Wave 2: apps cluster (panel CPU, software counts/prefix, hamterm close);
   audio (mp3 + boot sound); middle-paste; snake; RAM-leak-vs-sysmon.
+
+## CI hygiene
+- [x] Foundational `test_hambrowse_host.sh` 15 FAIL→0 (stale snapshot from landed proportional-column + border-model improvements; gate updated to match real Chrome-close output, no engine change).
