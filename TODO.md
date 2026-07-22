@@ -38,6 +38,9 @@ its drivers via the existing `.ko` shim.
     code blocker: host_ac.elf is currently OSABI=SYSV so `fs/elf.ad::elf_is_linux_binary` classifies
     it as NATIVE → wrong syscall routing. Then stage host_ac into a writable `#distro` + QEMU
     `enter linux { host_ac --backend=llvm hello.ad hello.ll }` → .ll appears.
+  - [x] **Phase 0a DONE** (main e1d00476): x86_64-linux target stamps EI_OSABI=3 (elf_emit.ad + fused_driver + seed adder.py header stamp). host_ac.elf→OS/ABI Linux; native user→SYSV; kobjdiff+fuzzer PASS.
+  - [x] **Phase 0b DONE + KEY FINDING** (main 4452c991): shim CORRECTLY routes host_ac on-device (`elf: Linux-ABI binary detected; route via u_syscalls` — 0a works!) BUT host_ac never reaches main(): the **ELF loader KERNEL-#PFs (vec=0x0e) backing host_ac's ~474 MiB static BSS arena** (fused compiler's huge fixed Array[] globals, e.g. fused_driver_host_main.ad drv_src: Array[25165824]). Non-present PTE (pte=0) in BSS span [0x488000,0x1def5000). NOT RAM-exhaustion (repro @3G/8G), NOT ENOSYS, NOT the ET_EXEC overlay — specifically the loader's large-BSS mapping path. Reproducer: `HAMNIX_STAGE_HOSTAC=1` + `scripts/test_ondevice_hostac_llvm.sh` (opt-in, normal images unaffected).
+  - [~] **Phase 0c (NEXT) — fix large-BSS ELF loading** (fs/elf.ad + paging). Options: (1) demand-zero-page BSS (correct general model, Linux-like — non-present BSS PTE faults-in+zeros a page), (2) properly back the full BSS at load (handle large sizes), (3) shrink/mmap-allocate the compiler's arenas (band-aid). Gate = the Phase-0b reproducer goes #PF-halt → host_ac rc=0 + .ll produced. Native-safe (existing binaries + apt/busybox still load).
   - [ ] **Phase 1** — prove clang survives the shim (big C++ dyn binary + subprocesses + temp);
     fix `fs/vfs.ad::vfs_mkdir` `/tmp` ENOSYS gap; stage clang DSO closure into writable ext4 `#distro`.
   - [ ] **Phase 2** — on-device `/usr/local/bin/adder-cc-llvm` (port `scripts/adder_cc_llvm.sh`).
