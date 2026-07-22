@@ -5,7 +5,8 @@ NOTE: image was default `-O0` (HAMNIX_KERNEL_OPT=0) — NOT the SSA/--opt path, 
 these are pre-existing bugs, not opt-cutover regressions.
 
 ## Tier 1 — system stability (CRITICAL)
-- [ ] **#DF hang in `syscall_entry`** — double-fault (vec=8), CPL0 on USER stack,
+- [x] **#DF hang in `syscall_entry`** — FIXED (main, cli-before-user-RSP @ syscall_64.S; boot-verified)  
+  <details>original:</details> — double-fault (vec=8), CPL0 on USER stack,
   rip=0xffffffff805f26f9 = `syscall_entry`+0xa9 (fn @ 0x805f2650). Kernel faults
   while still on the user rsp → syscall-entry stack-switch bug (per-CPU kstack /
   swapgs / %gs base). Trips under heavy syscall load ("while typing a lot"). = the hang.
