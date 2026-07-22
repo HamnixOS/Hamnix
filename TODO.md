@@ -16,6 +16,12 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ---
 
+## 2026-07-22 — LLVM = PRIMARY backend: compile EVERYTHING (USER)
+USER 07-22: "make LLVM the primary compile pathway"; "build the kernel and all packages with llvm" for the speedup; "get the new LLVM backend to compile EVERYTHING, keeping the kernel LAST but still on the TODO after we get all other apps compiled via llvm."
+- ✅ LLVM backend PROVEN: 0.86× gcc-O2; native-link → real ELF64 native binaries; **panel (662/662 fns) compiled via LLVM BOOTS + launches apps (3/3)**; on-device compilation works (host_ac emits .ll on live OS via PIE). Native SSA stays the BOOTSTRAP FLOOR (builds host_ac; can't drop).
+- [~] **ALL USER APPS via LLVM** (agent a999cbb2 mapping DE-app coverage now). Sequence: (1) coverage table user/*.ad → emitted/bailed; (2) close the bail classes real apps hit (structs DONE; next likely match/enum, more memory patterns) in ssa.ad/ssa_llvm.ad (LLVM-path-only, native byte-safe); (3) build every user app via ELF64-LLVM (`ADDER_ELF64_APPS`), boot-verify the desktop + apps; (4) measure the speedup.
+- [ ] **KERNEL via LLVM — LAST, but ON THE LIST** (USER: after all apps). The hard one: bare-metal (higher-half link), heavy **inline asm** + `%gs` **percpu** the LLVM emitter doesn't handle yet. Needs: inline-asm passthrough to LLVM, percpu modeling, `clang -ffreestanding -target x86_64` + the kernel.lds link. Do after all apps compile via LLVM.
+
 ## 2026-07-21 — LLVM optional backend (USER-approved direction)
 
 Decision: the native SSA optimizer is correct but ~5.5× slower than gcc-O2; hand-matching
