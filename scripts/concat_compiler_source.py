@@ -365,7 +365,15 @@ def main(argv):
             # codegen/elf_emit. NOTE: deliberately NOT added to the frozen Python
             # seed's import-discovery closure — the seed stays the untouched
             # bootstrap oracle; only the self-hosted host_ac.elf links the SSA code.
-            modules += ["ssa.ad", "ssa_opt.ad", "ssa_emit.ad"]
+            #
+            # ssa_llvm.ad is the OPTIONAL "release/fast" LLVM backend (a SPIKE).
+            # It READS the SSA IR (ssa.ad arenas) + codegen global/enum/class
+            # layout tables and emits TEXTUAL LLVM IR (.ll). It references
+            # codegen/ssa/parser/lexer symbols only (all ahead of it), so it is
+            # appended LAST. Gated at RUNTIME behind the driver's --backend=llvm /
+            # --emit-llvm flag; with neither set it is never entered and
+            # host_ac.elf's ELF output is byte-identical to the pre-LLVM compiler.
+            modules += ["ssa.ad", "ssa_opt.ad", "ssa_emit.ad", "ssa_llvm.ad"]
 
     chunks = []
     header = (
