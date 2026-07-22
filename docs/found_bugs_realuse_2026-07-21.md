@@ -11,7 +11,7 @@ these are pre-existing bugs, not opt-cutover regressions.
   while still on the user rsp → syscall-entry stack-switch bug (per-CPU kstack /
   swapgs / %gs base). Trips under heavy syscall load ("while typing a lot"). = the hang.
   → AGENT (kernel).
-- [ ] **RAM only ever goes UP** — closing apps doesn't free memory (mem_gate log:
+- [x] **RAM only ever goes UP** (FIXED main: (B) reporting bug — meminfo now counts buddy free pool, not just order-0 list) — closing apps doesn't free memory (mem_gate log:
   free stuck at 1466512 before/after). Either a real kernel leak (task teardown
   not reclaiming pages) OR System Monitor reads wrong. Confirm which.
 
