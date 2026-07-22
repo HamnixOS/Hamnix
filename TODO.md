@@ -29,10 +29,22 @@ its drivers via the existing `.ko` shim.
   `.ll` from the SSA IR → clang-19/llc. Gated `--backend=llvm`, native default unchanged.
   Acceptance = correctness (0 wrong answers on bench+fuzzer) + the 4-way perf number
   (native-SSA vs Adder-LLVM vs gcc-O0 vs gcc-O2). The LLVM-vs-gcc-O2 number decides it.
-- [ ] **Get the LLVM backend functional WITHIN the Linux namespace** (USER) — build/run the
-  LLVM toolchain on-device via the Debian namespace (apt clang/llvm) so on-device release
-  compilation works, not just host. Preserves self-hosting: native backend bootstraps; LLVM
-  is the opt-in fast path built from the distro's C++ toolchain.
+- [~] **Get the LLVM backend functional WITHIN the Linux namespace** (USER) — feasibility mapped
+  2026-07-22: the whole `.ad→.ll→clang→binary` pipeline runs INSIDE `enter linux { }` (host_ac.elf
+  AND clang are both x86_64-linux binaries; bash runs in the Debian ns) — NO new kernel/ns machinery.
+  Phased plan (QEMU-validated):
+  - [~] **Phase 0** — stamp `EI_OSABI=LINUX(3)` on the `x86_64-linux` target (`elf_emit.ad:832`,
+    thread the target through `ELF_FMT_USER`; keep `x86_64-adder-user`=SYSV/native). Fixes the ONE
+    code blocker: host_ac.elf is currently OSABI=SYSV so `fs/elf.ad::elf_is_linux_binary` classifies
+    it as NATIVE → wrong syscall routing. Then stage host_ac into a writable `#distro` + QEMU
+    `enter linux { host_ac --backend=llvm hello.ad hello.ll }` → .ll appears.
+  - [ ] **Phase 1** — prove clang survives the shim (big C++ dyn binary + subprocesses + temp);
+    fix `fs/vfs.ad::vfs_mkdir` `/tmp` ENOSYS gap; stage clang DSO closure into writable ext4 `#distro`.
+  - [ ] **Phase 2** — on-device `/usr/local/bin/adder-cc-llvm` (port `scripts/adder_cc_llvm.sh`).
+  - [ ] **Phase 3** — productionize: clang delivery (bake into debootstrap fixture OR file:// localrepo,
+    no network), size a disk-backed `#distro` for the ~1GB toolchain, add a QEMU on-device gate.
+  RISKS: clang-under-shim (unproven, moderate) + fitting ~1GB toolchain on a writable disk `#distro`.
+  Output binary is a Linux-ABI ELF (runs in the linux ns) — correct per docs/distro-namespaces.md.
 - [ ] Once the LLVM number lands: STOP grinding the native register allocator toward
   gcc-parity (it only needs correct + decent for bootstrap); LLVM carries release speed.
 - [ ] Robustify the `.ko` driver L-shim (the answer to "mature drivers" that made forking
