@@ -97,7 +97,9 @@ assert_grep 'glyphs .*\"Upgradable\"'           "sidebar: Upgradable category"
 # --- package index parsed from real-shape `hpm search` output ---------------
 assert_grep '^COUNT 6'                          "6 packages parsed from search output"
 assert_grep '^FILT_ALL 6'                       "category All -> all 6 shown"
-assert_grep 'glyphs .*\"hamnix-base\"'          "package hamnix-base listed"
+# The redundant "hamnix-" vendor prefix is stripped for DISPLAY (the stored
+# package id keeps it for install/list matching), so the row renders "base".
+assert_grep 'glyphs .*\"base\" #'               "package hamnix-base listed as 'base' (prefix stripped)"
 assert_grep 'glyphs .*\"hambrowse\"'            "package hambrowse listed"
 assert_grep 'glyphs .*\"webkitgtk\"'            "package webkitgtk listed"
 assert_grep 'glyphs .*\"native web browser\"'   "short description rendered"
