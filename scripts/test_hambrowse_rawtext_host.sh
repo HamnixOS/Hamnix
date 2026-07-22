@@ -85,6 +85,14 @@ assert_grep '^JSLOG after 3$'  "a real element after the script/style blocks sti
 assert_nogrep '^JSERR'  "no uncaught JS error across the raw-text script"
 assert_nogrep 'Uncaught' "no 'Uncaught' error from a missing DOM API"
 
+# BUTTON-LABEL RAW-TEXT SCOPE: a <button> whose first child is a nested <style>
+# (google's search button shape) must render only its real label — the rawtext
+# CSS body must NOT leak as the visible button label. Before the fix the button
+# read as "[ .leakcls{display:flex;…}Search Now ]".
+assert_grep '\[ Search Now \]' "button with a nested <style> renders its real label"
+assert_nogrep 'leakcls'        "nested <style> class selector does not leak as button-label text"
+assert_nogrep 'display:flex'   "nested <style> declarations do not leak as button-label text"
+
 if [ "$fail" -ne 0 ]; then
     echo "[hb-rt] RESULT: FAIL"; exit 1
 fi
