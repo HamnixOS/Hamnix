@@ -496,6 +496,19 @@ def ssa_callee_rettype_sgn(off: uint32, len_: uint32) -> uint32:
     return 0
 
 
+# Return-type NODE of an in-unit function named by `off/len`, or 0 if unknown.
+# Used to type a call USED AS AN INDEX BASE (`foo()[i]`): the element width comes
+# from the callee's declared Ptr[T] pointee.
+def ssa_callee_ret_node(off: uint32, len_: uint32) -> uint32:
+    cur: uint32 = ssa_prog_decls
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            if ssa_name_bytes_eq(nd_name_off[cur], nd_name_len[cur], off, len_) != 0:
+                return nd_b[cur]
+        cur = nd_next[cur]
+    return 0
+
+
 # SHALLOW expression signedness (0/1/2), mirroring codegen.ad's expr_signedness
 # restricted to the Phase-1 subset: ND_IDENT -> the local's declared signedness
 # (non-locals bail before this is reached); ND_CALL -> the callee's return-type
@@ -1395,6 +1408,232 @@ def ssa_lower_global_ptr_index_store(bb: uint32, stmt: uint32, target: uint32,
     return ssa_cur_bb
 
 
+# ---- NON-IDENT index base (`g[i][j][k]`, `foo()[i]`) ----------------------
+# The 1-D/2-D/global-ptr fast paths above all require the index BASE to be a bare
+# identifier.  The two helpers below close the remaining machine-scalar INTEGER
+# element cases where the base is a compound expression:
+#   * a fully-indexed N-D (depth>=3) GLOBAL array (`scf_l[gr][ch][sfb]`), and
+#   * an rvalue expression that produces a POINTER (`_name_slot(pk)[i]`).
+# Float-element bases are rejected (the SVO_LOAD/STORE ops are integer-only), so
+# they keep bailing to native.  LLVM path only (callers gate on ssa_mem_model !=
+# 0); the native path never reaches them, so its byte output is unchanged.
+
+# Element byte address of a fully-indexed N-D scalar-INTEGER GLOBAL array named
+# at the root of the index chain `node` (the OUTERMOST ND_INDEX).  Returns 0 when
+# the shape is not such an array (no bail set) or on a mid-lowering bail; on
+# success writes the element width/signedness through out_esz/out_esgn.  The flat
+# offset is base + Σ_d idx_d * stride_d with row-major strides (stride_d = es *
+# Π_{m>d} dim_m) — the same pure base+idx*scale arithmetic the 2-D path builds.
+def ssa_global_arraynd_addr(node: uint32, out_esz: Ptr[uint32],
+                            out_esgn: Ptr[uint32]) -> uint32:
+    out_esz[0] = 0
+    out_esgn[0] = 0
+    # Walk the index chain: idxs[0..count) are the index exprs innermost-applied
+    # first (idxs[0] = last `[..]`); the chain must bottom out at an ND_IDENT.
+    idxs: Array[8, uint32]
+    count: uint32 = 0
+    cur: uint32 = node
+    while nd_kind[cur] == ND_INDEX:
+        if count >= 8:
+            return 0
+        idxs[count] = nd_b[cur]
+        count = count + 1
+        cur = nd_a[cur]
+    if count == 0 or nd_kind[cur] != ND_IDENT:
+        return 0
+    gi: uint32 = glob_lookup(nd_name_off[cur], nd_name_len[cur])
+    if gi == 0 or glob_is_percpu[gi - 1] != 0:
+        return 0
+    tn: uint32 = glob_type_node[gi - 1]
+    if tn == 0 or nd_kind[tn] != ND_ARRAY_TYPE:
+        return 0
+    # Collect the array dims outer..inner and reach the innermost element type.
+    dims: Array[8, uint32]
+    ndim: uint32 = 0
+    t: uint32 = tn
+    while nd_kind[t] == ND_ARRAY_TYPE:
+        if ndim >= 8:
+            return 0
+        dims[ndim] = cast[uint32](nd_num[t])
+        ndim = ndim + 1
+        t = nd_a[t]
+    if ndim != count:
+        return 0                              # partial index (subarray) -> defer
+    if type_float_width(t) != 0:
+        return 0                              # float element: integer ops only
+    es: uint32 = prim_type_size(t)
+    if es != 1 and es != 2 and es != 4 and es != 8:
+        return 0
+    # Lower every index expr first (matches ssa_index2_addr ordering), then the
+    # base symbol address, then fold base + Σ idx_d*stride_d.
+    ivs: Array[8, uint32]
+    d: uint32 = 0
+    while d < ndim:
+        iv: uint32 = ssa_lower_expr(idxs[count - 1 - d], ssa_cur_bb)
+        if iv == 0:
+            return 0
+        ivs[d] = iv
+        d = d + 1
+    acc: uint32 = ssa_globaladdr(gi, ssa_cur_bb)
+    if acc == 0:
+        return 0
+    d = 0
+    while d < ndim:
+        stride: uint32 = es
+        m: uint32 = d + 1
+        while m < ndim:
+            stride = stride * dims[m]
+            m = m + 1
+        scaled: uint32 = ivs[d]
+        if stride != 1:
+            sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](stride))
+            if sc == 0:
+                return 0
+            mul: uint32 = sv_new(SVO_BINOP)
+            if mul == 0:
+                return 0
+            sv_aux[mul] = BINOP_MUL
+            sv_a[mul] = ivs[d]
+            sv_b[mul] = sc
+            bb_append(ssa_cur_bb, mul)
+            scaled = mul
+        addv: uint32 = sv_new(SVO_BINOP)
+        if addv == 0:
+            return 0
+        sv_aux[addv] = BINOP_ADD
+        sv_a[addv] = acc
+        sv_b[addv] = scaled
+        sv_type[addv] = SVT_PTR
+        bb_append(ssa_cur_bb, addv)
+        acc = addv
+        d = d + 1
+    out_esz[0] = es
+    out_esgn[0] = type_signedness(t)
+    return acc
+
+
+# Pointee width/signedness of an expression that STATICALLY has pointer type and
+# whose element is a machine-scalar integer, else 0.  Only a direct call to an
+# in-unit function returning `Ptr[<machine int>]` is resolvable (a general expr's
+# static type is not tracked here).  On a hit writes the signedness tristate.
+def ssa_ptr_expr_esz(node: uint32, out_esgn: Ptr[uint32]) -> uint32:
+    out_esgn[0] = 0
+    if nd_kind[node] != ND_CALL:
+        return 0
+    callee: uint32 = nd_a[node]
+    if callee == 0 or nd_kind[callee] != ND_IDENT:
+        return 0
+    rt: uint32 = ssa_callee_ret_node(nd_name_off[callee], nd_name_len[callee])
+    if rt == 0 or nd_kind[rt] != ND_PTR_TYPE:
+        return 0
+    pointee: uint32 = nd_a[rt]
+    if pointee == 0:
+        return 0
+    if nd_kind[pointee] == ND_PTR_TYPE:
+        out_esgn[0] = 1
+        return 8
+    if type_float_width(pointee) != 0:
+        return 0
+    ps: uint32 = prim_type_size(pointee)
+    if ps != 1 and ps != 2 and ps != 4 and ps != 8:
+        return 0
+    out_esgn[0] = type_signedness(pointee)
+    return ps
+
+
+# Element byte address of `<ptr-rvalue>[i]` — the base expr (nd_a[node]) is
+# lowered as an rvalue POINTER value and `base + i*es` added.  Returns 0 when the
+# base is not a resolvable pointer (no bail) or on a mid-lowering bail.
+def ssa_ptr_rvalue_index_addr(node: uint32, out_esz: Ptr[uint32],
+                              out_esgn: Ptr[uint32]) -> uint32:
+    out_esz[0] = 0
+    out_esgn[0] = 0
+    base: uint32 = nd_a[node]
+    esgn: uint32 = 0
+    es: uint32 = ssa_ptr_expr_esz(base, &esgn)
+    if es == 0:
+        return 0
+    ptrval: uint32 = ssa_lower_expr(base, ssa_cur_bb)
+    if ptrval == 0:
+        return 0
+    idxv: uint32 = ssa_lower_expr(nd_b[node], ssa_cur_bb)
+    if idxv == 0:
+        return 0
+    scaled: uint32 = idxv
+    if es != 1:
+        sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](es))
+        if sc == 0:
+            return 0
+        mul: uint32 = sv_new(SVO_BINOP)
+        if mul == 0:
+            return 0
+        sv_aux[mul] = BINOP_MUL
+        sv_a[mul] = idxv
+        sv_b[mul] = sc
+        bb_append(ssa_cur_bb, mul)
+        scaled = mul
+    addv: uint32 = sv_new(SVO_BINOP)
+    if addv == 0:
+        return 0
+    sv_aux[addv] = BINOP_ADD
+    sv_a[addv] = ptrval
+    sv_b[addv] = scaled
+    sv_type[addv] = SVT_PTR
+    bb_append(ssa_cur_bb, addv)
+    out_esz[0] = es
+    out_esgn[0] = esgn
+    return addv
+
+
+# Dispatcher: element byte address for an ND_INDEX `node` whose base is NOT a
+# bare identifier — try the N-D global array shape, then the pointer-rvalue shape.
+# Returns 0 (with out_esz==0) when neither applies or a sub-lowering bailed.
+def ssa_nonident_index_addr(node: uint32, out_esz: Ptr[uint32],
+                            out_esgn: Ptr[uint32]) -> uint32:
+    a: uint32 = ssa_global_arraynd_addr(node, out_esz, out_esgn)
+    if a != 0:
+        return a
+    if ssa_bail != 0:
+        return 0
+    return ssa_ptr_rvalue_index_addr(node, out_esz, out_esgn)
+
+
+# `<nonident-base>[i] = rhs` / `... op= rhs` store.  The element address (which
+# evaluates the base + index once) is computed via the dispatcher; the augmented
+# form load-modify-writes the SAME address.  LLVM path only.
+def ssa_lower_nonident_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
+    aug: uint32 = nd_aux[stmt]
+    es: uint32 = 0
+    esgn: uint32 = 0
+    if aug != 0:
+        addr: uint32 = ssa_nonident_index_addr(target, &es, &esgn)
+        if addr == 0:
+            if ssa_bail == 0:
+                ssa_set_bail(SBR_MEMORY)
+            return ssa_cur_bb
+        cur: uint32 = ssa_load_at(addr, es, esgn)
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at(addr, comb, es)
+        return ssa_cur_bb
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    addr2: uint32 = ssa_nonident_index_addr(target, &es, &esgn)
+    if addr2 == 0:
+        if ssa_bail == 0:
+            ssa_set_bail(SBR_MEMORY)
+        return ssa_cur_bb
+    ssa_store_at(addr2, rhsv, es)
+    return ssa_cur_bb
+
+
 # Pointee load/store width of a `*expr` deref, or 0 if not derefable in-subset
 # (only a bare local/param pointer identifier with a machine-width scalar pointee
 # is accepted; every other operand bails).
@@ -2189,7 +2428,16 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
                     return 0
                 return ssa_load_at(a2d, glob_elem_size[g2 - 1], ssa_array2_elem_sgn(g2))
         if nd_kind[base] != ND_IDENT:
-            ssa_set_bail(SBR_MEMORY)
+            # Non-identifier base (LLVM path): N-D global array (`g[i][j][k]`) or
+            # a pointer-returning rvalue (`foo()[i]`).  Integer-element only.
+            if ssa_mem_model != 0:
+                niesz: uint32 = 0
+                niesgn: uint32 = 0
+                niaddr: uint32 = ssa_nonident_index_addr(node, &niesz, &niesgn)
+                if niaddr != 0:
+                    return ssa_load_at(niaddr, niesz, niesgn)
+            if ssa_bail == 0:
+                ssa_set_bail(SBR_MEMORY)
             return 0
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
         if bnid < NM_MAX and ssa_islocal[bnid] != 0:
@@ -2278,6 +2526,10 @@ def ssa_lower_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
         if g2s != 0:
             return ssa_lower_index2_store(bb, stmt, target, g2s)
     if nd_kind[base] != ND_IDENT:
+        # Non-identifier base (LLVM path): N-D global array (`g[i][j][k] = rhs`)
+        # or a pointer-returning rvalue (`foo()[i] = rhs`).  Integer-element only.
+        if ssa_mem_model != 0:
+            return ssa_lower_nonident_index_store(bb, stmt, target)
         ssa_set_bail(SBR_MEMORY)
         return bb
     bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
