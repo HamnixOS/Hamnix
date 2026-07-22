@@ -168,24 +168,34 @@ assert_grep3() {
     fi
 }
 
-# Column x-positions are computed from the WIDEST cell per column, and each
-# cell's text is inset CELL_PADX=6px from its left border so it never collides
-# with the frame. A <th> renders BOLD (~1/8 wider than the CELL_W monospace
-# estimate) so its column reserves ~1/3 extra chars to fit the bold header:
-#   col0 "Blueberry"(9)       -> next col at 8+(9+2)*8 = 96
-#   col1 "Colour"(6,th->8)    -> next col at 96+(8+2)*8 = 176
-# Cell text starts at col_x + 6 (the 6px inset): col0 -> 14, col1 -> 102,
-# col2 -> 182. Header + every body row share these exact inset column x's.
+# Column x-positions are computed from each column's WIDEST cell using the
+# PROPORTIONAL glyph-advance model (lib/web/layout/tables.ad::_adv8/_measure_table,
+# commit 73ad044e "match Chrome cell height + proportional column widths",
+# table SSIM 0.36->0.56). A column's char width = ceil(sum_of_glyph_advances /
+# CELL_W); cell text is then inset CELL_PADX=6px from the column's left border.
+#   col0 "Blueberry": adv sum 78px -> ceil(78/8)=10 cells -> next col at
+#         8+(10+2)*8 = 104          (the old monospace model counted 9 chars -> 96)
+#   col1 "Colour"(bold th): adv sum 58px -> ceil(58/8)=8 cells -> next col at
+#         104+(8+2)*8 = 184
+# Cell text starts at col_x + 6 (the 6px inset): col0 -> 14, col1 -> 110,
+# col2 -> 190. Header + every body row share these exact inset column x's.
+# NOTE: the earlier expected x's (col1=102, col2=182) predate the proportional
+# model (they encoded the old monospace char-count of b16501c4) and were STALE;
+# updated to the proportional Chrome-matching x's. Chrome renders this fixture's
+# col0:col1 border-box width ratio as 68:52 = 1.31 (measured via
+# getBoundingClientRect); the proportional model's 96:80 = 1.20 tracks that far
+# closer than the old monospace 88:80 = 1.10 (see build/framediff_gfx/table/
+# sxs_chromium.png for the pixel columns aligning with Chrome).
 assert_grep3 '^SEG 2 14 #101010 b1 .*Fruit\|'   "th 'Fruit' bold at col0 (x=14, 6px inset)"
-assert_grep3 '^SEG 2 102 #101010 b1 .*Colour\|' "th 'Colour' bold at col1 (x=102, fits bold header)"
-assert_grep3 '^SEG 2 182 #101010 b1 .*Qty\|'    "th 'Qty' bold at col2 (x=182)"
+assert_grep3 '^SEG 2 110 #101010 b1 .*Colour\|' "th 'Colour' bold at col1 (x=110, proportional col width)"
+assert_grep3 '^SEG 2 190 #101010 b1 .*Qty\|'    "th 'Qty' bold at col2 (x=190)"
 assert_grep3 '^SEG 3 14 #101010 b0 .*Apple\|'   "td 'Apple' plain at col0 (x=14, aligned to header)"
-assert_grep3 '^SEG 3 102 #101010 b0 .*red\|'    "td 'red' at col1 (x=102, aligned to header)"
-assert_grep3 '^SEG 3 182 #101010 b0 .*12\|'     "td '12' at col2 (x=182, aligned to header)"
-assert_grep3 '^SEG 4 102 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=102"
+assert_grep3 '^SEG 3 110 #101010 b0 .*red\|'    "td 'red' at col1 (x=110, aligned to header)"
+assert_grep3 '^SEG 3 190 #101010 b0 .*12\|'     "td '12' at col2 (x=190, aligned to header)"
+assert_grep3 '^SEG 4 110 #101010 b0 .*blue\|'   "wide row 'Blueberry' keeps col1 at x=110"
 # Per-cell colour + background survive the padded column placement.
 assert_grep3 '^SEG 6 14 #101010 b0 u0 s0 l-1 bg#c0c0c0 .*Lime\|' "td bgcolor=silver fills the cell (#c0c0c0)"
-assert_grep3 '^SEG 6 102 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
+assert_grep3 '^SEG 6 110 #008000 .*green\|'                   "font color=green inside a cell -> #008000"
 # Cell text must sit strictly INSIDE the cell's left border (x>col_x): col0's
 # border is at x=8, so no cell text may start at x<=8 — proving the padding.
 if grep -Eq '^SEG [2-6] 8 #' "$DUMP3"; then
@@ -195,8 +205,8 @@ else
 fi
 # The FLOW reconstruction shows the columns aligned as a grid (bold-header col
 # widened so "Colour" is not cramped against "Qty").
-assert_grep3 '^FLOW  Fruit      Colour    Qty$'  "FLOW renders the header row as aligned columns"
-assert_grep3 '^FLOW  Blueberry  blue      340$'  "FLOW renders the wide row aligned to the same columns"
+assert_grep3 '^FLOW  Fruit       Colour    Qty$'  "FLOW renders the header row as aligned columns"
+assert_grep3 '^FLOW  Blueberry   blue      340$'  "FLOW renders the wide row aligned to the same columns"
 
 # ====================================================================
 # BLOCK-MARGIN fixture — CSS margin-left/padding-left shift a <p>/<div>'s
@@ -238,9 +248,15 @@ assert_grepM '^SEG 7 8 .*Back flush at the body margin' "indent pops back to x=8
 # COLSPAN fixture — <thead>/<tbody> wrappers (transparent) + colspan cells.
 # Columns are sized by the single-span cells only; bold <th>s reserve ~1/3
 # extra chars and every cell's text is inset CELL_PADX=6px from its border:
-#   col0 "Region"(6,th->8) -> x=8,  next 8+(8+2)*8   = 88 ; text at 8+6  = 14
-#   col1 "Q1"(2,th->3)     -> x=88, next 88+(3+2)*8  = 128; text at 88+6 = 94
-#   col2 "Q2"(2,th->3)     -> x=128,right sentinel 128+(3+2)*8 = 168;   = 134
+#   col0 "Region"(th)  -> x=8,  next 8+(8+2)*8   = 88 ; text at 8+6  = 14
+#   col1 "Q1"(bold th) -> x=88, PROPORTIONAL adv -> 4 cells: next 88+(4+2)*8 = 136;
+#                         text at 88+6 = 94
+#   col2 "Q2"(bold th) -> x=136, text at 136+6 = 142
+# NOTE: col2's earlier expected x=134 (and col1's 3-cell width) predate the
+# proportional glyph-advance column model (commit 73ad044e); "Q1" bold measures
+# just over 3 cells so its column rounds up to 4, shifting col2 text from 134 to
+# 142. Updated to the proportional Chrome-matching x (same model that renders the
+# table fixture's columns aligned with Chrome, build/framediff_gfx/table/).
 # A colspan=2 cell starts at col1 (text x=94) and its right edge is col_x[3]
 # (spanning col1+col2), so its text flows across BOTH columns' width; a
 # colspan=3 cell starts at col0 (text x=14) and spans the whole table.
@@ -266,10 +282,10 @@ assert_grepS() {
 # body <td>s align to the SAME x-positions across the wrapper boundary.
 assert_grepS '^SEG 2 14 #101010 b1 .*Region\|'  "th 'Region' bold at col0 (x=14, thead transparent)"
 assert_grepS '^SEG 2 94 #101010 b1 .*Q1\|'      "th 'Q1' bold at col1 (x=94)"
-assert_grepS '^SEG 2 134 #101010 b1 .*Q2\|'     "th 'Q2' bold at col2 (x=134)"
+assert_grepS '^SEG 2 142 #101010 b1 .*Q2\|'     "th 'Q2' bold at col2 (x=142)"
 assert_grepS '^SEG 3 14 #101010 b0 .*North\|'   "tbody td 'North' aligns to col0 (x=14)"
 assert_grepS '^SEG 3 94 #101010 b0 .*10\|'      "tbody td '10' aligns to col1 (x=94)"
-assert_grepS '^SEG 3 134 #101010 b0 .*20\|'     "tbody td '20' aligns to col2 (x=134)"
+assert_grepS '^SEG 3 142 #101010 b0 .*20\|'     "tbody td '20' aligns to col2 (x=142)"
 # colspan=2: cell starts at col1 (x=94) and wraps within the SPANNED right edge
 # (col_x[3]) — its text flows across col1+col2, not col1's own 3 chars.
 assert_grepS '^SEG 4 14 #101010 b0 .*Totals\|'  "row: single-span 'Totals' at col0 (x=14)"
@@ -278,8 +294,9 @@ assert_grepS '^SEG [5-6] 94 #101010 b0 .*quarters\|' "colspan=2 body wraps insid
 # colspan=3: cell starts at col0 (x=14) and spans the whole table width.
 assert_grepS '^SEG [0-9]+ 14 #101010 b0 .*Grand total across\|' "colspan=3 cell starts at col0 (x=14) across full width"
 # The single-span columns were NOT inflated by the spanning cells' long text
-# (col1 stayed 3 chars wide -> col2 text at x=134, not pushed further right).
-if grep -Eq '^SEG 2 134 ' "$DUMPS"; then
+# (col2 text stays at x=142 from the header widths, not pushed further right by
+# the colspan cells' long "All quarters combined" / "Grand total ..." text).
+if grep -Eq '^SEG 2 142 ' "$DUMPS"; then
     echo "[hb-host] PASS spanning cells do not inflate single-span column widths"
 else
     echo "[hb-host] FAIL spanning cell inflated a column width"; fail=1
@@ -456,13 +473,22 @@ assert_grepB '^SEG 1[5-9] 8 .*(wraps|rows|page|would|allow)' \
     ".narrow width:120px keeps wrapping onto later rows (constrained width)"
 # border box: top/bottom '+---+' rules, content inset by one cell (x=16), and
 # vertical '|' bars at the left (x=8) and right (x=584) columns.
+# NOTE: the side bars now share the FIRST content row (row 17), the same row the
+# top '+---+' rule sits on. The 1px top border is drawn at the TOP EDGE of the
+# first content row (lib/web/layout/box.ad::_block_box_open, "the reserved top-
+# rule row was removed") instead of consuming its own ~19px grid row — the fix
+# that stopped every bordered block (card/panel/grid-item/fieldset) from being
+# pushed ~19px too far DOWN vs Chrome. The earlier expected row (18) encoded that
+# old reserved-top-rule-row bug; updated to row 17. The pixel border still fully
+# encloses the content (build/framediff_gfx/hambrowse_cssbox/sxs_chromium.png:
+# the bordered card box matches Chrome's).
 assert_grepB '^SEG [0-9]+ 8 .*\+-+\+\|$' \
     ".card border draws a '+---+' horizontal rule spanning the box"
 assert_grepB '^SEG [0-9]+ 16 .*Bordered card block with inset content' \
     ".card border insets the content column by one cell (x=8 -> x=16)"
-assert_grepB '^SEG 18 8 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 17 8 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a left '|' side bar at x=8 on the content row"
-assert_grepB '^SEG 18 584 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
+assert_grepB '^SEG 17 584 #101010 b0 u0 s0 l-1 bg- \|\|\|$' \
     ".card border draws a right '|' side bar at x=584 on the content row"
 # there must be TWO horizontal border rules (top + bottom) for the one .card.
 if [ "$(grep -Ec '^SEG [0-9]+ 8 .*\+-+\+\|$' "$DUMPB")" -eq 2 ]; then
@@ -860,23 +886,30 @@ assert_grepA '^SEG [0-9]+ [0-9]+ #0a6b5a b0 u0 s0 l-1 bg#eef0f3 \| code\|' \
 assert_grepA '^SEG 45 32 #5a5a5a b0 u0 s0 l-1 bg- \|Anything that can go wrong' \
     "blockquote text -> muted grey (#5a5a5a), indented to x=32"
 
-# ---- readable-measure default: on a WIDE window the body column is capped at
-# MEASURE_MAX (584 px) and CENTRED, so text does not span edge-to-edge. At 900 px
-# the centring gutter is (900-16-584)/2 = 150, so body text starts at x=158.
+# ---- edge-to-edge prose on a WIDE window: Chrome/Firefox parity. A plain-prose
+# page that does NOT declare its own author `max-width` spans the FULL viewport
+# width (body content starts at the body margin x=8), rather than being capped at
+# a 584px centred reading column. This matches Chrome exactly: at a 900px window
+# the first paragraph's border-box left = 8px and width = 869px (measured via
+# getBoundingClientRect), i.e. edge-to-edge — NOT a centred 584px strip.
+# NOTE: the earlier expected x=158 encoded an always-on 584px centred measure
+# (gutter (900-16-584)/2 = 150) that _page_gutter() no longer applies to plain
+# prose (lib/web/state.ad::_page_gutter now returns 0 unless g_page_maxwidth) —
+# it was STALE. Updated to the Chrome-matching edge-to-edge x=8.
 DUMPA9="$OUT/dump_article_wide.txt"
-echo "[hb-host] running host harness on $FIXA (900 px, centred measure) ..."
+echo "[hb-host] running host harness on $FIXA (900 px, edge-to-edge prose) ..."
 if ! "$BIN" "$FIXA" 900 >"$DUMPA9" 2>&1; then
     echo "[hb-host] FAIL: wide-article harness exited non-zero"; cat "$DUMPA9"; exit 1
 fi
 cat "$DUMPA9"
-assert_grepA '^SEG 2 158 #101010 b0 u0 s0 l-1 bg- \|Hamnix is a native operating system' \
-    "wide window: body column centred at the 584px measure (x=158 at 900px)" "$DUMPA9"
-# the centred column is exactly the measure wide: the wrapped line ends near
-# x=158+584=742, NOT at the 892px window edge (proves the cap engaged).
+assert_grepA '^SEG 2 8 #101010 b0 u0 s0 l-1 bg- \|Hamnix is a native operating system' \
+    "wide window: plain prose spans edge-to-edge at the body margin (x=8 at 900px, Chrome parity)" "$DUMPA9"
+# each wrapped prose line begins at the body margin x=8 (no artificial centring
+# gutter): there is no line whose START x lands in the 750-899 band.
 if grep -Eq '^SEG 2 (7[5-9][0-9]|8[0-9][0-9]) ' "$DUMPA9"; then
-    echo "[hb-host] FAIL wide window text overflowed the readable measure"; fail=1
+    echo "[hb-host] FAIL wide window prose line started in the right gutter band"; fail=1
 else
-    echo "[hb-host] PASS wide window text is capped at the readable measure (no edge-to-edge)"
+    echo "[hb-host] PASS wide window prose lines all start at the body margin (edge-to-edge)"
 fi
 
 # ====================================================================
