@@ -1,0 +1,944 @@
+# user/hambrowse_sdl_host.ad — the INTERACTIVE hambrowse window for the Linux
+# HOST (x86_64-linux), driven by the SAME parse/layout/paint engine that runs
+# on Hamnix (lib/htmlengine + lib/htmlpage + lib/browserwin).
+#
+# WHY A CHILD PROCESS + C BRIDGE:
+#   The Adder x86_64-linux target links a STATIC, no-libc, no-PIE ELF with raw
+#   syscall wrappers, so it cannot dlopen/dynamically-link libSDL2. A real
+#   interactive window therefore lives behind a thin C bridge
+#   (scripts/hambrowse_sdl_bridge.c) exactly like the GPU path
+#   (scripts/vk_hostgpu_bridge.c). The bridge opens the real SDL2 window, pumps
+#   OS input, and speaks a tiny pipe protocol to THIS process — which owns ALL
+#   the browser logic (engine, layout, click-dispatch, address bar). The bridge
+#   is a dumb blitter; the browser is this shared Adder code. So the host window
+#   and the on-device window are produced by identical engine code.
+#
+# PIPE PROTOCOL (this process is the child; stdin = fd 0, stdout = fd 1):
+#   child -> bridge (stdout): one frame per event, as
+#       "FRAME <w> <h>\n"  followed by w*h*3 raw RGB bytes
+#   bridge -> child (stdin): one command per line
+#       "d <code>\n"          key press (ASCII byte, or ESC-sequence bytes)
+#       "m <x> <y> <btn> <dz>\n"  pointer: btn bit0 = left, dz = wheel delta
+#       "r <w> <h>\n"         window resized to w x h
+#       "q\n"                 quit
+#
+# SCOPE (phase 1): LOCAL pages. Clicking a link to a local file navigates;
+# typing a local path / file:// URL + Enter loads it; the wheel + keys scroll;
+# the address bar edits with a caret. A typed http(s):// URL shows a
+# "networking: phase 2" status instead of fetching (no sockets on the host
+# frontend — live fetch is future work). NO Plan 9 / http9 dependency here.
+#
+# USAGE (built to build/host/hambrowse_sdl):
+#   hambrowse_sdl [PAGE.html]     # spoken to over the pipe by the bridge
+# Run interactively via scripts/run_hambrowse_sdl.sh [PAGE.html].
+
+extern def sys_open(path: Ptr[char], flags: int32, mode: int32) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+from lib.htmlengine import he_layout, he_n_images, he_img_name_ptr, \
+    he_img_name_len, \
+    TITLE_H, ADDR_Y, ADDR_H, GO_W, CONTENT_Y, STATUS_H, NAV_BTN_W, NAV_BAR_W
+from lib.htmlpage import htmlpage_render, htmlpage_doc_width, \
+    htmlpage_doc_height, htmlpage_hit_link, htmlpage_install_reflow
+from lib.htmlpaint import htmlpaint_load_ttf
+from lib.font_ttf import FACE_TT_SANS, FACE_TT_SANS_BOLD, FACE_TT_SERIF, \
+    FACE_TT_MONO
+from lib.png import png_decode, png_width, png_height, png_rgba_ptr
+from lib.jpeg import jpeg_decode, jpeg_width, jpeg_height, jpeg_rgba_ptr
+from lib.gif import gif_decode, gif_width, gif_height, gif_rgba_ptr
+from lib.svg import svg_decode, svg_width, svg_height, svg_rgba_ptr, svg_sniff
+from lib.htmlimg import htmlimg_reset, htmlimg_add
+from lib.browserwin import browserwin_paint, browserwin_addr_caret_at, \
+    browserwin_url_box_w
+from lib.browserhistory import browserhist_reset, browserhist_push, \
+    browserhist_back, browserhist_fwd, browserhist_can_back, browserhist_can_fwd
+
+
+# ====================================================================
+# Buffers (top-level BSS — never stack; the engine wants big arrays).
+# ====================================================================
+FILE_CAP: uint64 = 262144
+html_buf: Array[262144, uint8]
+html_len: uint64 = 0
+
+FONT_CAP: uint64 = 262144
+ttsans_buf:  Array[262144, uint8]
+ttsansb_buf: Array[262144, uint8]
+ttserif_buf: Array[262144, uint8]
+ttmono_buf:  Array[262144, uint8]
+png_file_buf: Array[262144, uint8]
+img_path: Array[1024, uint8]
+
+# Composited window buffer (RGBA8888) + the RGB scratch for the frame body.
+WIN_MAX_W: uint64 = 1200
+WIN_MAX_H: uint64 = 900
+win_rgba: Array[4320000, uint8]     # 1200*900*4
+frame_rgb: Array[3240000, uint8]    # 1200*900*3
+
+cur_url:  Array[1024, uint8]
+status_buf: Array[160, uint8]
+status_len: uint64 = 0
+
+# Address bar edit state (mirrors user/hambrowse.ad, local-only subset).
+addr_buf:   Array[1024, uint8]
+addr_len:   uint64 = 0
+addr_focus: int32 = 0
+addr_cur:   uint64 = 0
+addr_anc:   uint64 = 0
+addr_sel:   int32 = 0
+addr_esc:   int32 = 0
+addr_par:   int32 = 0
+
+# Page scroll state.
+scroll_px: int32 = 0
+doc_w_px:  int32 = 0
+doc_h_px:  int32 = 0
+SCROLL_LINE: int32 = 40
+
+# Top-level scratch for navigation resolution.
+nav_buf: Array[1024, uint8]
+
+# Non-address scroll ESC state machine (arrow keys when the bar is unfocused).
+esc_st: int32 = 0
+
+
+# ====================================================================
+# Tiny helpers.
+# ====================================================================
+def _slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _starts(s: Ptr[uint8], pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if s[i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _dec(v: int32, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        return 1
+    x: uint32 = cast[uint32](v)
+    digs: Array[16, uint8]
+    n: uint64 = 0
+    while x > 0:
+        digs[n] = cast[uint8](x % 10) + 48
+        x = x / 10
+        n = n + 1
+    w: uint64 = n
+    j: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[j] = digs[n]
+        j = j + 1
+    return w
+
+
+def _slurp(path: Ptr[char], dst: Ptr[uint8], cap: uint64) -> int64:
+    fd: int32 = sys_open(path, 0, 0)                   # O_RDONLY
+    if fd < 0:
+        return -1
+    got: uint64 = 0
+    while got < cap - 1:
+        n: int64 = sys_read(fd, &dst[got], cap - 1 - got)
+        if n <= 0:
+            break
+        got = got + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](got)
+
+
+def _set_status(s: Ptr[uint8]):
+    i: uint64 = 0
+    while s[i] != 0 and i < 159:
+        status_buf[i] = s[i]
+        i = i + 1
+    status_buf[i] = 0
+    status_len = i
+
+
+# ====================================================================
+# Image decode (local files, resolved against the current page's directory).
+# ====================================================================
+def _resolve_img(src: Ptr[uint8], slen: uint64):
+    # Strip a file:// scheme; join a relative src onto cur_url's directory.
+    soff: uint64 = 0
+    if slen >= 7 and src[0] == 102 and src[1] == 105 and src[2] == 108 and \
+       src[3] == 101 and src[4] == 58 and src[5] == 47 and src[6] == 47:
+        soff = 7
+    p: uint64 = 0
+    if slen > soff and src[soff] == 47:                # absolute "/x"
+        j: uint64 = soff
+        while j < slen and p < 1023:
+            img_path[p] = src[j]
+            p = p + 1
+            j = j + 1
+    else:
+        # cur_url up to and including its last '/'.
+        clen: uint64 = _slen(&cur_url[0])
+        last: int64 = -1
+        i: uint64 = 0
+        # skip a scheme://authority when computing the directory.
+        while i < clen:
+            if cur_url[i] == 47:
+                last = cast[int64](i)
+            i = i + 1
+        k: uint64 = 0
+        while cast[int64](k) <= last and p < 1023:
+            img_path[p] = cur_url[k]
+            p = p + 1
+            k = k + 1
+        j2: uint64 = soff
+        while j2 < slen and p < 1023:
+            img_path[p] = src[j2]
+            p = p + 1
+            j2 = j2 + 1
+    img_path[p] = 0
+
+
+def _decode_images():
+    htmlimg_reset()
+    ni: uint64 = he_n_images()
+    idx: uint64 = 0
+    while idx < ni:
+        nm: Ptr[uint8] = he_img_name_ptr(idx)
+        nl: uint64 = he_img_name_len(idx)
+        # http(s):// images are phase-2 (no host fetch); skip them.
+        if nl >= 7 and nm[0] == 104 and nm[1] == 116 and nm[2] == 116 and \
+           nm[3] == 112:
+            idx = idx + 1
+            continue
+        _resolve_img(nm, nl)
+        got: int64 = _slurp(cast[Ptr[char]](&img_path[0]), &png_file_buf[0],
+                            FILE_CAP)
+        if got >= 2:
+            if png_file_buf[0] == 137 and png_file_buf[1] == 80:
+                if png_decode(&png_file_buf[0], cast[uint64](got)) == 0:
+                    htmlimg_add(nm, nl, png_width(), png_height(),
+                                png_rgba_ptr())
+            elif png_file_buf[0] == 255 and png_file_buf[1] == 216:
+                if jpeg_decode(&png_file_buf[0], cast[uint64](got)) == 0:
+                    htmlimg_add(nm, nl, jpeg_width(), jpeg_height(),
+                                jpeg_rgba_ptr())
+            elif png_file_buf[0] == 71 and png_file_buf[1] == 73 and \
+                 png_file_buf[2] == 70 and png_file_buf[3] == 56:
+                if gif_decode(&png_file_buf[0], cast[uint64](got)) == 0:
+                    htmlimg_add(nm, nl, gif_width(), gif_height(),
+                                gif_rgba_ptr())
+            elif svg_sniff(&png_file_buf[0], cast[uint64](got)) != 0:
+                if svg_decode(&png_file_buf[0], cast[uint64](got)) == 0:
+                    htmlimg_add(nm, nl, svg_width(), svg_height(),
+                                svg_rgba_ptr())
+        idx = idx + 1
+
+
+# ====================================================================
+# Scroll math.
+# ====================================================================
+def _content_h() -> int32:
+    ch: int32 = bh - CONTENT_Y - STATUS_H
+    if ch < 0:
+        return 0
+    return ch
+
+
+def _max_scroll() -> int32:
+    m: int32 = doc_h_px - _content_h()
+    if m < 0:
+        return 0
+    return m
+
+
+def _clamp_scroll():
+    if scroll_px < 0:
+        scroll_px = 0
+    ms: int32 = _max_scroll()
+    if scroll_px > ms:
+        scroll_px = ms
+
+
+def _render_doc():
+    doc_h_px = htmlpage_render()
+    doc_w_px = htmlpage_doc_width()
+    _clamp_scroll()
+
+
+# Full re-layout after src_ptr/src_len point at new HTML (two passes around
+# image decode, mirroring the device browser), then rasterise the doc canvas.
+def _reload_layout():
+    he_layout()
+    _decode_images()
+    he_layout()
+    scroll_px = 0
+    _render_doc()
+
+
+# ====================================================================
+# Address bar <-> current URL sync.
+# ====================================================================
+def _sync_addr_from_url():
+    i: uint64 = 0
+    while cur_url[i] != 0 and i < 1023:
+        addr_buf[i] = cur_url[i]
+        i = i + 1
+    addr_buf[i] = 0
+    addr_len = i
+    addr_cur = i
+    addr_anc = i
+    addr_sel = 0
+
+
+def _set_cur_url(u: Ptr[uint8]):
+    i: uint64 = 0
+    while u[i] != 0 and i < 1023:
+        cur_url[i] = u[i]
+        i = i + 1
+    cur_url[i] = 0
+    _sync_addr_from_url()
+
+
+# ====================================================================
+# LOAD a page into src_ptr/src_len. Local file (or file://) only; an http(s)
+# URL is acknowledged with a phase-2 status line and NOT fetched.
+# ====================================================================
+def _load(url: Ptr[uint8]) -> int32:
+    if _starts(url, cast[Ptr[uint8]]("http://")) != 0 or \
+       _starts(url, cast[Ptr[uint8]]("https://")) != 0:
+        _set_status(cast[Ptr[uint8]]("networking: phase 2 (live URLs not fetched on host)"))
+        # Keep the previous page content on screen.
+        return 0
+    path: Ptr[uint8] = url
+    if _starts(url, cast[Ptr[uint8]]("file://")) != 0:
+        path = cast[Ptr[uint8]](cast[uint64](url) + 7)
+    n: int64 = _slurp(cast[Ptr[char]](path), &html_buf[0], FILE_CAP)
+    if n < 0:
+        html_len = 0
+        _set_status(cast[Ptr[uint8]]("open failed"))
+        return -1
+    html_len = cast[uint64](n)
+    src_ptr = &html_buf[0]
+    src_len = html_len
+    sb: Array[48, uint8]
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("loaded ")
+    while pre[p] != 0:
+        sb[p] = pre[p]
+        p = p + 1
+    p = p + _dec(cast[int32](html_len), &sb[p])
+    tail: Ptr[uint8] = cast[Ptr[uint8]](" bytes")
+    a: uint64 = 0
+    while tail[a] != 0:
+        sb[p] = tail[a]
+        p = p + 1
+        a = a + 1
+    sb[p] = 0
+    _set_status(&sb[0])
+    return 1
+
+
+# ====================================================================
+# LINK NAVIGATION (document-relative resolution against cur_url).
+# ====================================================================
+def _authority_len() -> uint64:
+    n: uint64 = _slen(&cur_url[0])
+    i: uint64 = 0
+    while i + 2 < n:
+        if cur_url[i] == 58 and cur_url[i + 1] == 47 and cur_url[i + 2] == 47:
+            j: uint64 = i + 3
+            while j < n and cur_url[j] != 47:
+                j = j + 1
+            return j
+        i = i + 1
+    return 0
+
+
+def _dir_len() -> uint64:
+    n: uint64 = _slen(&cur_url[0])
+    last: int64 = -1
+    al: uint64 = _authority_len()
+    i: uint64 = al
+    while i < n:
+        if cur_url[i] == 47:
+            last = cast[int64](i)
+        i = i + 1
+    if last < 0:
+        return n
+    return cast[uint64](last) + 1
+
+
+def _href_starts(ho: uint64, hl: uint64, pfx: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while pfx[i] != 0:
+        if i >= hl:
+            return 0
+        if link_href_buf[ho + i] != pfx[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Resolve link id `lid`'s href against cur_url into nav_buf. Returns 1 if usable.
+def _resolve(lid: int32) -> int32:
+    if lid < 0 or cast[uint64](lid) >= n_links:
+        return 0
+    ho: uint64 = cast[uint64](link_off[lid])
+    hl: uint64 = cast[uint64](link_len[lid])
+    if hl > 0 and link_href_buf[ho] == 35:             # '#' in-page anchor
+        return 0
+    if hl >= 7:
+        if _href_starts(ho, hl, cast[Ptr[uint8]]("http://")) != 0 or \
+           _href_starts(ho, hl, cast[Ptr[uint8]]("https://")) != 0:
+            k: uint64 = 0
+            while k < hl and k < 1023:
+                nav_buf[k] = link_href_buf[ho + k]
+                k = k + 1
+            nav_buf[k] = 0
+            return 1
+    if hl > 0 and link_href_buf[ho] == 47:             # root-relative "/x"
+        alen: uint64 = _authority_len()
+        p: uint64 = 0
+        while p < alen and p < 1023:
+            nav_buf[p] = cur_url[p]
+            p = p + 1
+        k2: uint64 = 0
+        while k2 < hl and p < 1023:
+            nav_buf[p] = link_href_buf[ho + k2]
+            p = p + 1
+            k2 = k2 + 1
+        nav_buf[p] = 0
+        return 1
+    # document-relative.
+    dlen: uint64 = _dir_len()
+    p2: uint64 = 0
+    while p2 < dlen and p2 < 1023:
+        nav_buf[p2] = cur_url[p2]
+        p2 = p2 + 1
+    k3: uint64 = 0
+    while k3 < hl and p2 < 1023:
+        nav_buf[p2] = link_href_buf[ho + k3]
+        p2 = p2 + 1
+        k3 = k3 + 1
+    nav_buf[p2] = 0
+    return 1
+
+
+def _hist_record():
+    browserhist_push(&cur_url[0], _slen(&cur_url[0]))
+
+
+# Navigate a clicked link id. Returns 1 if a real navigation happened.
+def _navigate(lid: int32) -> int32:
+    if _resolve(lid) == 0:
+        return 0
+    # An http(s) link -> phase-2 status, no page change (keep current page).
+    if _starts(&nav_buf[0], cast[Ptr[uint8]]("http://")) != 0 or \
+       _starts(&nav_buf[0], cast[Ptr[uint8]]("https://")) != 0:
+        _set_status(cast[Ptr[uint8]]("networking: phase 2 (live URLs not fetched on host)"))
+        return 1
+    _set_cur_url(&nav_buf[0])
+    _load(&nav_buf[0])
+    _reload_layout()
+    _hist_record()
+    return 1
+
+
+# Build the effective URL for a typed address (default a bare token to a local
+# relative path — the host is local-only, so no http:// prefixing).
+def _apply_scheme(url: Ptr[uint8]):
+    p: uint64 = 0
+    i: uint64 = 0
+    while url[i] != 0 and p < 1023:
+        nav_buf[p] = url[i]
+        p = p + 1
+        i = i + 1
+    nav_buf[p] = 0
+
+
+def _navigate_url(url: Ptr[uint8]) -> int32:
+    if url[0] == 0:
+        return 0
+    if _starts(url, cast[Ptr[uint8]]("http://")) != 0 or \
+       _starts(url, cast[Ptr[uint8]]("https://")) != 0:
+        _set_status(cast[Ptr[uint8]]("networking: phase 2 (live URLs not fetched on host)"))
+        return 0
+    _apply_scheme(url)
+    _set_cur_url(&nav_buf[0])
+    if _load(&nav_buf[0]) < 0:
+        _reload_layout()
+        return 1
+    _reload_layout()
+    _hist_record()
+    return 1
+
+
+def _nav_back() -> int32:
+    u: Ptr[uint8] = browserhist_back()
+    if cast[uint64](u) == 0:
+        return 0
+    _set_cur_url(u)
+    _load(u)
+    _reload_layout()
+    return 1
+
+
+def _nav_fwd() -> int32:
+    u: Ptr[uint8] = browserhist_fwd()
+    if cast[uint64](u) == 0:
+        return 0
+    _set_cur_url(u)
+    _load(u)
+    _reload_layout()
+    return 1
+
+
+# ====================================================================
+# ADDRESS-BAR caret / selection primitives (port of user/hambrowse.ad #315,
+# minus the /dev/snarf clipboard which is device-only).
+# ====================================================================
+def _addr_sel_lo() -> uint64:
+    if addr_cur < addr_anc:
+        return addr_cur
+    return addr_anc
+
+
+def _addr_sel_hi() -> uint64:
+    if addr_cur > addr_anc:
+        return addr_cur
+    return addr_anc
+
+
+def _addr_sel_active() -> int32:
+    if addr_sel != 0 and addr_cur != addr_anc:
+        return 1
+    return 0
+
+
+def _addr_del_sel() -> int32:
+    if _addr_sel_active() == 0:
+        addr_sel = 0
+        return 0
+    a: uint64 = _addr_sel_lo()
+    b: uint64 = _addr_sel_hi()
+    span: uint64 = b - a
+    j: uint64 = a
+    while j + span < addr_len:
+        addr_buf[j] = addr_buf[j + span]
+        j = j + 1
+    addr_len = addr_len - span
+    addr_buf[addr_len] = 0
+    addr_cur = a
+    addr_anc = a
+    addr_sel = 0
+    return 1
+
+
+def _addr_insert(c: uint8):
+    if addr_len >= 1023:
+        return
+    j: uint64 = addr_len
+    while j > addr_cur:
+        addr_buf[j] = addr_buf[j - 1]
+        j = j - 1
+    addr_buf[addr_cur] = c
+    addr_len = addr_len + 1
+    addr_cur = addr_cur + 1
+    addr_buf[addr_len] = 0
+
+
+def _addr_nav(fin: int32) -> int32:
+    addr_sel = 0
+    if fin == 68:                                      # Left
+        if addr_cur > 0:
+            addr_cur = addr_cur - 1
+    elif fin == 67:                                    # Right
+        if addr_cur < addr_len:
+            addr_cur = addr_cur + 1
+    elif fin == 72 or fin == 65:                       # Home / Up
+        addr_cur = 0
+    elif fin == 70 or fin == 66:                       # End / Down
+        addr_cur = addr_len
+    elif fin == 51:                                    # Delete (3~)
+        if addr_cur < addr_len:
+            j: uint64 = addr_cur
+            while j + 1 < addr_len:
+                addr_buf[j] = addr_buf[j + 1]
+                j = j + 1
+            addr_len = addr_len - 1
+            addr_buf[addr_len] = 0
+        addr_anc = addr_cur
+        return 1
+    else:
+        return 0
+    addr_anc = addr_cur
+    return 1
+
+
+# Returns 1 = bar changed (redraw), 2 = navigation happened, 0 = nothing.
+def _addr_key(code: int32) -> int32:
+    if addr_esc == 1:
+        if code == 91:                                 # '['
+            addr_esc = 2
+            return 0
+        addr_esc = 0
+        addr_focus = 0                                 # bare ESC -> cancel edit
+        _sync_addr_from_url()
+        return 1
+    if addr_esc == 2:
+        if code >= 48 and code <= 57:
+            addr_par = code
+            return 0
+        addr_esc = 0
+        fin: int32 = code
+        if code == 126:                                # '~' final: map by param
+            p: int32 = addr_par
+            addr_par = 0
+            if p == 51:
+                fin = 51
+            elif p == 49:
+                fin = 72
+            elif p == 52:
+                fin = 70
+            else:
+                return 0
+        return _addr_nav(fin)
+    if code == 27:                                     # ESC -> begin sequence
+        addr_esc = 1
+        return 0
+    if code == 13 or code == 10:                       # Enter -> navigate
+        addr_buf[addr_len] = 0
+        addr_focus = 0
+        if _navigate_url(&addr_buf[0]) != 0:
+            return 2
+        _sync_addr_from_url()
+        return 1
+    if code == 1:                                      # Ctrl-A -> select all
+        addr_anc = 0
+        addr_cur = addr_len
+        if addr_len > 0:
+            addr_sel = 1
+        else:
+            addr_sel = 0
+        return 1
+    if code == 8 or code == 127:                       # Backspace / DEL
+        if _addr_sel_active() != 0:
+            _addr_del_sel()
+            return 1
+        if addr_cur > 0:
+            j: uint64 = addr_cur - 1
+            while j + 1 < addr_len:
+                addr_buf[j] = addr_buf[j + 1]
+                j = j + 1
+            addr_len = addr_len - 1
+            addr_cur = addr_cur - 1
+            addr_buf[addr_len] = 0
+            addr_anc = addr_cur
+        return 1
+    if code >= 32 and code < 127:                      # printable -> insert
+        _addr_del_sel()
+        _addr_insert(cast[uint8](code))
+        addr_anc = addr_cur
+        return 1
+    return 0
+
+
+# Non-focused key dispatch: page scroll (arrows via ESC[, j/k/space/b/g/G).
+def _handle_code(code: int32) -> int32:
+    if addr_focus != 0:
+        return _addr_key(code)
+    if esc_st == 1:
+        if code == 91:
+            esc_st = 2
+            return 0
+        esc_st = 0
+    elif esc_st == 2:
+        esc_st = 0
+        if code == 65:                                 # up
+            scroll_px = scroll_px - SCROLL_LINE
+            _clamp_scroll()
+            return 1
+        if code == 66:                                 # down
+            scroll_px = scroll_px + SCROLL_LINE
+            _clamp_scroll()
+            return 1
+        return 0
+    if code == 27:
+        esc_st = 1
+        return 0
+    if code == 106:                                    # 'j'
+        scroll_px = scroll_px + SCROLL_LINE
+        _clamp_scroll()
+        return 1
+    if code == 107:                                    # 'k'
+        scroll_px = scroll_px - SCROLL_LINE
+        _clamp_scroll()
+        return 1
+    if code == 32 or code == 102:                      # space / 'f' page down
+        scroll_px = scroll_px + _content_h() - SCROLL_LINE
+        _clamp_scroll()
+        return 1
+    if code == 98:                                     # 'b' page up
+        scroll_px = scroll_px - _content_h() + SCROLL_LINE
+        _clamp_scroll()
+        return 1
+    if code == 103:                                    # 'g' top
+        scroll_px = 0
+        return 1
+    if code == 71:                                     # 'G' bottom
+        scroll_px = _max_scroll()
+        return 1
+    return 0
+
+
+# ====================================================================
+# POINTER: map a window click to a link / address-bar action.
+# ====================================================================
+def _hit_link(x: int32, y: int32) -> int32:
+    if y < CONTENT_Y or y >= bh - STATUS_H:
+        return -1
+    doc_y: int32 = scroll_px + (y - CONTENT_Y)
+    return htmlpage_hit_link(x, doc_y)
+
+
+# Handle a left-button-down at (cx,cy). Returns 0/1/2 (redraw/nav).
+def _click(cx: int32, cy: int32) -> int32:
+    if cy >= ADDR_Y and cy < ADDR_Y + ADDR_H:
+        if cx < NAV_BAR_W:                             # Back / Forward
+            did: int32 = 0
+            if cx < 4 + NAV_BTN_W:
+                did = _nav_back()
+            else:
+                did = _nav_fwd()
+            if did != 0:
+                return 2
+            return 0
+        if cx >= bw - GO_W:                            # "Go"
+            addr_buf[addr_len] = 0
+            if _navigate_url(&addr_buf[0]) != 0:
+                return 2
+            return 1
+        # URL box: focus + place caret at the clicked glyph.
+        addr_focus = 1
+        idx: uint64 = browserwin_addr_caret_at(bw, &addr_buf[0], addr_len,
+                                               addr_cur, cx)
+        addr_cur = idx
+        addr_anc = idx
+        addr_sel = 0
+        return 1
+    # Outside the address band: defocus, then hit-test a page link.
+    changed: int32 = 0
+    if addr_focus != 0:
+        addr_focus = 0
+        changed = 1
+    lid: int32 = _hit_link(cx, cy)
+    if lid >= 0:
+        if _navigate(lid) != 0:
+            return 2
+    return changed
+
+
+# ====================================================================
+# FRAME emit: composite the window and write it to stdout for the bridge.
+# ====================================================================
+def _emit_frame():
+    w: int32 = bw
+    h: int32 = bh
+    if cast[uint64](w) > WIN_MAX_W:
+        w = cast[int32](WIN_MAX_W)
+    if cast[uint64](h) > WIN_MAX_H:
+        h = cast[int32](WIN_MAX_H)
+    browserwin_paint(&win_rgba[0], w, h, w, h, scroll_px, doc_h_px,
+                     &addr_buf[0], addr_len, addr_focus,
+                     &status_buf[0], status_len,
+                     browserhist_can_back(), browserhist_can_fwd(),
+                     addr_cur, _addr_sel_active(), _addr_sel_lo(),
+                     _addr_sel_hi(),
+                     cast[Ptr[uint8]](""), 0, 0, 0)
+    # Header line "FRAME w h\n".
+    hdr: Array[48, uint8]
+    p: uint64 = 0
+    pre: Ptr[uint8] = cast[Ptr[uint8]]("FRAME ")
+    while pre[p] != 0:
+        hdr[p] = pre[p]
+        p = p + 1
+    p = p + _dec(w, &hdr[p])
+    hdr[p] = 32
+    p = p + 1
+    p = p + _dec(h, &hdr[p])
+    hdr[p] = 10
+    p = p + 1
+    sys_write(1, &hdr[0], p)
+    # RGBA -> RGB body.
+    npx: uint64 = cast[uint64](w) * cast[uint64](h)
+    i: uint64 = 0
+    while i < npx:
+        frame_rgb[i * 3]     = win_rgba[i * 4]
+        frame_rgb[i * 3 + 1] = win_rgba[i * 4 + 1]
+        frame_rgb[i * 3 + 2] = win_rgba[i * 4 + 2]
+        i = i + 1
+    sys_write(1, &frame_rgb[0], npx * 3)
+
+
+# ====================================================================
+# COMMAND dispatch: one bridge line -> engine action. Always emits a frame.
+# Returns 1 to keep looping, 0 to quit.
+# ====================================================================
+def _parse_ints(s: Ptr[uint8], n: uint64, start: uint64, out: Ptr[int64],
+                maxf: int32) -> int32:
+    p: uint64 = start
+    cnt: int32 = 0
+    while cnt < maxf:
+        while p < n and s[p] == 32:
+            p = p + 1
+        if p >= n:
+            break
+        neg: int32 = 0
+        if s[p] == 45:
+            neg = 1
+            p = p + 1
+        v: int64 = 0
+        d: int32 = 0
+        while p < n and s[p] >= 48 and s[p] <= 57:
+            v = v * 10 + cast[int64](s[p]) - 48
+            p = p + 1
+            d = 1
+        if d == 0:
+            break
+        if neg != 0:
+            v = 0 - v
+        out[cnt] = v
+        cnt = cnt + 1
+    return cnt
+
+
+last_mx: int32 = 0
+last_my: int32 = 0
+
+
+def _dispatch(s: Ptr[uint8], n: uint64) -> int32:
+    if n == 0:
+        return 1
+    t: uint8 = s[0]
+    if t == 113:                                       # 'q' quit
+        return 0
+    if t == 100:                                       # 'd <code>' key
+        f: Array[1, int64]
+        if _parse_ints(s, n, 1, &f[0], 1) == 1:
+            _handle_code(cast[int32](f[0]))
+        _emit_frame()
+        return 1
+    if t == 109:                                       # 'm x y btn dz' pointer
+        f2: Array[4, int64]
+        nf: int32 = _parse_ints(s, n, 1, &f2[0], 4)
+        if nf >= 2:
+            last_mx = cast[int32](f2[0])
+            last_my = cast[int32](f2[1])
+        if nf >= 4 and f2[3] != 0:                     # wheel
+            scroll_px = scroll_px - cast[int32](f2[3]) * SCROLL_LINE
+            _clamp_scroll()
+        elif nf >= 3 and (f2[2] & 1) != 0:             # left button down
+            _click(cast[int32](f2[0]), cast[int32](f2[1]))
+        _emit_frame()
+        return 1
+    if t == 114:                                       # 'r w h' resize
+        f3: Array[2, int64]
+        if _parse_ints(s, n, 1, &f3[0], 2) == 2:
+            if f3[0] >= 200 and f3[1] >= 160:
+                nw: int32 = cast[int32](f3[0])
+                nh: int32 = cast[int32](f3[1])
+                if cast[uint64](nw) > WIN_MAX_W:
+                    nw = cast[int32](WIN_MAX_W)
+                if cast[uint64](nh) > WIN_MAX_H:
+                    nh = cast[int32](WIN_MAX_H)
+                bw = nw
+                bh = nh
+                he_layout()
+                _render_doc()
+        _emit_frame()
+        return 1
+    # Unknown line: just repaint.
+    _emit_frame()
+    return 1
+
+
+# ====================================================================
+cmd_buf: Array[512, uint8]
+cmd_carry: uint64 = 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # Fonts (the pixel renderer needs the TrueType faces).
+    ts: int64 = _slurp(cast[Ptr[char]]("fonts/dejavu-sans.ttf"),
+                       &ttsans_buf[0], FONT_CAP)
+    tb: int64 = _slurp(cast[Ptr[char]]("fonts/dejavu-sans-bold.ttf"),
+                       &ttsansb_buf[0], FONT_CAP)
+    tr: int64 = _slurp(cast[Ptr[char]]("fonts/dejavu-serif.ttf"),
+                       &ttserif_buf[0], FONT_CAP)
+    tm: int64 = _slurp(cast[Ptr[char]]("fonts/dejavu-mono.ttf"),
+                       &ttmono_buf[0], FONT_CAP)
+    if ts <= 0 or tb <= 0 or tr <= 0 or tm <= 0:
+        sys_write(2, cast[Ptr[uint8]]("hambrowse_sdl: cannot read fonts/*.ttf\n"), 39)
+        return 1
+    htmlpaint_load_ttf(FACE_TT_SANS, &ttsans_buf[0], cast[uint64](ts))
+    htmlpaint_load_ttf(FACE_TT_SANS_BOLD, &ttsansb_buf[0], cast[uint64](tb))
+    htmlpaint_load_ttf(FACE_TT_SERIF, &ttserif_buf[0], cast[uint64](tr))
+    htmlpaint_load_ttf(FACE_TT_MONO, &ttmono_buf[0], cast[uint64](tm))
+
+    # Default window geometry.
+    bw = 900
+    bh = 640
+
+    # TRUE reflow: wrap prose to the window width in real TrueType advances.
+    htmlpage_install_reflow()
+
+    # Initial page: argv[1] local path, or the built-in home fixture.
+    browserhist_reset()
+    if argc >= 2 and argv != cast[Ptr[uint64]](0):
+        target: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        _set_cur_url(target)
+        _load(target)
+    else:
+        _set_cur_url(cast[Ptr[uint8]]("tests/fixtures/hambrowse_sdl_home.html"))
+        _load(&cur_url[0])
+    _reload_layout()
+    _hist_record()
+
+    # First frame (the bridge reads this before pumping input).
+    _emit_frame()
+
+    # Event loop: read newline-delimited commands from the bridge on stdin.
+    while True:
+        room: uint64 = 512 - cmd_carry
+        if room == 0:
+            cmd_carry = 0
+            room = 512
+        n: int64 = sys_read(0, &cmd_buf[cmd_carry], room)
+        if n <= 0:
+            break                                      # bridge closed the pipe
+        total: uint64 = cmd_carry + cast[uint64](n)
+        ls: uint64 = 0
+        i: uint64 = 0
+        quit: int32 = 0
+        while i < total:
+            if cmd_buf[i] == 10:
+                if _dispatch(&cmd_buf[ls], i - ls) == 0:
+                    quit = 1
+                ls = i + 1
+            i = i + 1
+        if quit != 0:
+            break
+        leftover: uint64 = total - ls
+        m: uint64 = 0
+        while m < leftover:
+            cmd_buf[m] = cmd_buf[ls + m]
+            m = m + 1
+        cmd_carry = leftover
+    return 0
