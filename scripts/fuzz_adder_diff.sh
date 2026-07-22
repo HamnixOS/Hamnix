@@ -162,24 +162,12 @@ python3 tests/fuzz/adder_fuzzer.py --ad-codegen \
 RC=$?
 [ "$RC" -eq 0 ] || fail "codegen.ad differential found a genuine miscompile (see report above)"
 
-# ---- ADDER_OPT=1 NATIVE-OPTIMIZER correctness lane ----------------------
-# The batch above runs codegen.ad on its pre-opt path (byte-exact vs the seed).
-# The three real miscompiles this fuzzer was hardened to catch (loop-condition
-# CSE fa494cdf, the DSE global-name-cap class, the blank-desktop function-
-# pointer class) live in the --opt optimizer (opt.ad), which is ONLY exercised
-# with ADDER_OPT=1. So we ALSO run a differential batch with the native
-# optimizer ON: its output must still match the by-construction oracle. The
-# FUZZ_FEATURES kernel-shape generators (fnptr/loopcond/callgraph/manyglobals)
-# are on by default so the kernel-like patterns are covered. A --opt-introduced
-# non-termination (e.g. a re-introduced loop-cond-CSE bug) surfaces here as a
-# run-timeout escalated to a differential miscompile.
-FUZZ_OPT_COUNT="${FUZZ_OPT_COUNT:-200}"
-if [ "$FUZZ_OPT_COUNT" -gt "$FUZZ_COUNT" ]; then FUZZ_OPT_COUNT="$FUZZ_COUNT"; fi
-echo "[fuzz_adder_diff] ADDER_OPT=1 differential: count=$FUZZ_OPT_COUNT seed=$FUZZ_SEED"
-ADDER_OPT=1 python3 tests/fuzz/adder_fuzzer.py --ad-codegen \
-    --count "$FUZZ_OPT_COUNT" --seed "$FUZZ_SEED" --max-fail 25
-RCOPT=$?
-[ "$RCOPT" -eq 0 ] \
-    || fail "codegen.ad --opt differential found a genuine miscompile (see report above)"
+# ---- ADDER_OPT=1 legacy optimizer lane: REMOVED ------------------------
+# opt1 (the AST optimizer opt.ad + its linear-scan allocator) has been RETIRED
+# — `--opt` now routes through the SSA pipeline (identical to ADDER_OPT2=1). The
+# old ADDER_OPT=1 native-optimizer differential lane exercised opt.ad, which no
+# longer exists, so it is gone. The SSA optimizer's correctness is covered by
+# running this same gate under ADDER_OPT2=1 (which drives ssa_emit_program), and
+# by the OPT2 corpus in adder_fuzzer.py.
 
 echo "[fuzz_adder_diff] PASS"
