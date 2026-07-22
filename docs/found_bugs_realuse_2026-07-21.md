@@ -32,14 +32,14 @@ these are pre-existing bugs, not opt-cutover regressions.
 - [x] **hamterm** (FIXED main: waitpid reap + Ctrl-D close): `exit` ends the shell prompt but does NOT close the window;
   Ctrl+D also doesn't. Window should close on shell exit ([hamterm] logs
   "shell exited; closing window" in one case but leaves it in the GUI case).
-- [ ] **Middle-mouse paste** (X11 primary selection): mouse MIDDLE is seen
+- [x] **Middle-mouse paste** (FIXED: paste hook was gated behind scrollback view): (X11 primary selection): mouse MIDDLE is seen
   (Input Event Inspector shows it) but paste doesn't happen. Ctrl+C/V works.
   → primary-selection buffer not wired to middle-click.
-- [ ] **Audio**: `hamnix-music-demo.mp3` = "unreadable audio" but test.mp3 +
+- [x] **Audio** (FIXED: file buffer 320KiB→4MiB; decoder was fine): `hamnix-music-demo.mp3` = "unreadable audio" but test.mp3 +
   test.wav work. Specific MP3 (bitrate/format variant) the decoder chokes on.
   HOST-checkable (run mp3decode on the file).
-- [ ] **No boot-up sound** played.
-- [ ] **Snake (hamgame)**: after a few rounds slows way down AND leaves green
+- [x] **No boot-up sound** (FIXED: jingle hook was in disabled legacy panel; now fires from live desktop) played.
+- [x] **Snake (hamgame)**: after a few rounds slows way down AND leaves green
   cells behind the snake (trail not cleared) — perf degradation + stale-cell paint.
 
 ## Dispatch waves
