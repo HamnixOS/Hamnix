@@ -682,6 +682,7 @@ flex_natural:  Array[8, int32]    # 1 => use flex_child_x/_w, not equal columns
 flex_child_x:  Array[64, int32]   # [frame*FLEX_MAX+col] x offset from flex_left
 flex_child_w:  Array[64, int32]   # [frame*FLEX_MAX+col] natural content width px
 flex_meas_w:   Array[8, int32]    # scratch: per-child measured natural widths
+flex_meas_save: Array[8, int32]   # save/restore around the wrap-relocate order scan
 # Scratch buffer: the CURRENT direct child's collapsed visible text, so its
 # natural width can be measured with the SAME per-glyph advances the renderer
 # paints with (via the proportional measure hook) instead of a monospace
@@ -703,6 +704,10 @@ flex_grow_s:   Array[8, int32]    # scratch: per-child flex-shrink * 1000 (defau
 # permutation, so ordinary flex rows stay byte-for-byte identical.
 flex_order:    Array[8, int32]    # scratch: per-child CSS order (0 default)
 flex_perm:     Array[8, int32]    # scratch: visual slot -> dom column (stable)
+# `width:100%` per direct child (cascade winner m_wpct == 100). Captured by the
+# same pre-scan as `order`; consumed ONLY by the deferred wrap-relocate to force a
+# full-width own line for a promo band (google footer's `.ssOUyb{width:100%}`).
+flex_wpct100:  Array[8, int32]    # scratch: 1 => child width:100%
 # Per-child horizontal margins (px, 0 default) captured by _flex_grow_scan from
 # each item's cascade winner (m_ml/m_mr). Flex items are NOT margin-collapsed and
 # their margins add to the main-size occupancy + shift the item's box, so a
@@ -718,6 +723,15 @@ flex_mr:       Array[8, int32]    # scratch: per-child margin-right px
 # NEW line below the tallest item of the previous one. This reuses the same
 # single-pass rewind trick as single-line flex, so line heights need no 2nd pass.
 flex_wrap_on:  Array[8, int32]    # 1 => this frame wraps onto multiple lines
+# DEFERRED WRAP RELOCATE: a wrap frame whose children carry a real CSS `order`
+# and/or a `width:100%` child cannot be streamed left-to-right in DOM order — a
+# later-DOM promo row (order:0; width:100%) must paint ABOVE earlier siblings and
+# take a full line. When armed (1), each item is emitted onto its OWN provisional
+# vertical band at its PRE-COMPUTED target x (flex_it_tx), and at container close
+# every item's segs/fills are shifted in Y to its real visual line (grouped by
+# flex_it_vline). Zero-cost off this path: stays 0 for ordinary wrap frames, which
+# keep the byte-identical single-pass online placement.
+flex_wrap_reloc: Array[8, int32]  # 1 => deferred order/width:100% relocate armed
 flex_avail:    Array[8, int32]    # content width the items wrap within (px)
 flex_rawgap:   Array[8, int32]    # inter-item gap px (author gap / FLEX_GAP)
 flex_rowgap:   Array[8, int32]    # inter-LINE gap in ROWS (row-gap px / LINE_H)
@@ -757,6 +771,11 @@ flex_it_bx0:   Array[64, int32]   # [frame*FLEX_MAX+col] n_bboxes at item open
 flex_it_bx1:   Array[64, int32]   # [frame*FLEX_MAX+col] n_bboxes at item close
 flex_it_ltop:  Array[64, int32]   # [frame*FLEX_MAX+col] line-top row the item sat at
 flex_it_bot:   Array[64, int32]   # [frame*FLEX_MAX+col] item's exclusive bottom row
+# Deferred wrap-relocate per-item plan (filled by _flex_wrap_plan at container
+# open; consumed at item open + container close). flex_it_tx = target x offset
+# from the container's left content edge; flex_it_vline = the item's VISUAL line.
+flex_it_tx:    Array[64, int32]   # [frame*FLEX_MAX+col] planned x offset (px)
+flex_it_vline: Array[64, int32]   # [frame*FLEX_MAX+col] planned visual line index
 # CSS GRID reuse of the flex frame: a `display:grid` container places its items
 # into fixed TRACK columns (widths resolved from grid-template-columns into the
 # shared flex_child_x/_w arrays; fr distributes free space) and auto-wraps to the
@@ -3173,6 +3192,7 @@ def _flex_grow_scan(after: uint64, nc: int32) -> int32:
         flex_ml[c] = 0
         flex_mr[c] = 0
         flex_order[c] = 0                                # CSS order default 0
+        flex_wpct100[c] = 0                              # width:100% (wrap-relocate)
         c = c + 1
     depth: int32 = 0
     ci: int32 = -1
@@ -3222,6 +3242,12 @@ def _flex_grow_scan(after: uint64, nc: int32) -> int32:
                             # the item off the default 0).
                             if m_order != -2000000000:
                                 flex_order[ci] = m_order
+                            # width:100% cascade winner — recorded for the wrap
+                            # relocate (a full-width promo row on its own line).
+                            # m_wpct is the "width is a percentage" flag; m_wd holds
+                            # the percent value (100 for width:100%).
+                            if m_wpct != 0 and m_wd >= 100:
+                                flex_wpct100[ci] = 1
                         # A flex item's main size is its BORDER-box: fold its
                         # horizontal padding + border into the measured content
                         # width (which counted glyphs only). Without this a padded
@@ -3417,6 +3443,104 @@ def _flex_layout_natural(frame: int32, nc: int32, avail: int32, just: int32, \
         flex_child_w[base + dom] = flex_meas_w[dom]
         x = x + flex_meas_w[dom] + step_extra
         slot = slot + 1
+
+
+# Deferred WRAP-RELOCATE plan (armed frames only). Assign each direct child a
+# VISUAL line (packing in CSS `order` sequence, a `width:100%` child taking a full
+# line of its own) and a per-line justify-content x offset (flex_it_tx). The item
+# HEIGHTS are not yet known, so the real per-line Y positions are resolved at
+# container close (_flex_wrap_relocate); this pass fixes only the x + line index.
+# `just` is the container's resolved justify-content (1..5). Widths are the natural
+# measured widths (flex_meas_w), a width:100% child taking the whole `avail`.
+def _flex_wrap_plan(frame: int32, nc: int32, avail: int32, gp: int32, just: int32):
+    base: int32 = frame * FLEX_MAX
+    _flex_build_perm(nc)                          # flex_perm[slot] = dom col (order)
+    # ---- assign each item a visual line, packing in visual (order) sequence ----
+    line: int32 = 0
+    curx: int32 = 0
+    line_has: int32 = 0
+    slot: int32 = 0
+    while slot < nc:
+        c: int32 = flex_perm[slot]
+        full: int32 = 0
+        if flex_wpct100[c] != 0:
+            full = 1
+        cw: int32 = flex_meas_w[c]
+        if full != 0:
+            cw = avail
+        if cw > avail:                            # an over-measured item (hidden
+            cw = avail                            # menu text) can't exceed a line
+        if cw < CELL_W:
+            cw = CELL_W
+        # A width:100% item takes its own line; a normal item that no longer fits
+        # the current line wraps. The first item on a line never forces a break.
+        if line_has > 0 and (full != 0 or curx + cw > avail):
+            line = line + 1
+            curx = 0
+            line_has = 0
+        flex_it_vline[base + c] = line
+        curx = curx + cw + gp
+        line_has = line_has + 1
+        if full != 0:                             # force the next item onto a new line
+            line = line + 1
+            curx = 0
+            line_has = 0
+        slot = slot + 1
+    # ---- per-line justify-content -> x offsets ----
+    l: int32 = 0
+    while l <= line:
+        sumw: int32 = 0
+        n: int32 = 0
+        s2: int32 = 0
+        while s2 < nc:
+            c2: int32 = flex_perm[s2]
+            if flex_it_vline[base + c2] == l:
+                w0: int32 = flex_meas_w[c2]
+                if flex_wpct100[c2] != 0:
+                    w0 = avail
+                if w0 > avail:
+                    w0 = avail
+                if w0 < CELL_W:
+                    w0 = CELL_W
+                sumw = sumw + w0
+                n = n + 1
+            s2 = s2 + 1
+        if n > 0:
+            free: int32 = avail - sumw - (n - 1) * gp
+            if free < 0:
+                free = 0
+            lead: int32 = 0
+            step: int32 = gp
+            # A LONE item on a line is left-aligned (flex-start): our natural-width
+            # measure over-sizes real containers (min-width / hidden popup content),
+            # so a group meant to share the line with a sibling gets stranded alone;
+            # centering it (space-*) then reads worse than the real page's left edge.
+            if n <= 1:
+                lead = 0
+            elif just == 2:                       # center
+                lead = free / 2
+            elif just == 3:                       # flex-end
+                lead = free
+            elif just == 4:                       # space-between
+                step = gp + free / (n - 1)
+            elif just == 5:                       # space-around / space-evenly
+                g2: int32 = free / (n + 1)
+                lead = g2
+                step = gp + g2
+            x2: int32 = lead
+            s3: int32 = 0
+            while s3 < nc:
+                c3: int32 = flex_perm[s3]
+                if flex_it_vline[base + c3] == l:
+                    w1: int32 = flex_meas_w[c3]
+                    if flex_wpct100[c3] != 0:
+                        w1 = avail
+                    if w1 < CELL_W:
+                        w1 = CELL_W
+                    flex_it_tx[base + c3] = x2
+                    x2 = x2 + w1 + step
+                s3 = s3 + 1
+        l = l + 1
 
 
 # Resolve a grid frame's TRACK x-positions + widths into the shared flex_child_x/
@@ -3677,6 +3801,7 @@ def _flex_container_open(content_after: uint64, eldepth: int32) -> int32:
     use_nat: int32 = 0
     use_wrap: int32 = 0
     use_grid: int32 = 0
+    wrap_reloc: int32 = 0
     nt: int32 = 0
     # GRID path: `display:grid` resolves grid-template-columns into fixed track
     # widths (fr distributing free space) up front; items auto-place into those
@@ -3703,18 +3828,46 @@ def _flex_container_open(content_after: uint64, eldepth: int32) -> int32:
             # onto new lines. Width-less items (nav pills) size to their measured
             # content; items with an explicit CSS width use it.
             #
-            # RESIDUAL — CSS `order` is NOT applied on this wrap path (it is honoured
-            # on the single-line natural/grow paths above via _flex_build_perm). The
-            # wrap path streams items in DOM order and computes each item's x/line
-            # INCREMENTALLY at its own open, so honouring `order` here — where a
-            # LATER-DOM item (e.g. Google's footer promo row, `order:0; width:100%`)
-            # must paint ABOVE earlier siblings — needs a deferred TWO-PASS relocate
-            # (stage every item, then shift its recorded segs/fills to its visual
-            # line at container close). That, plus honouring `width:100%` in the wrap
-            # path (currently m_wpct, unused here) and per-wrap-line justify-content,
-            # is what Google's footer two-tier bar requires; deferred as out of the
-            # bounded `order` + padding-measurement scope.
+            # DEFERRED RELOCATE: the online stream emits items in DOM order, but a
+            # wrap frame whose children carry a real CSS `order` and/or a
+            # `width:100%` child cannot be placed that way — a LATER-DOM promo row
+            # (order:0; width:100%) must paint ABOVE earlier siblings and take a
+            # full line (google's footer). Pre-scan the children for order +
+            # width:100% (WITHOUT disturbing the natural measured widths — save +
+            # restore flex_meas_w, since _flex_grow_scan folds padding/border in),
+            # and when any child reorders OR is width:100%, ARM the relocate: plan
+            # each item's visual line + per-line justify x now, emit each on its own
+            # provisional band, and shift them to their real lines at close. An
+            # ordinary wrap frame (all order 0, no width:100%) is NOT armed and keeps
+            # the byte-identical online placement.
             use_wrap = 1
+            sv: int32 = 0
+            while sv < nc and sv < FLEX_MAX:
+                flex_meas_save[sv] = flex_meas_w[sv]
+                sv = sv + 1
+            _flex_grow_scan(content_after, nc)
+            omin: int32 = flex_order[0]
+            omax: int32 = flex_order[0]
+            anyfull: int32 = 0
+            oc: int32 = 0
+            while oc < nc and oc < FLEX_MAX:
+                if flex_order[oc] < omin:
+                    omin = flex_order[oc]
+                if flex_order[oc] > omax:
+                    omax = flex_order[oc]
+                if flex_wpct100[oc] != 0:
+                    anyfull = 1
+                oc = oc + 1
+            sv = 0
+            while sv < nc and sv < FLEX_MAX:
+                flex_meas_w[sv] = flex_meas_save[sv]
+                sv = sv + 1
+            if omin != omax or anyfull != 0:
+                wrap_reloc = 1
+                ej: int32 = g_flex_just
+                if ej == 0:
+                    ej = 1
+                _flex_wrap_plan(flex_sp, nc, avail, gp, ej)
         elif g_flex_just != 0 or g_flex_gap >= 0:
             # EITHER an explicit justify-content, OR an explicit `gap`/`column-gap`
             # was set. A gap-carrying `display:flex` with NO justify-content is the
@@ -3749,6 +3902,7 @@ def _flex_container_open(content_after: uint64, eldepth: int32) -> int32:
     flex_eldepth[flex_sp] = eldepth
     flex_natural[flex_sp] = use_nat
     flex_wrap_on[flex_sp] = use_wrap
+    flex_wrap_reloc[flex_sp] = wrap_reloc
     flex_grid[flex_sp]    = use_grid
     flex_ntrack[flex_sp]  = nt
     flex_avail[flex_sp]   = avail
@@ -3873,7 +4027,8 @@ def _flex_item_close():
     # still-open trailing text segment FIRST — a segment reserves seg_line at open
     # but only bumps n_segs at _close_seg, so an uncommitted tail would fall past
     # the recorded [seg0,seg1) range and escape the cross-axis shift.
-    if (flex_align[top] >= 2 or flex_ac[top] != 0) and flex_next[top] < FLEX_MAX:
+    if (flex_align[top] >= 2 or flex_ac[top] != 0 or flex_wrap_reloc[top] != 0) and \
+       flex_next[top] < FLEX_MAX:
         _word_flush()
         _close_seg()
         fidx1: int32 = top * FLEX_MAX + flex_next[top]
@@ -3922,12 +4077,17 @@ def _flex_item_close():
 # (center / flex-end cross-axis alignment). Rows clamp into [0, MAX_ROWS) and grow
 # total_rows, mirroring _apply_positioned's relocation.
 def _flex_shift_item(fidx: int32, dy: int32):
-    if dy <= 0:
+    # dy > 0 = down (align-items center/end, align-content). dy < 0 = UP (the
+    # wrap-relocate lifts a later-DOM promo row above its earlier siblings). Rows
+    # clamp into [0, MAX_ROWS); only downward shifts can grow total_rows.
+    if dy == 0:
         return
     j: int32 = flex_it_seg0[fidx]
     s1: int32 = flex_it_seg1[fidx]
     while j < s1:
         nr: int32 = seg_line[j] + dy
+        if nr < 0:
+            nr = 0
         if cast[uint64](nr) >= MAX_ROWS:
             nr = cast[int32](MAX_ROWS) - 1
         seg_line[j] = nr
@@ -3937,14 +4097,26 @@ def _flex_shift_item(fidx: int32, dy: int32):
     bf: int32 = flex_it_bf0[fidx]
     bf1: int32 = flex_it_bf1[fidx]
     while bf < bf1:
-        bfill_top[bf] = bfill_top[bf] + dy
-        bfill_bot[bf] = bfill_bot[bf] + dy
+        nt0: int32 = bfill_top[bf] + dy
+        nb0: int32 = bfill_bot[bf] + dy
+        if nt0 < 0:
+            nt0 = 0
+        if nb0 < 0:
+            nb0 = 0
+        bfill_top[bf] = nt0
+        bfill_bot[bf] = nb0
         bf = bf + 1
     bx: int32 = flex_it_bx0[fidx]
     bx1: int32 = flex_it_bx1[fidx]
     while bx < bx1:
-        bbox_top[bx] = bbox_top[bx] + dy
-        bbox_bot[bx] = bbox_bot[bx] + dy
+        nt1: int32 = bbox_top[bx] + dy
+        nb1: int32 = bbox_bot[bx] + dy
+        if nt1 < 0:
+            nt1 = 0
+        if nb1 < 0:
+            nb1 = 0
+        bbox_top[bx] = nt1
+        bbox_bot[bx] = nb1
         bx = bx + 1
 
 
@@ -3987,6 +4159,10 @@ def _flex_stretch_item(fidx: int32, line_bot: int32):
 # tallest item sharing its line-top (so single-line AND wrapped lines both work);
 # center/flex-end offset the item down within that extent, stretch grows its box.
 def _flex_align_fixup(top: int32):
+    # The wrap-relocate owns the cross-axis of an armed frame (it groups items into
+    # visual lines and shifts them itself), so the align-items fixup stands down.
+    if flex_wrap_reloc[top] != 0:
+        return
     mode: int32 = flex_align[top]
     if mode < 2:
         return
@@ -4049,6 +4225,8 @@ def _flex_align_fixup(top: int32):
 # `stretch`, growing each item's box to the enlarged line height). A no-op unless
 # the container wraps onto >= 2 lines AND has spare cross-size (flex_cross set).
 def _flex_content_fixup(top: int32):
+    if flex_wrap_reloc[top] != 0:                     # relocate owns the cross axis
+        return
     mode: int32 = flex_ac[top]
     if mode == 0:
         return
@@ -4143,6 +4321,68 @@ def _flex_content_fixup(top: int32):
         flex_max_bot[top] = endrow
 
 
+# Deferred WRAP-RELOCATE (armed frames only), run at container close once every
+# item's provisional band + height is recorded. Each item was emitted on its OWN
+# vertical band (in DOM order) at its planned target x; now group the items by
+# their planned VISUAL line (flex_it_vline), size each line to its tallest item,
+# lay the lines contiguously from the container top, and SHIFT each item's segs/
+# fills up or down to its line's real top. This realises CSS `order` across wrap
+# lines + a `width:100%` full-line promo row (google's footer two-tier bar).
+def _flex_wrap_relocate(top: int32):
+    nc: int32 = flex_next[top]
+    if nc > flex_ncol[top]:
+        nc = flex_ncol[top]
+    if nc <= 0:
+        return
+    base: int32 = top * FLEX_MAX
+    ctop: int32 = flex_top_row[top]
+    rgap: int32 = flex_rowgap[top]
+    # visual-line count = max planned line index + 1
+    nlines: int32 = 0
+    c: int32 = 0
+    while c < nc:
+        v: int32 = flex_it_vline[base + c]
+        if v + 1 > nlines:
+            nlines = v + 1
+        c = c + 1
+    if nlines > FLEX_MAX:
+        nlines = FLEX_MAX
+    # per-line height = tallest item on that line (flex_ln_bot reused as the height
+    # accumulator; flex_ln_top as the resolved real top row).
+    l: int32 = 0
+    while l < nlines:
+        flex_ln_bot[l] = 0
+        l = l + 1
+    c = 0
+    while c < nc:
+        v2: int32 = flex_it_vline[base + c]
+        if v2 < nlines:
+            h: int32 = flex_it_bot[base + c] - flex_it_ltop[base + c]
+            if h > flex_ln_bot[v2]:
+                flex_ln_bot[v2] = h
+        c = c + 1
+    # lay lines contiguously from the container top
+    acc: int32 = ctop
+    l = 0
+    while l < nlines:
+        flex_ln_top[l] = acc
+        acc = acc + flex_ln_bot[l] + rgap
+        l = l + 1
+    # shift every item to its line's real top
+    c = 0
+    while c < nc:
+        v3: int32 = flex_it_vline[base + c]
+        if v3 < nlines:
+            dy: int32 = flex_ln_top[v3] - flex_it_ltop[base + c]
+            if dy != 0:
+                _flex_shift_item(base + c, dy)
+        c = c + 1
+    # the frame's true extent is the bottom of the last visual line (acc carries a
+    # trailing row-gap). This SUPERSEDES the deep provisional stacked bottom.
+    endr: int32 = acc - rgap
+    flex_max_bot[top] = endr
+
+
 # Called on a flex container's close (BEFORE its box closes): drop cur_row to the
 # tallest column so the container spans the full flex-row height, then pop the
 # frame.
@@ -4150,6 +4390,8 @@ def _flex_container_close():
     top: int32 = flex_sp - 1
     if top < 0:
         return
+    if flex_wrap_reloc[top] != 0:
+        _flex_wrap_relocate(top)
     _flex_align_fixup(top)
     _flex_content_fixup(top)
     if flex_max_bot[top] > cast[int32](cur_row):
