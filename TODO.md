@@ -16,6 +16,30 @@ Markers: `[ ]` open · `[~]` in flight.
 
 ---
 
+## 2026-07-21 — LLVM optional backend (USER-approved direction)
+
+Decision: the native SSA optimizer is correct but ~5.5× slower than gcc-O2; hand-matching
+LLVM is a multi-year grind. So adopt **LLVM as an OPTIONAL "release/fast" backend** (Rust's
+MIR→LLVM model), lowering our existing **SSA IR → LLVM IR**. Native SSA/hand-written-x86
+backend STAYS as the DEFAULT + self-hosting bootstrap. USER also **rejected forking Linux**
+into a Plan 9 shape — keep the native Adder kernel; get its speed by LLVM-compiling it and
+its drivers via the existing `.ko` shim.
+
+- [~] LLVM backend spike (agent 2026-07-21): `adder/compiler/ssa_llvm.ad` emits textual
+  `.ll` from the SSA IR → clang-19/llc. Gated `--backend=llvm`, native default unchanged.
+  Acceptance = correctness (0 wrong answers on bench+fuzzer) + the 4-way perf number
+  (native-SSA vs Adder-LLVM vs gcc-O0 vs gcc-O2). The LLVM-vs-gcc-O2 number decides it.
+- [ ] **Get the LLVM backend functional WITHIN the Linux namespace** (USER) — build/run the
+  LLVM toolchain on-device via the Debian namespace (apt clang/llvm) so on-device release
+  compilation works, not just host. Preserves self-hosting: native backend bootstraps; LLVM
+  is the opt-in fast path built from the distro's C++ toolchain.
+- [ ] Once the LLVM number lands: STOP grinding the native register allocator toward
+  gcc-parity (it only needs correct + decent for bootstrap); LLVM carries release speed.
+- [ ] Robustify the `.ko` driver L-shim (the answer to "mature drivers" that made forking
+  Linux tempting) + LLVM-compile the native kernel (the answer to "faster kernel").
+
+---
+
 ## ✅ 2026-07-17 session close — ~31 merges, wide 8-agent fan-out (see STATUS.md for the log)
 
 - **GPU track COMPLETE** — DE + all games present via virtio-gpu zero-copy DMA, **0.20 ms/frame (53.9×)**, SW fallback intact. Games are transitively accelerated (compositor owns scanout). NEXT: venus/virgl 3D for real fill/compute accel (#182, foundation agent in flight).
