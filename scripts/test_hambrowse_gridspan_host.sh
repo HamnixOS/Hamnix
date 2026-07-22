@@ -56,7 +56,11 @@ fill_uniq() { awk -v f="$1" -v c="$2" '$1=="FILL" && $6==c{print $f; exit}' "$D"
 # ---- (A) grid-column: span 2 hero over a repeat(3,1fr) dashboard --------------
 HLX=$(fill_uniq 4 "#ffeeaa"); HRX=$(fill_uniq 5 "#ffeeaa")   # hero box left/right
 # dashboard row1 (three cells across all three tracks) FILL extents, sorted L->R.
-readarray -t R1 < <(awk '$1=="FILL" && $2==10 && $6=="#e8eefc"{print $4" "$5}' "$D" | sort -n)
+# Row index 9 (was 10 before the border-model change: a bordered grid item no
+# longer reserves a whole top-rule grid row, so its fill starts one row higher —
+# the same Chrome-matching shift this change makes everywhere. The span/pitch
+# assertions below are all RELATIVE, so only this absolute snapshot moved.)
+readarray -t R1 < <(awk '$1=="FILL" && $2==9 && $6=="#e8eefc"{print $4" "$5}' "$D" | sort -n)
 c0lx=$(echo "${R1[0]}" | awk '{print $1}')            # track0 left
 c1rx=$(echo "${R1[1]}" | awk '{print $2}')            # track1 right
 c2w=$(( $(echo "${R1[2]}" | awk '{print $2}') - $(echo "${R1[2]}" | awk '{print $1}') ))  # a single track width

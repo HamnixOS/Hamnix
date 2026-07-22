@@ -1115,26 +1115,30 @@ assert_grepP() {
     fi
 }
 
-# The card body text sits at the card's content origin (row 3, x=16).
-assert_grepP '^SEG 3 16 #101010 b0 u0 s0 l-1 bg- \|Card body text line one here\.\|' \
-    "position: card body text at the card content origin (row 3, x=16)"
+# The card body text sits at the card's content origin (row 2, x=16). NOTE: rows
+# are ONE LOWER than the pre-border-model geometry — a bordered box no longer
+# reserves a whole top-rule grid row for its 1px top border (the border is stroked
+# AT the content-box top), so the card content + everything after it moves up one
+# row (the Chrome-matching card-top fix).
+assert_grepP '^SEG 2 16 #101010 b0 u0 s0 l-1 bg- \|Card body text line one here\.\|' \
+    "position: card body text at the card content origin (row 2, x=16)"
 # ABSOLUTE top-left: the .tl badge lands at the card's top-LEFT (x=16) and,
-# being out of flow, shares the card body's row (row 3) instead of pushing it
+# being out of flow, shares the card body's row (row 2) instead of pushing it
 # down. Same x as the body text proves left:0 maps to the containing-block left.
-assert_grepP '^SEG 3 16 #ffffff b0 u0 s0 l-1 bg#ff0000 \|TL\|' \
-    "position:absolute top:0 left:0 -> card top-left, out of flow (row 3, x=16)"
-# ABSOLUTE top-right: the .tr badge is pinned to the card's RIGHT edge (x=320,
-# = 336 right edge - 2-char badge width) on the SAME top row.
-assert_grepP '^SEG 3 320 #ffffff b0 u0 s0 l-1 bg#00aa00 \|TR\|' \
-    "position:absolute top:0 right:0 -> card top-right, right-anchored (row 3, x=320)"
-# Out of flow means the card stays COMPACT (bottom border at row 5), so the
-# trailing plain paragraph is at row 8 — NOT shoved far down by in-flow badges.
-assert_grepP '^SEG 8 8 #101010 b0 u0 s0 l-1 bg- \|Plain trailing paragraph\.\|' \
-    "position: absolute badges are out of flow (card compact, trailing para at row 8)"
+assert_grepP '^SEG 2 16 #ffffff b0 u0 s0 l-1 bg#ff0000 \|TL\|' \
+    "position:absolute top:0 left:0 -> card top-left, out of flow (row 2, x=16)"
+# ABSOLUTE top-right: the .tr badge is pinned to the card's RIGHT edge (x=328)
+# on the SAME top row.
+assert_grepP '^SEG 2 328 #ffffff b0 u0 s0 l-1 bg#00aa00 \|TR\|' \
+    "position:absolute top:0 right:0 -> card top-right, right-anchored (row 2, x=328)"
+# Out of flow means the card stays COMPACT, so the trailing plain paragraph is at
+# row 7 — NOT shoved far down by in-flow badges.
+assert_grepP '^SEG 7 8 #101010 b0 u0 s0 l-1 bg- \|Plain trailing paragraph\.\|' \
+    "position: absolute badges are out of flow (card compact, trailing para at row 7)"
 # RELATIVE offset: the nudged paragraph is shifted right by left:48px (x 8->56)
-# and down by top:16px (one row) from its normal-flow position (x 8->56, row 7).
-assert_grepP '^SEG 7 56 #0000ff b0 u0 s0 l-1 bg- \|Nudged para here\.\|' \
-    "position:relative left:48 top:16 -> shifted right (x=56) and down (row 7)"
+# and down by top:16px (one row) from its normal-flow position (x 8->56, row 6).
+assert_grepP '^SEG 6 56 #0000ff b0 u0 s0 l-1 bg- \|Nudged para here\.\|' \
+    "position:relative left:48 top:16 -> shifted right (x=56) and down (row 6)"
 
 if [ "$fail" -eq 0 ]; then
     echo "[hb-host] RESULT: PASS"
