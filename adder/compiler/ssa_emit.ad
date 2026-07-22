@@ -370,6 +370,21 @@ sra_start: Array[65536, uint32]       # interval start = def position
 sra_end: Array[65536, uint32]         # interval end   = last live position
 sra_defpos: Array[65536, uint32]      # linear position of the defining instruction
 
+# ---------------------------------------------------------------------------
+# x86 addressing-mode folding (emission-lowering; allocator UNTOUCHED).
+# For a memory op whose byte address is `base + index*scale` (the GLOBALADDR +
+# idx*elem + SVO_LOAD/STORE chain ssa_index_addr builds), fold the index
+# arithmetic into a single SIB memory operand `disp(%base,%index,scale)` instead
+# of materializing the address with imul/add.  se_fold_ok[v] marks a LOAD/STORE
+# that folds; se_fold_skip[w] marks the (single-use, same-block) address ADD, the
+# scaling MUL and its scale constant so their normal emission is elided.
+se_uc: Array[65536, uint32]           # per-value use count (fold-safety)
+se_fold_skip: Array[65536, uint32]    # 1 => value folded into a memop; emit nothing
+se_fold_ok: Array[65536, uint32]      # 1 => LOAD/STORE v uses a SIB memory operand
+se_fold_base: Array[65536, uint32]    # vid supplying the base register
+se_fold_index: Array[65536, uint32]   # vid supplying the index register
+se_fold_scale: Array[65536, uint32]   # SIB scale in {1,2,4,8}
+
 # reverse map: linear position -> vid defined there (0 = none).
 sra_posval: Array[8192, uint32]
 
@@ -898,6 +913,221 @@ def se_unary_direct(v: uint32, digit: uint32) -> uint32:
 
 
 # =======================================================================
+# x86 SIB addressing-mode folding — encoders + analysis (emission-lowering).
+# =======================================================================
+
+# Load SSA value `v` into physical scratch register `dst` (rax=0/rcx=1/rdx=2),
+# register-aware exactly like se_load_rax: a pool-resident value moves reg->reg,
+# a spilled value loads from its stack slot.  The pool ({rbx,r12..r15}) is
+# disjoint from rax/rcx/rdx, so successive se_load_into calls to distinct scratch
+# dsts never clobber an as-yet-unread source.
+def se_load_into(v: uint32, dst: uint32):
+    r: uint32 = sra_vreg[v]
+    if r != SRA_MEM:
+        if r != dst:
+            emit_mov_reg_reg(r, dst)
+    else:
+        emit_load_local_callee(dst, ssa_slot(v))
+
+
+# SIB scale field encoding: log2(scale) for scale in {1,2,4,8}.
+def se_scale_bits(scale: uint32) -> uint32:
+    if scale == 8:
+        return 3
+    if scale == 4:
+        return 2
+    if scale == 2:
+        return 1
+    return 0
+
+
+# Emit the modrm+sib(+disp) bytes for the memory operand `disp(%base,%index,scale)`
+# with modrm.reg = `reg` (low 3 bits; REX carries the 4th).  r/m = 100 selects a
+# SIB byte.  mod picks the disp width; base low-3 == 101 (rbp/r13) has no mod=00
+# form so a zero disp8 is forced there.
+def se_emit_sib_operand(reg: uint32, base: uint32, index: uint32, scale: uint32,
+                        disp: int32):
+    sib: uint32 = (se_scale_bits(scale) << 6) | ((index & 7) << 3) | (base & 7)
+    if disp == 0 and (base & 7) != 5:
+        emit_b(((reg & 7) << 3) | 4)              # mod=00, r/m=100
+        emit_b(sib)
+    elif disp >= 0 - 128 and disp <= 127:
+        emit_b(0x40 | ((reg & 7) << 3) | 4)       # mod=01, disp8
+        emit_b(sib)
+        emit_b(cast[uint32](disp) & 0xFF)
+    else:
+        emit_b(0x80 | ((reg & 7) << 3) | 4)       # mod=10, disp32
+        emit_b(sib)
+        emit_imm32(cast[uint64](cast[uint32](disp)))
+
+
+# REX byte for a SIB memory op: W set unless it is an unsigned 32-bit access
+# (movl / movl-store zero-extend the 64-bit dest, matching emit_load_mem_rax).
+# R extends modrm.reg, X the SIB index, B the SIB base.
+def se_sib_rex(regfield: uint32, base: uint32, index: uint32, w: uint32) -> uint32:
+    rex: uint32 = 0x40
+    if w != 0:
+        rex = rex | 0x08
+    if regfield >= 8:
+        rex = rex | 0x04
+    if index >= 8:
+        rex = rex | 0x02
+    if base >= 8:
+        rex = rex | 0x01
+    return rex
+
+
+# mov(zx/sx) disp(%base,%index,scale) -> %dst, sized by `size`, `signed` chooses
+# movsx over movzx for sub-word loads.  Mirrors emit_load_mem_rax / _signed but
+# with a SIB memory operand instead of the plain (%rax) form.
+def se_emit_indexed_load(dst: uint32, base: uint32, index: uint32, scale: uint32,
+                         disp: int32, size: uint32, signed: uint32):
+    w: uint32 = 1
+    if size == 4 and signed == 0:
+        w = 0                                     # movl zero-extends; no REX.W
+    rex: uint32 = se_sib_rex(dst, base, index, w)
+    if rex != 0x40:
+        emit_b(rex)
+    if size == 1:
+        emit_b(0x0F)
+        if signed != 0:
+            emit_b(0xBE)                          # movsbq
+        else:
+            emit_b(0xB6)                          # movzbq
+    elif size == 2:
+        emit_b(0x0F)
+        if signed != 0:
+            emit_b(0xBF)                          # movswq
+        else:
+            emit_b(0xB7)                          # movzwq
+    elif size == 4:
+        if signed != 0:
+            emit_b(0x63)                          # movslq
+        else:
+            emit_b(0x8B)                          # movl
+    else:
+        emit_b(0x8B)                              # movq
+    se_emit_sib_operand(dst, base, index, scale, disp)
+
+
+# mov %src -> disp(%base,%index,scale), sized store; mirrors emit_store_mem_rcx.
+def se_emit_indexed_store(src: uint32, base: uint32, index: uint32, scale: uint32,
+                          disp: int32, size: uint32):
+    if size == 2:
+        emit_b(0x66)                              # 16-bit operand-size prefix
+    w: uint32 = 0
+    if size != 1 and size != 2 and size != 4:
+        w = 1                                     # 8-byte store needs REX.W
+    rex: uint32 = se_sib_rex(src, base, index, w)
+    if rex != 0x40:
+        emit_b(rex)
+    if size == 1:
+        emit_b(0x88)                              # movb
+    else:
+        emit_b(0x89)                              # movw/movl/movq (width via 66/REX.W)
+    se_emit_sib_operand(src, base, index, scale, disp)
+
+
+# Count every SSA use of each value (all operand edges the allocator's liveness
+# walk visits), plus reset the fold tables.  A value used exactly once by an
+# address computation can be safely elided when that address folds into a memop.
+def se_uc_add(x: uint32):
+    if x != 0 and x < 65536:
+        se_uc[x] = se_uc[x] + 1
+
+
+def se_count_uses():
+    v: uint32 = 1
+    while v < sv_count:
+        se_uc[v] = 0
+        se_fold_skip[v] = 0
+        se_fold_ok[v] = 0
+        v = v + 1
+    w: uint32 = 1
+    while w < sv_count:
+        op: uint32 = sv_op[w]
+        if op == SVO_BINOP or op == SVO_ICMP or op == SVO_STORE:
+            se_uc_add(sv_a[w])
+            se_uc_add(sv_b[w])
+        elif op == SVO_NEG or op == SVO_NOT or op == SVO_BITNOT or op == SVO_LOAD or op == SVO_TRUNC or op == SVO_CONDBR:
+            se_uc_add(sv_a[w])
+        elif op == SVO_RET:
+            if sv_a[w] != 0:
+                se_uc_add(sv_a[w])
+        elif op == SVO_CALL:
+            node: uint32 = sv_arg_head[w]
+            while node != 0:
+                se_uc_add(arg_val[node])
+                node = arg_next[node]
+        elif op == SVO_PHI:
+            node2: uint32 = sv_arg_head[w]
+            while node2 != 0:
+                se_uc_add(arg_val[node2])
+                node2 = arg_next[node2]
+        w = w + 1
+
+
+# Decide whether LOAD/STORE `v` can fold its address into a SIB memory operand.
+# Pattern (ssa_index_addr): addr = ADD(base, sidx) where sidx is the index side,
+# optionally sidx = MUL(index, const) with const in {1,2,4,8}.  The ADD (and the
+# MUL + its scale const) must each be single-use and live in v's own block so the
+# base/index operands are still resident when the folded memop reads them.
+def se_try_fold(v: uint32):
+    addr: uint32 = sv_a[v]
+    if addr == 0:
+        return
+    if sv_op[addr] != SVO_BINOP or sv_aux[addr] != BINOP_ADD:
+        return
+    if se_uc[addr] != 1 or sv_block[addr] != sv_block[v]:
+        return
+    base: uint32 = sv_a[addr]
+    sidx: uint32 = sv_b[addr]
+    idxreg: uint32 = sidx
+    scale: uint32 = 1
+    mul: uint32 = 0
+    cnode: uint32 = 0
+    if sv_op[sidx] == SVO_BINOP and sv_aux[sidx] == BINOP_MUL and se_uc[sidx] == 1 and sv_block[sidx] == sv_block[v]:
+        cn: uint32 = 0
+        ot: uint32 = 0
+        if sv_op[sv_b[sidx]] == SVO_CONST:
+            cn = sv_b[sidx]
+            ot = sv_a[sidx]
+        elif sv_op[sv_a[sidx]] == SVO_CONST:
+            cn = sv_a[sidx]
+            ot = sv_b[sidx]
+        if cn != 0:
+            c: uint64 = sv_imm[cn]
+            if c == 1 or c == 2 or c == 4 or c == 8:
+                scale = cast[uint32](c)
+                idxreg = ot
+                mul = sidx
+                cnode = cn
+    if base == 0 or idxreg == 0:
+        return
+    se_fold_ok[v] = 1
+    se_fold_base[v] = base
+    se_fold_index[v] = idxreg
+    se_fold_scale[v] = scale
+    se_fold_skip[addr] = 1                         # the address ADD is now dead
+    if mul != 0:
+        se_fold_skip[mul] = 1                      # the scaling MUL is now dead
+        if se_uc[cnode] == 1:
+            se_fold_skip[cnode] = 1                # its scale constant, if private
+
+
+# Analyse the whole function's LOAD/STORE ops for address folds (call after the
+# allocator has assigned registers; it reads sra_vreg but never changes it).
+def se_analyze_folds():
+    se_count_uses()
+    v: uint32 = 1
+    while v < sv_count:
+        op: uint32 = sv_op[v]
+        if op == SVO_LOAD or op == SVO_STORE:
+            se_try_fold(v)
+        v = v + 1
+
+
+# =======================================================================
 # per-value emission (register-resident where allocated, else all-memory).
 # =======================================================================
 def ssa_emit_value(v: uint32):
@@ -989,6 +1219,14 @@ def ssa_emit_value(v: uint32):
 
     if op == SVO_LOAD:
         # sized load from the address value in sv_a; sv_aux = width, sv_c = signed.
+        if se_fold_ok[v] != 0:
+            # base+index*scale folds into one SIB memory operand: read base/index
+            # into scratch (rax/rcx) — the address ADD/MUL are elided entirely.
+            se_load_into(se_fold_base[v], 0)     # base  -> rax
+            se_load_into(se_fold_index[v], 1)    # index -> rcx
+            se_emit_indexed_load(0, 0, 1, se_fold_scale[v], 0, sv_aux[v], sv_c[v])
+            se_store_rax(v)
+            return
         se_load_rax(sv_a[v])                     # rax = address
         if sv_c[v] != 0:
             emit_load_mem_rax_signed(sv_aux[v])
@@ -999,6 +1237,12 @@ def ssa_emit_value(v: uint32):
 
     if op == SVO_STORE:
         # sized store of value (sv_b) to the address value (sv_a); sv_aux = width.
+        if se_fold_ok[v] != 0:
+            se_load_into(se_fold_base[v], 0)     # base  -> rax
+            se_load_into(se_fold_index[v], 1)    # index -> rcx
+            se_load_into(sv_b[v], 2)             # value -> rdx
+            se_emit_indexed_store(2, 0, 1, se_fold_scale[v], 0, sv_aux[v])
+            return
         se_load_rax(sv_a[v])                     # rax = address
         se_load_rcx(sv_b[v])                     # rcx = value
         emit_store_mem_rcx(sv_aux[v])
@@ -1154,6 +1398,10 @@ def ssa_emit_function(fn: uint32) -> uint32:
     # reproduces the trivial lowering exactly.
     sra_allocate()
 
+    # Emission-lowering: fold `base+index*scale` addresses into SIB memory
+    # operands (reads the allocation, never mutates it).
+    se_analyze_folds()
+
     ssa_nvals = sv_count
     ssa_last_fn_start = code_len
     se_fix_n = 0
@@ -1192,6 +1440,9 @@ def ssa_emit_function(fn: uint32) -> uint32:
                 ssa_emit_phi_read(vv)
             elif ssa_is_terminator(op) != 0:
                 ssa_emit_term(vv, bb)
+            elif se_fold_skip[vv] != 0:
+                # address ADD/MUL folded into a following SIB memop — emit nothing.
+                pass
             else:
                 ssa_emit_value(vv)
             vv = sv_next[vv]
