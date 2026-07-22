@@ -73,6 +73,7 @@ from compiler.parser import (
     ND_PTR_TYPE,
     ND_INDEX,
     ND_MEMBER,
+    ND_STRING_LIT,
     ND_VAR_DECL,
     ND_ASSIGN,
     ND_EXPR_STMT,
@@ -150,10 +151,15 @@ from compiler.codegen import (
     glob_is_bss,
     glob_signedness,
     glob_type_node,
+    glob_count,
+    intern_string,
+    glob_define,
 )
 
 from compiler.lexer import (
     strbuf,
+    strbuf_pos,
+    strbuf_append,
 )
 
 # =======================================================================
@@ -1107,6 +1113,53 @@ def ssa_local_index_addr(nid: uint32, idxnode: uint32) -> uint32:
     return addv
 
 
+# Byte address of element `idxnode` through a POINTER local/param `nid`
+# (`p[i]` == `*(p + i)`).  The pointer VALUE is read as a promotable scalar and
+# `idx * elem_size` (elem_size = ssa_ptr_esz[nid]) added — the same pure
+# base+idx*scale shape a global/local array index uses.  LLVM path only (the
+# sole callers gate on ssa_mem_model != 0).  Returns 0 on bail (bail flag set).
+def ssa_ptr_index_addr(nid: uint32, idxnode: uint32) -> uint32:
+    esz: uint32 = ssa_ptr_esz[nid]
+    if esz == 0:
+        ssa_set_bail(SBR_MEMORY)                  # non-pointer / aggregate pointee
+        return 0
+    idxv: uint32 = ssa_lower_expr(idxnode, ssa_cur_bb)
+    if idxv == 0:
+        return 0
+    # The pointer VALUE: a promotable pointer scalar is read as an SSA value; a
+    # slot-spilled pointer (non-promotable — indexing marked its slot read) is
+    # loaded from its 8-byte alloca.
+    base: uint32 = 0
+    if ssa_ismem[nid] != 0:
+        base = ssa_load_at(ssa_mem_addr[nid], 8, 0)
+    else:
+        base = ssa_read_var(nid, ssa_cur_bb)
+    if base == 0:
+        return 0
+    scaled: uint32 = idxv
+    if esz != 1:
+        sc: uint32 = ssa_const_in(ssa_cur_bb, cast[uint64](esz))
+        if sc == 0:
+            return 0
+        mul: uint32 = sv_new(SVO_BINOP)
+        if mul == 0:
+            return 0
+        sv_aux[mul] = BINOP_MUL
+        sv_a[mul] = idxv
+        sv_b[mul] = sc
+        bb_append(ssa_cur_bb, mul)
+        scaled = mul
+    addv: uint32 = sv_new(SVO_BINOP)
+    if addv == 0:
+        return 0
+    sv_aux[addv] = BINOP_ADD
+    sv_a[addv] = base
+    sv_b[addv] = scaled
+    sv_type[addv] = SVT_PTR
+    bb_append(ssa_cur_bb, addv)
+    return addv
+
+
 # Pointee load/store width of a `*expr` deref, or 0 if not derefable in-subset
 # (only a bare local/param pointer identifier with a machine-width scalar pointee
 # is accepted; every other operand bails).
@@ -1162,6 +1215,9 @@ def ssa_lower_addr_of(operand: uint32) -> uint32:
         bnid: uint32 = nm_intern(nd_name_off[base], nd_name_len[base])
         if bnid < NM_MAX and ssa_islocal[bnid] != 0 and ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
             return ssa_local_index_addr(bnid, nd_b[operand])
+        # &p[i] on a POINTER local/param: p + i*elem (no load).
+        if bnid < NM_MAX and ssa_islocal[bnid] != 0 and ssa_ptr_esz[bnid] != 0:
+            return ssa_ptr_index_addr(bnid, nd_b[operand])
         # &global[i] : element address of a 1-D scalar-element global array,
         # built as base(GLOBALADDR) + idx*elem_size (the same shape a global
         # array rvalue index uses).
@@ -1321,11 +1377,15 @@ def ssa_lower_call(node: uint32, result_used: uint32) -> uint32:
     if result_used != 0:
         if ssa_callee_rettype_ok(nd_name_off[callee], nd_name_len[callee]) == 0:
             # A float-returning in-unit callee is accepted on the LLVM path (the
-            # result lands in xmm0 and is typed float); otherwise bail.
+            # result lands in xmm0 and is typed float).
             cfw = ssa_callee_ret_fw(nd_name_off[callee], nd_name_len[callee])
-            if ssa_mem_model == 0 or cfw == 0:
-                ssa_set_bail(SBR_CALL)
+            if ssa_mem_model == 0:
+                ssa_set_bail(SBR_CALL)        # native path: unchanged (bails)
                 return 0
+            # LLVM path: an extern / narrow-int / unknown callee is modeled as an
+            # i64 result — its `declare` is i64 and a narrow assignment truncates
+            # (e.g. `fd: int32 = sys_open(...)`), so the upper bits are discarded.
+            # (cfw != 0 keeps the in-unit float typing below.)
     cv: uint32 = sv_new(SVO_CALL)
     if cv == 0:
         return 0
@@ -1353,6 +1413,53 @@ def ssa_lower_call(node: uint32, result_used: uint32) -> uint32:
     sv_aux[cv] = argc
     bb_append(ssa_cur_bb, cv)
     return cv
+
+
+# Register the interned string literal at strbuf[src_off..src_off+len) as a data
+# GLOBAL so the OPTIONAL LLVM backend (ssa_llvm.ad) can take its address via
+# SVO_GLOBALADDR — which reverse-maps a (byte-offset, is_bss) pair back to a
+# `[N x i8] @symbol` — and emit its raw bytes.  Returns the 1-based global index.
+# Deduped: identical literals share ONE gdata slot AND one global entry (so the
+# Pass-A discovery / Pass-B emit round-trip in llvm_emit_program is idempotent).
+#
+# ISOLATION: lives in ssa.ad (codegen.ad stays byte-unchanged) and is only ever
+# reached from ND_STRING_LIT lowering when ssa_mem_model != 0 (the LLVM path);
+# the native/seed codegen never calls it, so the default globals table is
+# untouched.  The synthetic `.LstrN` symbol name is not a legal Adder identifier,
+# so it can never collide with a real global lookup.
+def ssa_intern_string_global(src_off: uint32, src_len: uint32) -> uint32:
+    doff: uint32 = intern_string(src_off, src_len)     # dedup -> gdata offset
+    total: uint32 = src_len + 1                         # bytes incl. trailing NUL
+    # Reuse an existing string-global entry pointing at the same data slot.
+    i: uint32 = 0
+    while i < glob_count:
+        if glob_offset[i] == doff and glob_elem_size[i] == total and glob_scalar_size[i] == 0 and glob_is_bss[i] == 0 and glob_type_node[i] == 0:
+            return i + 1
+        i = i + 1
+    # Synthesize a unique `.Lstr<glob_count>` symbol into strbuf.
+    name_off: uint32 = strbuf_pos
+    strbuf_append(cast[uint8](46))                      # '.'
+    strbuf_append(cast[uint8](76))                      # 'L'
+    strbuf_append(cast[uint8](115))                     # 's'
+    strbuf_append(cast[uint8](116))                     # 't'
+    strbuf_append(cast[uint8](114))                     # 'r'
+    n: uint32 = glob_count
+    if n == 0:
+        strbuf_append(cast[uint8](48))                  # '0'
+    else:
+        digs: Array[16, uint8]
+        dn: uint32 = 0
+        while n > 0:
+            digs[dn] = cast[uint8](48 + (n % 10))
+            dn = dn + 1
+            n = n / 10
+        while dn > 0:
+            dn = dn - 1
+            strbuf_append(digs[dn])
+    name_len: uint32 = strbuf_pos - name_off
+    gi0: uint32 = glob_count
+    glob_define(name_off, name_len, doff, total, 0)
+    return gi0 + 1
 
 
 def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
@@ -1643,6 +1750,12 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
                 if laddr == 0:
                     return 0
                 return ssa_load_at(laddr, ssa_mem_esz[bnid], ssa_mem_esgn[bnid])
+            # `p[i]` on a POINTER local/param (LLVM path): *(p + i*elem).
+            if ssa_mem_model != 0 and ssa_ptr_esz[bnid] != 0:
+                paddr: uint32 = ssa_ptr_index_addr(bnid, nd_b[node])
+                if paddr == 0:
+                    return 0
+                return ssa_load_at(paddr, ssa_ptr_esz[bnid], ssa_ptr_esgn[bnid])
             ssa_set_bail(SBR_MEMORY)
             return 0
         gia: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
@@ -1653,6 +1766,20 @@ def ssa_lower_expr(node: uint32, bb: uint32) -> uint32:
         if addr == 0:
             return 0
         return ssa_load_at(addr, glob_elem_size[gia - 1], ssa_array_elem_sgn(gia))
+
+    if k == ND_STRING_LIT:
+        # String literal (LLVM path): intern its bytes as a `[N x i8]` data
+        # global and yield the symbol's address (exactly how codegen interns a
+        # `.asciz` into .rodata and hands out a RIP-relative pointer).  The
+        # native path keeps bailing (NONSUBSET_EXPR) so it stays byte-identical.
+        if ssa_mem_model != 0:
+            sgi: uint32 = ssa_intern_string_global(nd_name_off[node], nd_name_len[node])
+            if sgi == 0:
+                ssa_set_bail(SBR_MEMORY)
+                return 0
+            return ssa_globaladdr(sgi, ssa_cur_bb)
+        ssa_set_bail(SBR_NONSUBSET_EXPR)
+        return 0
 
     # float literal, member, slice, conditional, etc. -> bail.
     if k == ND_FLOAT_LIT:
@@ -1688,6 +1815,9 @@ def ssa_lower_index_store(bb: uint32, stmt: uint32, target: uint32) -> uint32:
     if bnid < NM_MAX and ssa_islocal[bnid] != 0:
         if ssa_ismem[bnid] != 0 and ssa_mem_isarr[bnid] != 0:
             return ssa_lower_local_index_store(bb, stmt, target, bnid)
+        # `p[i] = rhs` on a POINTER local/param (LLVM path).
+        if ssa_mem_model != 0 and ssa_ptr_esz[bnid] != 0:
+            return ssa_lower_ptr_index_store(bb, stmt, target, bnid)
         ssa_set_bail(SBR_MEMORY)                  # non-array local indexed
         return bb
     gi: uint32 = ssa_global_array_1d(nd_name_off[base], nd_name_len[base])
@@ -1750,6 +1880,38 @@ def ssa_lower_local_index_store(bb: uint32, stmt: uint32, target: uint32,
     if rhsv == 0:
         return ssa_cur_bb
     addr2: uint32 = ssa_local_index_addr(bnid, nd_b[target])
+    if addr2 == 0:
+        return ssa_cur_bb
+    ssa_store_at(addr2, rhsv, es)
+    return ssa_cur_bb
+
+
+# Lower `p[i] = rhs` / `p[i] op= rhs` for a POINTER local/param base; same
+# discipline as the local-array path but the base address is `p + i*elem` built
+# from the pointer VALUE (ssa_ptr_index_addr).  LLVM path only.
+def ssa_lower_ptr_index_store(bb: uint32, stmt: uint32, target: uint32,
+                              bnid: uint32) -> uint32:
+    es: uint32 = ssa_ptr_esz[bnid]
+    aug: uint32 = nd_aux[stmt]
+    if aug != 0:
+        addr: uint32 = ssa_ptr_index_addr(bnid, nd_b[target])
+        if addr == 0:
+            return ssa_cur_bb
+        cur: uint32 = ssa_load_at(addr, es, ssa_ptr_esgn[bnid])
+        if cur == 0:
+            return ssa_cur_bb
+        rhs: uint32 = ssa_lower_expr(nd_b[stmt], ssa_cur_bb)
+        if rhs == 0:
+            return ssa_cur_bb
+        comb: uint32 = ssa_build_aug_binop(aug, cur, rhs, target, nd_b[stmt], stmt, ssa_cur_bb)
+        if comb == 0:
+            return ssa_cur_bb
+        ssa_store_at(addr, comb, es)
+        return ssa_cur_bb
+    rhsv: uint32 = ssa_lower_expr(nd_b[stmt], bb)
+    if rhsv == 0:
+        return ssa_cur_bb
+    addr2: uint32 = ssa_ptr_index_addr(bnid, nd_b[target])
     if addr2 == 0:
         return ssa_cur_bb
     ssa_store_at(addr2, rhsv, es)
