@@ -74,3 +74,41 @@ CLOSED so far: flex-column blockification (SSIM 0.663→0.729); #1 text-too-wide
 2. MDN-class two-column sidebar/main (0.709 — nav renders as narrow 284px col, main pushed below; grid/flex two-pane collapse).
 3. Article-column max-width (Wikipedia hb content 995px vs Chrome 355px).
 4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
+
+## Chrome-parity progress (round 3, 2026-07-23)
+CLOSED: **nested `<table width="100%">` now STRETCHES to fill its parent cell** (the
+Hacker News orange nav-bar pattern `<td bgcolor=#ff6600><table width=100%>…`). Before,
+a nested width table shrank to its content and stranded the right-aligned `login`, so
+`Hacker News new | past | … | submit` wrapped to a 2nd line; now the nav renders on ONE
+line like Chrome. Fix: a nested table honours its width attribute, bounded to the parent
+cell's right edge (`_compute_cols` stretch no longer gated to `cell_active==0`;
+forms.ad `<table>` open reads the width attr for nested tables too). HN brmse 0.133→0.119
+(the harness's PRIMARY structural distance improves); SSIM 0.563→0.562 (neutral — the raw
+SSIM is confounded by HN's uncorrected vertical row-inflation, below). Non-table pages
+(wiki/mdn/blog) byte-identical; wiki/mdn/google spot-checks unchanged. New host gate
+`test_hambrowse_nesthdr_host.sh` (fixtures `hambrowse_nesthdr{,_auto}.html`): asserts the
+nested width=100% right-cell reaches the viewport edge (632/640) vs an un-sized control
+that stays content-width (188) — fails on base (188 both).
+
+ATTEMPTED-BUT-DEFERRED this round (kept OUT to avoid a headline-metric regression):
+**auto-column cap → container width** (so a long story title stays on one line instead
+of wrapping at the fixed 480px per-column cap). Correct in isolation (clean full-width
+table fixture brmse 0.227→0.184, titles single-line) BUT it interacts badly with HN's
+`<center><table width=85%>`: the nested story table's now-uncapped natural width exceeds
+the outer table's 85% target, so the OUTER table loses its explicit-width clamp and
+overflows FULL-WIDTH (dropping the `<center>` gutter Chrome shows), spiking HN brmse
+0.119→0.210. Prerequisite for that fix → **clamp an explicit-width table to its target
+(wrap wide content at the target, don't let a wide descendant overflow it)**.
+
+Re-ranked remaining gaps (round 4):
+1. **HN vertical row-inflation** (NEW top lever; hb 1988px vs Chrome 1430px = 1.39×).
+   Root-caused: table cells share the GLOBAL `cur_row`, so a block element inside one
+   cell inflates the whole row — the empty `<div class="votearrow">` in HN's votelinks
+   cell alone adds ~18px/story (isolated: story block 35px→53px with the div). Chrome
+   gives an empty styleless block 0 height. This vertical mismatch dominates the raw
+   SSIM (the metric's vertical-stretch normalization amplifies/inverts it), so it must
+   land before horizontal table fixes can move SSIM. Fix = independent cell row-flow OR
+   collapse empty in-cell blocks — a row-model change, sized as its own round.
+2. Explicit-width table target CLAMP (prereq for the auto-column-cap title fix above).
+3. MDN two-column sidebar/main (0.709).
+4. Article-column max-width (Wikipedia).
