@@ -80,8 +80,32 @@ echo "[kllvm]    bailed functions:"; grep '; BAILED' "$WORK/kernel_main.ll" | se
 # default native kernel build is byte-identical (no codegen.ad / kernel source
 # change). See docs/kernel_llvm_phase5b.md (Phase 5e).
 #
+# Phase-5m ROOT PIN (supersedes the do_page_fault default): a clean full-LLVM
+# lane (KLLVM_DEFAULT_FORCE_NATIVE="") walls at hamsh stage-01, NOT at pid=7 —
+# overturning the Phase-5k "clean boots to pid=7" claim. Layout-invariant QEMU
+# `xp` PHYSICAL reads at the stall show a large CONTIGUOUS zeroed region whose
+# start is EXACTLY __bss_start (fb_base/printk_line_seq/task_table/vma_tree_root
+# all physically 0) — i.e. a bulk memset over .bss, NOT the per-slot/variable-
+# stride store Phase 5k/5l chased. Single-variable force-native bisection pins
+# the writer: forcing ONLY `memblock_alloc` native (bis4) clears the stage-01
+# wall AND advances PAST rfork pid=7 to the kmod-load stage — the SAME far
+# downstream point as forcing the whole exec-alloc group; forcing `region_alloc`
+# alone (bis2) does nothing. Mechanism: the LLVM-compiled `memblock_alloc`
+# returns a kernel-image / __bss_start-colliding base, so region_alloc hands
+# `_load_elf64` a region ALIASING .bss and its eager memset/segment-copy zeroes
+# task_table etc. — which is ALSO why the child at pid=7 is never dispatched
+# (task_table[child].state clobbered → _another_task_ready()==0). The two walls
+# are the SAME bug. do_page_fault-LLVM is FINE (bis4 keeps it LLVM and boots
+# past), confirming Phase 5k's "do_page_fault native is a layout artifact" — so
+# the default is now memblock_alloc, not do_page_fault. The exact codegen defect
+# inside memblock_alloc (visible -O0 asm looks equivalent; suspect the loop phi-
+# web return threading or a hybrid-link multiple-definition global-resolution
+# interaction on @memblock_region_start) is the open ssa_llvm.ad fix (gate
+# ssa_mem_model). Opt-in-lane-only: no codegen.ad / kernel source change, native
+# kernel byte-identical. See docs/kernel_llvm_phase5b.md (Phase 5m).
+#
 # KLLVM_FORCE_NATIVE="fn1 fn2 ..." appends extra names (A/B bisection hook).
-KLLVM_DEFAULT_FORCE_NATIVE="${KLLVM_DEFAULT_FORCE_NATIVE-do_page_fault}"
+KLLVM_DEFAULT_FORCE_NATIVE="${KLLVM_DEFAULT_FORCE_NATIVE-memblock_alloc}"
 KLLVM_ALL_FORCE_NATIVE="$KLLVM_DEFAULT_FORCE_NATIVE ${KLLVM_FORCE_NATIVE:-}"
 if [ -n "$(echo "$KLLVM_ALL_FORCE_NATIVE" | tr -d ' ')" ]; then
     echo "[kllvm] 1b) FORCE-NATIVE: $KLLVM_ALL_FORCE_NATIVE"

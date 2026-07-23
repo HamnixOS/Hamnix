@@ -660,3 +660,96 @@ Net: default lane unchanged (`do_page_fault` native-hybrid → `rfork pid=7`).
 Native kernel byte-identical (only `scripts/scan_oob.py` + this doc changed; no
 compiler/kernel source touched). The separate `_another_task_ready` pid=7
 scheduler wall remains the actual boot blocker once the wild store is found.
+
+## Phase 5m — ROOT PINNED: `memblock_alloc` LLVM codegen returns a `.bss`-colliding base; the wild store is a BULK memset over `.bss` (not per-slot/stride); it is the SAME bug behind BOTH walls (evidence-backed, native-safe)
+
+Phase 5m reproduced the lane from a CLEAN, probe-free emit and **overturns both the
+Phase-5k framing ("clean boots to pid=7") and the 5k/5l "variable-index/stride"
+hypothesis**, then pins the miscompiled function by single-variable force-native
+bisection and confirms the brief's unification hypothesis. No `codegen.ad` /
+`ssa*.ad` / kernel `.ad` change (only `scripts/build_kernel_llvm.sh`'s
+force-native DEFAULT + this doc); native kernel byte-identical by construction.
+
+### 1. A CLEAN full-LLVM lane walls at stage-01, NOT pid=7 (overturns 5k)
+Built `build_kernel_llvm.sh` with `KLLVM_DEFAULT_FORCE_NATIVE=""` (do_page_fault
+LEFT as LLVM, ZERO probes) and booted under `-accel kvm -cpu host`. It
+DETERMINISTICALLY walls at hamsh **stage-01** — `[pf] user fault on unmapped
+va=0x0ed1da0 -> SIGSEGV`, `NO covering VMA`, `printk_line_seq` collapsed
+~1080→33 — reproduced identically across runs. Phase 5k's claim that a clean
+do_page_fault-LLVM kernel boots PAST stage-01 to pid=7 is **not reproducible on
+current main**; the wild store is LIVE in the clean lane and the `do_page_fault`
+native-hybrid default merely shifts BSS layout off the (then-visible) victims.
+
+### 2. The wild store is a BULK contiguous memset over `.bss` starting at `__bss_start` (refutes 5k/5l per-slot/stride framing)
+At the stall, QEMU-monitor `xp` PHYSICAL reads (CR3-independent, layout-invariant
+— NOT a `.bss`-shifting source probe) show a single LARGE **contiguous** zeroed
+region. Fine boundary scan: the stable-zero begins at phys **0x391d000**, which
+`nm` resolves to **`__bss_start` / `fb_base`** exactly. Every fb-console global
+(`fb_base`,`fb_pitch`,`fb_width`,`fb_height`,`fb_shadow_base`) reads 0;
+`printk_line_seq`, `vma_tree_root[*]`, `task_table[*]` (all above `__bss_start`)
+read 0. So the writer zeroes `[__bss_start, ...)` — a **bulk memset**, not the
+scattered array-of-struct/variable-stride store 5k/5l chased (scan_oob correctly
+found 0 of those). `-nic none` does not stop it (5k: CPU store, not DMA).
+
+### 3. Single-variable bisection PINS `memblock_alloc`
+Using the layout-invariant force-native mechanism (`kllvm_force_native.py`
+declare-ifies a function so the native-hybrid copy is linked):
+- **`memblock_alloc` native, everything else LLVM (do_page_fault INCLUDED as
+  LLVM)** → stage-01 wall GONE; boot advances PAST `rfork pid=7`, through
+  rc.boot, into the `kmod_linux` module-load stage (stops later at an UNRELATED
+  `#GP` on Linux static-call relocation `__SCT__might_resched`, rip
+  `0xffffffff8c61a956`). ~3900 serial lines vs ~1090 at the wall.
+- **`region_alloc` native, `memblock_alloc` LLVM** → still walls at stage-01
+  (identical `va=0x0ed1da0`). So region_alloc is NOT the writer.
+- Forcing the whole exec-alloc group native reaches the SAME far downstream
+  `#GP` as `memblock_alloc` alone — memblock_alloc accounts for the entire fix.
+
+The 24 MiB-wide `.bss` hole is anchored at the fixed `__bss_start` symbol with
+`task_table` ~24 MiB inside it; memblock_alloc's sub-page instruction removal
+cannot shift a hole that wide off `task_table`, so reaching kmod-load is a REAL
+disappearance of the corruption, not a victim relocation.
+
+### 4. Mechanism + UNIFICATION (both walls are the same bug)
+The LLVM-compiled `memblock_alloc` returns a kernel-image / `__bss_start`-
+colliding base (which is why the hole starts EXACTLY at `__bss_start`).
+`region_alloc(file_hi_rel)` cold-miss carves that base and hands it to
+`_load_elf64`, whose eager `memset(region,0,file_hi_rel)` + PT_LOAD `memcpy`
+zero/overwrite `.bss` from `__bss_start` — clobbering `task_table`,
+`printk_line_seq`, `vma_tree_root`, the fb console state, etc. That single
+corruption produces BOTH walls: the stage-01 SIGSEGV (task_table[6] VMA state
+zeroed → `NO covering VMA`) AND the Phase-5d/5k **pid=7 wall**
+(`task_table[child].state`/`rq_cpu` clobbered → `_another_task_ready()==0` →
+child never dispatched). The brief's unification hypothesis is CONFIRMED: fixing
+`memblock_alloc` clears the pid=7 wall too.
+
+### 5. do_page_fault-native was a layout artifact (confirms 5k's own caveat)
+The winning bisection build keeps `do_page_fault` as LLVM and boots past both
+walls — so `do_page_fault`-native was never needed; it only relocated the
+victims. The default is therefore switched **`do_page_fault` → `memblock_alloc`**.
+
+### Fix status + the open ssa_llvm.ad defect
+Landed the correctness-first, native-safe route: `KLLVM_DEFAULT_FORCE_NATIVE`
+default is now `memblock_alloc` (opt-in-lane-only; no compiler/kernel source
+change, native byte-identical). The exact codegen defect INSIDE
+`memblock_alloc` is NOT yet isolated to an instruction: its arrays are correctly
+sized (`memblock_region_start`/`_end` = `Array[16,uint64]` → `[128 x i8]`,
+capped at `MEMBLOCK_MAX_REGIONS=16`, indexed `base+i*8` — all correct), and the
+`-O0` `clang -S` asm of the loop/return looks semantically equivalent to the
+native objdump. Prime remaining suspects for the `ssa_llvm.ad` fix (gate
+`ssa_mem_model`): (a) the loop **phi-web return threading** (the found-flag +
+result carried out of the region-scan loop via nested phis — the exact SSA
+construct the Braun builder emits for a mid-loop early result), or (b) a
+**hybrid-link `--allow-multiple-definition` global-resolution** interaction on
+`@memblock_region_start`/`@memblock_nr_regions` (both the LLVM object and the
+native `main.o` define every global; a first-wins vs. init-writer mismatch could
+make LLVM `memblock_alloc` read an UNINITIALIZED copy → base 0/low). NEXT: dump
+the FULL `clang -S @memblock_alloc` vs native side-by-side focused on the return
+value and the `@memblock_region_start` relocation target, and/or a host
+differential of the region-scan loop shape.
+
+Net: opt-in lane now boots PAST stage-01 AND pid=7 to the kmod-load stage
+(new furthest point; residual = an unrelated Linux static-call `#GP`). Native
+kernel byte-identical (only `scripts/build_kernel_llvm.sh` default + this doc;
+no compiler/kernel source touched). Reproduce: `KLLVM_DEFAULT_FORCE_NATIVE=""
+scripts/build_kernel_llvm.sh <out>` walls at stage-01; the default (memblock_alloc
+native) boots past pid=7.
