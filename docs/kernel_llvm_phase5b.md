@@ -485,3 +485,95 @@ zeroing (unknown when)" to a hard TIME bracket (execve-sysret → first user fau
 with the write path, timer IRQ, `_vma_zero_phys`, and the wrong-slot/percpu read
 class all EXCLUDED. The separate `_another_task_ready` pid=7 wall remains
 distinct.
+
+## Phase 5k — the stage-01 wall is a DEBUG-PROBE LAYOUT ARTIFACT; a CLEAN do_page_fault-LLVM kernel boots past it (TCG+KVM); the writer is a deterministic CPU store, NOT DMA (evidence-backed, native-safe)
+
+Phase 5k reproduced from a **clean, probe-free** emit and overturns the framing of
+5b–5j: the "stage-01 multi-global BSS zeroing wall" they all chased is **induced
+by the debugging instrumentation itself**. All probes reverted; no
+`codegen.ad`/compiler/kernel-source change (the one temporary probe in
+`trap_diag.ad` was reverted); native kernel byte-identical by construction.
+
+### Method (fast, reproducible — clang -O0 of the 33 MiB `.ll` is ~4 s, not minutes)
+Emitted the whole-kernel `.ll` from CLEAN worktree source with
+`KLLVM_DEFAULT_FORCE_NATIVE=""` (do_page_fault LEFT as LLVM), clang-19 -O0
+-mcmodel=kernel, linked with the existing boot `.S`/initramfs/native-hybrid
+objects, BIOS-GRUB-ISO boot under BOTH `-accel tcg` and `-accel kvm -cpu host`.
+For the corruption A/B, re-added a **minimal single-BSS-global probe** at
+`do_page_fault` entry (`scripts/kllvm_repro_bss_zero.sh` drives the shape).
+
+### Hard results
+1. **A CLEAN do_page_fault-LLVM kernel boots PAST stage-01 to `rfork: child
+   created, pid=7`** — identical to the native-hybrid default — under **both TCG
+   and KVM**. The stage-01 SIGSEGV does **not** occur without instrumentation.
+   Emit stat: clean `funcs=11064 emitted=11059`; the failing probe9 build was
+   `funcs=11065` (one extra probe fn/global). **Adding even ONE `.bss` probe
+   global shifts `.bss` so the wild store lands on task_table[6]/printk_line_seq/
+   vma_tree_root → the stage-01 wall.** This is the Phase-5g layout artifact,
+   now demonstrated cleanly: every 5b–5j "wall" observation carried probes.
+2. **The corruption reproduces under KVM**, not TCG-only: with the +1-global
+   probe, after `pid=7` the first `do_page_fault` reads `task_table[6].image_lo=
+   image_hi=0` AND the probe's own fresh `.bss` global `=0`; `printk_line_seq`
+   collapsed ~550→0 then re-incremented. So it is NOT a TCG emulation quirk — it
+   happens under hardware virtualization (i.e. would happen on real HW too).
+3. **GENUINE physical-memory zeroing**, confirmed CR3-independently via the QEMU
+   monitor `xp` (physical) read: `xp/1gx <phys(img6)>` = `0x0`,
+   `xp/1gx <phys(printk_line_seq)>` = `0xa` (the post-collapse re-increment) —
+   NOT a per-CR3 mapping/read artifact. Consistent with KPTI gated OFF
+   (`cpu_mitigations.ad` `kpti_live=0` → #PF does not switch CR3; do_page_fault
+   runs under the faulting task's own CR3, which maps the kernel).
+4. **DMA vs CPU = CPU store.** `-nic none` (removing the default e1000 whose
+   SLIRP RX polling is the only active-DMA source) does **NOT** stop the
+   corruption; the default `pc` machine has no other post-boot DMA (CD/IDE idle,
+   no AHCI/xHCI/virtio devices present). → the writer is the **deterministic
+   layout-sensitive wild OOB store in SHARED LLVM code** (Phase 5g), NOT async
+   device DMA.
+5. **Not a constant-offset OOB.** `scripts/scan_oob.py` (5i's "global declared
+   too small" catcher, added to `scripts/` this phase) = **0** on the current
+   `.ll` — 5i's `llvm_glob_bytes` fix holds. The residual is a **variable-index
+   / stride** (or pointer-arith) miscompile that constant-offset scanning cannot
+   see, e.g. an array-of-struct `g[i].field` / nested `g[i].arr[j]` store whose
+   INDEX STRIDE is wrong. The corruption fires on the execve→stage-04 path and
+   again at rfork/pid=7 — both dense with variable-index `task_table[idx].field`
+   writes and zeroing loops (e.g. `seccomp_native_filter[j]=0`, `fpu_area[]`).
+
+### Tooling reality (load-bearing — do NOT repeat these dead-ends)
+- **Hardware watchpoints are USELESS for this bug.** TCG deopts too slow to reach
+  the late event (stalls in early boot at printk_line_seq≈40 after minutes —
+  matches wp7). The **KVM gdbstub DR watchpoints are clobbered by the kernel's
+  own DRn writes** early in boot: an armed watch catches only the very-early
+  `.bss` clear (pc `0xffffffff80114018`) and then MISSES even the legitimate
+  execve store of `task_table[6].image_lo=0x400000`. This is why 8 prior agents
+  could not catch the store.
+- **The productive instruments:** (a) a MINIMAL +1-global source probe at
+  do_page_fault entry; (b) the QEMU monitor `xp <phys>` CR3-independent physical
+  read (`-monitor unix:...,server,nowait`, `stop`, `xp/1gx`); (c) the
+  clean-vs-probe layout A/B and `-nic none` device-quiesce. `phys = VA -
+  0xffffffff80000000` for higher-half globals; `task_table[slot].image_lo =
+  task_table + slot*0x38d0 + 0xbc0` (verify stride/off by `objdump -d
+  <task_image_lo>` each build — they drift).
+
+### Next steps (for the next agent)
+- **STOP adding probes to chase stage-01** — probes move the target. Boot clean.
+- **Hunt the variable-stride store statically:** extend `scan_oob.py` to model
+  `getelementptr` / `mul index,stride`+`add base` chains and flag `stride !=
+  element_size` for array-of-struct and nested-array globals; focus on the
+  stores `ssa_llvm.ad` emits via `ssa_global_indexed_struct_base` / the recursive
+  lvalue-address walker for `task_table[idx].*` and nested `[i].arr[j]`.
+- **OR clean-build differential:** dump `.bss` physically (`xp`) at pid=7 in the
+  clean do_page_fault-LLVM build and diff vs the native kernel's expected values
+  to locate the wrongly-zeroed hole → back-map to its source global → identify
+  the writing loop, then `clang -S` vs native objdump on that store.
+- **`KLLVM_DEFAULT_FORCE_NATIVE=do_page_fault` may be unnecessary:** a clean
+  do_page_fault-LLVM build boots to pid=7. Re-test a full clean
+  `build_kernel_llvm.sh` with `KLLVM_DEFAULT_FORCE_NATIVE=""` before flipping the
+  default (the wild store is in shared code and layout-dependent, so a full build
+  could still land it on a victim — verify, don't assume).
+
+Net: default lane unchanged (`do_page_fault` native-hybrid → `rfork pid=7`).
+Diagnosis corrected: the stage-01 wall = debug-probe layout artifact; the true
+defect = a deterministic CPU wild-store (variable-index/stride miscompile) in
+shared LLVM code, genuine physical zeroing, NOT DMA and NOT do_page_fault-specific.
+Native kernel byte-identical (no compiler/kernel source change; probe reverted;
+`git status` clean bar the new `scripts/scan_oob.py`, `scripts/kllvm_repro_bss_zero.sh`,
+and this doc). The separate `_another_task_ready` pid=7 wall remains distinct.
