@@ -51,9 +51,79 @@ _BUILD_JOBS="${HAMNIX_BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}"
 # Build host_ac.elf ONCE before fanning out (no-op under ADDER_CC=python).
 adder_cc_bootstrap || { echo "[build_user] ERROR: compiler bootstrap failed" >&2; exit 1; }
 
-# Failure markers land here; presence of any file == a compile failed.
+# Failure markers land here; presence of any file == a compile failed
+# (i.e. BOTH the LLVM lane AND the native fallback failed for that app).
 _FAILDIR="$(mktemp -d)"
-trap 'rm -rf "$_FAILDIR"' EXIT
+# Per-app lane outcome markers: "<name>.llvm" (built as native ELF64 via the
+# LLVM->clang lane) or "<name>.native" (fell back to the native SSA ELF32
+# lane). Native fallbacks also drop a one-line "<name>.reason" (bail class).
+_LANEDIR="$(mktemp -d)"
+trap 'rm -rf "$_FAILDIR" "$_LANEDIR"' EXIT
+
+# --- DEFAULT BACKEND SELECTION ---------------------------------------------
+# USER directive: EVERY user app should compile through the LLVM->clang->native
+# ELF64 lane (scripts/adder_cc_llvm_native64.sh) by DEFAULT, with an automatic
+# per-app fallback to the native SSA ELF32 lane whenever the LLVM build bails
+# (an SSA-subset function is not emitted -> link undef, or clang/emit fails).
+# So the build ALWAYS completes and produces a bootable image; the native lane
+# stays the bootstrap floor + safety net.
+#
+# Knobs:
+#   ADDER_LLVM_DEFAULT=0        force the native lane for ALL apps (debug/A-B).
+#   ADDER_FORCE_NATIVE_APPS="a b"  force the native lane for just these apps.
+_LLVM_DEFAULT="${ADDER_LLVM_DEFAULT:-1}"
+_FORCE_NATIVE=" ${ADDER_FORCE_NATIVE_APPS:-} "
+
+# _classify_bail <llvm-logfile> — reduce an LLVM-lane failure to a short bail
+# class for the coverage report (why this app fell back to native).
+_classify_bail() {
+    local log="$1" stat reason sym
+    stat="$(grep -m1 'ADDER_STAT' "$log" 2>/dev/null | sed 's/^; *//')"
+    if grep -q 'no @main emitted' "$log" 2>/dev/null; then
+        reason="no-main(main-body-bailed)"
+    elif grep -q 'undefined reference to' "$log" 2>/dev/null; then
+        sym="$(grep -m1 'undefined reference to' "$log" | sed -E "s/.*undefined reference to \`([^']+)'.*/\1/")"
+        reason="link-undef:$sym(callee bailed SSA subset)"
+    elif grep -q 'backend=llvm failed' "$log" 2>/dev/null; then
+        reason="hostac-emit-err"
+    elif grep -q 'clang -c failed' "$log" 2>/dev/null; then
+        reason="clang-err"
+    elif grep -q 'ERROR assembling' "$log" 2>/dev/null; then
+        reason="as-err"
+    elif grep -q 'ERROR linking' "$log" 2>/dev/null; then
+        reason="link-err"
+    else
+        reason="other"
+    fi
+    echo "$reason | ${stat:-no-stat}"
+}
+
+# _compile_one_app <src.ad> <out.elf> <basename> — LLVM-first with native
+# fallback. Records the winning lane (+ bail reason on fallback), and a hard
+# FAILDIR marker only if BOTH lanes fail.
+_compile_one_app() {
+    local src="$1" out="$2" base="$3" nm=" $3 " llog
+    if [ "$_LLVM_DEFAULT" = "1" ] && [[ "$_FORCE_NATIVE" != *"$nm"* ]]; then
+        llog="$(mktemp)"
+        if ADDER_HOST_AC="${ADDER_HOST_AC:-build/cutover/host_ac.elf}" \
+                bash scripts/adder_cc_llvm_native64.sh "$src" "$out" >"$llog" 2>&1; then
+            : > "$_LANEDIR/$base.llvm"
+            rm -f "$llog"
+            echo "[build_user] LLVM   wrote $out"
+            return 0
+        fi
+        # LLVM bailed -> classify, then fall back to the native lane.
+        _classify_bail "$llog" > "$_LANEDIR/$base.reason"
+        rm -f "$llog"
+    fi
+    if adder_cc_compile compile --target=x86_64-adder-user "$src" -o "$out"; then
+        : > "$_LANEDIR/$base.native"
+        echo "[build_user] native wrote $out"
+    else
+        echo "[build_user] ERROR: compile FAILED (both lanes): $src -> $out" >&2
+        : > "$_FAILDIR/$base"
+    fi
+}
 
 # Queue of (src -> out) compile jobs, run by _run_compile_pool.
 _Q_SRC=()
@@ -77,24 +147,39 @@ _run_compile_pool() {
         while [ "$(jobs -rp | wc -l)" -ge "$_BUILD_JOBS" ]; do
             wait -n 2>/dev/null || true
         done
-        local src="${_Q_SRC[$i]}" out="${_Q_OUT[$i]}"
-        (
-            if adder_cc_compile compile --target=x86_64-adder-user "$src" -o "$out"; then
-                echo "[build_user] wrote $out"
-            else
-                echo "[build_user] ERROR: compile FAILED: $src -> $out" >&2
-                : > "$_FAILDIR/$(basename "$out")"
-            fi
-        ) &
+        local src="${_Q_SRC[$i]}" out="${_Q_OUT[$i]}" base
+        base="$(basename "$out" .elf)"
+        ( _compile_one_app "$src" "$out" "$base" ) &
     done
     wait
-    # Fail-fast: propagate any backgrounded compile failure to the whole build.
+    # Fail-fast: propagate any compile that failed BOTH lanes to the whole build.
     if [ -n "$(ls -A "$_FAILDIR" 2>/dev/null)" ]; then
-        echo "[build_user] ERROR: $(ls -1 "$_FAILDIR" | wc -l) user compile(s) FAILED:" >&2
+        echo "[build_user] ERROR: $(ls -1 "$_FAILDIR" | wc -l) user compile(s) FAILED (both LLVM + native lanes):" >&2
         ls -1 "$_FAILDIR" >&2
         exit 1
     fi
     echo "[build_user] all $n Adder programs compiled OK"
+
+    # --- LLVM-default coverage report --------------------------------------
+    local _llvm _nat _total
+    _llvm=$(ls -1 "$_LANEDIR"/*.llvm   2>/dev/null | wc -l)
+    _nat=$(ls -1 "$_LANEDIR"/*.native 2>/dev/null | wc -l)
+    _total=$(( _llvm + _nat ))
+    echo "[build_user] ================ LLVM-default coverage ================"
+    if [ "$_LLVM_DEFAULT" = "1" ]; then
+        echo "[build_user] LLVM ELF64 (default): $_llvm / $_total apps built via LLVM->clang"
+        echo "[build_user] native fallback:      $_nat / $_total apps"
+        if [ "$_nat" -gt 0 ]; then
+            echo "[build_user] --- native fallbacks (app: bail-class | ADDER_STAT) ---"
+            for r in "$_LANEDIR"/*.reason; do
+                [ -f "$r" ] || continue
+                printf '[build_user]   %s: %s\n' "$(basename "$r" .reason)" "$(cat "$r")"
+            done | sort
+        fi
+    else
+        echo "[build_user] ADDER_LLVM_DEFAULT=0 -> all $_total apps built via native lane"
+    fi
+    echo "[build_user] ======================================================="
 }
 
 build_one() {
@@ -431,7 +516,12 @@ queue_adder_compile adder/compiler/adder_cc_driver.ad    build/user/adder_cc.elf
 # --- Fan out every queued Adder compile across cores -----------------
 _run_compile_pool
 
-# --- OPT-IN: rebuild selected apps as NATIVE ELF64 (LLVM backend) -----
+# --- LEGACY OPT-IN: force-rebuild selected apps as NATIVE ELF64 (LLVM) -----
+# NOTE: LLVM->ELF64 is now the DEFAULT for EVERY app (see _compile_one_app),
+# so this block is redundant for normal builds. It is retained only for the
+# ADDER_LLVM_DEFAULT=0 debug mode: set ADDER_LLVM_DEFAULT=0 (native for all)
+# plus ADDER_ELF64_APPS="foo bar" to force just those apps back onto the LLVM
+# lane for an A/B comparison.
 # Set ADDER_ELF64_APPS to a space-separated list of app names (matching
 # build/user/<name>.elf) to OVERWRITE those binaries with a native ELF64
 # build via scripts/adder_cc_llvm_native64.sh (clang codegen of the LLVM
