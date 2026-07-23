@@ -67,3 +67,10 @@ Ranked hambrowse-vs-Chrome gaps by cross-site impact (agent acdff02e):
 5. Default vertical rhythm (line-height, heading/paragraph margins).
 6. justify-content spacing nuances; flex/block background-bar FILL emission (dispflex/flexnav fails).
 Tooling: `chromium` @ /usr/bin (Chrome ref); `framediff_gfx_*` SSIM harness; self-contained inline-CSS pages give clean comparisons.
+
+## Chrome-parity progress (round 2, main 14b39ad7)
+CLOSED so far: flex-column blockification (SSIM 0.663→0.729); #1 text-too-wide (DejaVu→Liberation condensed metric, HN 0.427→0.451); list `<li>` vertical margins (danluu blog 0.558→0.648, zero churn — gated on authored margin). Serif empirically ruled out as a big lever (+0.01). Re-ranked remaining gaps:
+1. Header/nav `<table>`-cell sizing → single-line headers don't wrap (HN 0.563).
+2. MDN-class two-column sidebar/main (0.709 — nav renders as narrow 284px col, main pushed below; grid/flex two-pane collapse).
+3. Article-column max-width (Wikipedia hb content 995px vs Chrome 355px).
+4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
