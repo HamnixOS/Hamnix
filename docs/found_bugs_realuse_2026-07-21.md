@@ -148,3 +148,50 @@ Re-ranked remaining gaps (round 8):
 3. **MDN responsive mega-menu collapse** — the desktop nav is a click-dropdown Chrome hides; hb renders it fully expanded (needs media-query `display:none` / CSSOM). Big MDN-class lever but complex.
 4. Wikipedia article-column max-width (SSIM 0.826).
 5. `<tr height:5px>` spacer honoring (still deferred; opposing sign to any height fix).
+
+## Chrome-parity round 8 (worktree — LANDED the primary lever)
+Re-measured 2026-07-23 vs `/usr/bin/chromium` at width 1000. Ranked gaps confirmed:
+**1. Blog/prose list-row vertical rhythm** (top general lever; danluu index, SSIM
+0.709, hb item pitch **38px vs Chrome 32px**). 2. HN residual (page confounded by the
+round-7 vertical shortening; SSIM 0.493). 3. MDN mega-menu (0.720). 4. Wikipedia
+max-width (0.826).
+
+CLOSED: **#1 — list-item sub-row margin PIXEL height.** Root cause was NOT flexbox:
+a block `<li>` and a `display:flex` `<li>` measured **identically** (both 38px). The
+gap is entirely the **authored bottom margin**. `li{margin:0 0 .9em}` = 14.4px
+quantises to exactly ONE blank grid row, and hambrowse drew that lone gap row at the
+full `BODY_H` (~19px) body line pitch — so every item ran 19(content)+19(gap)=38px
+instead of Chrome's 19+14≈32. The `<li>` inter-item-margin path (`lib/web/dom/forms.ad`)
+emitted the gap via `_emit_vgap` but never tagged its px. Fix: tag the lone emitted gap
+row with its REAL px via `row_mgap` — the *identical* mechanism the heading
+margin-bottom already uses (the `lib/htmlpage.ad` per-row pass then draws `mg` px when
+`mg < BODY_H` instead of a full body row). Guarded to fire only when the emit ran with
+the previous item's row still dirty (the common single-line item) and the gap rounds to
+one row.
+**Measured:** danluu index item pitch **38 → 33px** (Chrome 32 — within 3%, was 19%
+over); synthetic 6-item `li{margin:.9em}` list pitch 38 → 33. Full-frame blog SSIM reads
+0.709 → 0.699 — the **documented vertical-misregistration confound** (a denser, more
+Chrome-correct page mis-registers against Chrome's frame); item pitch + side-by-side are
+the honest signal, per the round-4 note.
+**Blast radius (all 222 fixtures diffed base-vs-fix at the 640px gate width):** **0
+fixtures change** — the path fires only for a sub-`BODY_H` `li` margin that rounds to one
+row, which no committed 640px fixture hits. **Gate churn = 0.** HN / MDN / Wikipedia real
+pages **byte-identical** (HN's story list is a `<table>`, not an `li` list; the others
+carry no sub-row li margin). All required gates PASS: host, google, realsite,
+realarticle, tblwidth, tblcolcap, nesttable, nesthdr, cellflow, cellrowh, smallrowh,
+limargin, navgap. New gate `test_hambrowse_limarginpx_host.sh` (fixture
+`hambrowse_limargin_px.html`): the 4 inter-item gap rows of a 5-item `li{margin:.9em}`
+list are drawn at 14px while a `margin:0` control adds no short row (base: all 12 rows a
+flat 19px → FAIL). Native hambrowse compiles.
+
+Re-ranked remaining gaps (round 9):
+1. **HN residual** — narrow rank/vote columns still a touch wider than Chrome (title
+   starts ~150 vs ~100px); inline sitebit `(domain)` carries extra leading whitespace
+   rather than sitting tight after the title.
+2. **MDN responsive mega-menu collapse** — desktop nav is a click-dropdown Chrome hides;
+   hb renders it fully expanded (needs media-query `display:none` / CSSOM). Big MDN-class
+   lever but complex.
+3. Wikipedia article-column max-width (SSIM 0.826, closest).
+4. Prose paragraph rhythm / heading margins on long-form articles (next general lever
+   after list rhythm).
+5. `<tr height:5px>` spacer honoring (still deferred; opposing sign to any height fix).
