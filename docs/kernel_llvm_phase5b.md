@@ -753,3 +753,96 @@ kernel byte-identical (only `scripts/build_kernel_llvm.sh` default + this doc;
 no compiler/kernel source touched). Reproduce: `KLLVM_DEFAULT_FORCE_NATIVE=""
 scripts/build_kernel_llvm.sh <out>` walls at stage-01; the default (memblock_alloc
 native) boots past pid=7.
+
+## Phase 5n — Phase-5m's "past pid=7 / kmod-load furthest point" is OVERTURNED; the walls UNIFY as ONE persistent bulk-`.bss` wild store that memblock_alloc-native did NOT eliminate — it only shifted the victim (evidence-backed, native-safe)
+
+Reproduced the DEFAULT lane (`memblock_alloc` native, KVM `-cpu host`) from clean
+source and ran the un-confounding A/B the brief asked for. Result confirms the
+orchestrator's HONEST repro (commit 7a1bf7bf) and **overturns Phase 5m's central
+claims**: the default lane does NOT reach pid=7, the kmod-load `#GP` is NOT "past
+pid=7", and `memblock_alloc`-native is a layout artifact — the Phase-5g/5k/5m
+bulk-`.bss` wild store is STILL LIVE. No source touched; `git status` clean bar
+this doc; native kernel byte-identical by construction (no `codegen.ad`/`ssa*.ad`/
+kernel `.ad`/`build_kernel_llvm.sh` change this phase).
+
+### 1. Ground truth A/B (same harness: BIOS-GRUB-ISO, `-accel kvm -cpu host`, `-m 1024M`)
+- **NATIVE kernel** (`adder_cc_link_kernel init/main.ad`, same `.S`/initramfs):
+  boots FULLY — hamsh `M16.35 shell ready`, stage-05, `rfork: child created,
+  pid=7` **dispatched**, then pid=8…**pid=26**, stage-06/07/08, interactive
+  `hamsh$` prompt, `pid N exited`. `kmod_linux` (usbcore/…) init_module returns
+  cleanly (`relocations applied=14183 skipped=0`, **unresolved=0**).
+- **DEFAULT LLVM kernel** (`memblock_alloc` native): does **NOT** reach userspace
+  at all. It walls at **`[boot:35]` kmod_linux init_module** with a `#GP`
+  (`TRAP vector 0x0d rip=0xffffffff8c61a956`), preceded by **3290 SKIPPED
+  relocations** and thousands of `unresolved external symbol` (`__x86_return_thunk`
+  601, `__fentry__` 510, `mutex_unlock`, `kfree`, … essentially the WHOLE
+  Linux-ABI export table). Userspace/hamsh launches at boot:37+, so this `#GP` is
+  **BEFORE** pid=7 — Phase 5m's "boot advances PAST rfork pid=7 into the
+  kmod-load stage" is FALSE (boot ordering: module load is IN `start_kernel`,
+  hamsh is later).
+
+### 2. Root symptom PINNED by CR3-independent physical read (QEMU-monitor `xp`)
+At the `#GP`, `xp` of the export table's PHYSICAL frames:
+`NR_EXPORTS` (phys `0x05109c40`) = **0**; `export_names[0..3]` (`0x05109c50`) =
+**0**; `export_addrs[0..3]` (`0x05111c50`) = **0**. The table is PHYSICALLY
+EMPTY. So `linux_abi_lookup` correctly returns 0 for every symbol → every UND
+relocation is skipped → usbcore's `init_module` calls an unrelocated
+`__SCT__might_resched`/`fortify_panic` site → `#GP`.
+
+### 3. `linux_abi_lookup`'s LLVM codegen is CORRECT (disassembly-verified) — NOT the bug
+`objdump` of `@linux_abi_lookup` in the real ELF: `NR_EXPORTS` read RIP-relative
+at the right address (`mov 0x…(%rip) # <NR_EXPORTS>`), `export_names[i]`/
+`export_addrs[i]` addressed as `base + i*8` with the correct immediate bases —
+byte-for-byte the right scan. It reads NR_EXPORTS=0 because the memory IS 0. (The
+earlier isolated-`.ll` GOTPCREL red herring only appears when the globals are made
+`external`; in-module they are direct.)
+
+### 4. "Force `linux_abi_lookup` native FIXES resolution" is a LAYOUT SHIFT, not a fix
+- `KLLVM_FORCE_NATIVE="linux_abi_lookup"` (or `+linux_abi_exports_init`) →
+  **unresolved=0, `relocations applied=14183 skipped=0`**, boot advances PAST
+  kmod into userspace to **hamsh `[stage-01] main-enter`**.
+- BUT it then dies at the **exact Phase-5j stage-01 SIGSEGV**: `[pf] user fault on
+  unmapped va=0x0ed1da0`, `NO covering VMA`, `tree-find=0`, `pid 0 exited
+  (code=139)`, `schedule: no live tasks; halting`. The wild store simply moved to
+  a DIFFERENT `.bss` victim (task_table/vma_tree_root) once the export table was
+  shifted out of its target range.
+- **Control:** forcing an UNRELATED function (`_another_task_ready`) native does
+  NOT fix resolution (still `skipped=3290`) — proving it is the *specific* `.bss`
+  layout delta, not the function's own codegen. `exports_init` is LLVM in BOTH the
+  fixed and broken builds and its population logic is address-independent, so the
+  table IS populated then ZEROED (not never-populated); only its `.bss` address
+  differs between the two layouts.
+
+### 5. UNIFICATION + corrected record
+The stage-01 wall, the pid=7 wall, and the new kmod/export-table wall are the
+**SAME** deterministic, layout-sensitive bulk-`.bss` wild store (Phase 5g/5k/5m:
+genuine physical zeroing, CPU store not DMA, invisible to `scan_oob.py`). Forcing
+`memblock_alloc` (Phase 5m) or `linux_abi_lookup` (this phase) native only
+RELOCATES the victims; it does not remove the store. **The LLVM lane reaches pid=7
+in NO tested configuration** — it walls at whichever `.bss` global the store lands
+on for the current layout. The brief's premise (pid=7 is now un-confounded, and
+`_another_task_ready`/`do_rfork` is the blocker) does not hold: we never reach
+userspace scheduling; the confounder (the wild store) is still live. `memblock_
+alloc`-native's apparent Phase-5m win was itself a layout artifact.
+
+### 6. Best next probe (improves on the documented dead-ends)
+The export-table victim is a MUCH better instrumentation target than the
+execve-timed task_table victim (Phase 5j needed elaborate time-bracketing): it is
+zeroed EARLY (`[boot:35]`, ~serial line 400 — long past early boot's DR-clobber
+window) at a FIXED symbol (`NR_EXPORTS` @ `0x05109c40` phys). Arm a QEMU physical
+/ low-identity **hardware watchpoint on `0x05109c40` AFTER boot:34** (connect gdb,
+run to the kmod_hello init_module return, THEN `watch`; the boot:35 store should
+trip it — the Phase-5j/5k KVM-DR-clobber failure was for EARLY-armed watches). The
+tripping RIP names the writing function directly → `clang -S` vs native objdump on
+that store → the `ssa_llvm.ad` construct to fix (gate `ssa_mem_model`). Candidate
+writers to disasm at boot:35 (all run between `exports_init` and the `#GP`):
+`kmod_linux_load`'s `memset(base,0,span)` / `_bias_loaded` / `_copy_sections`
+(linux_abi/loader.ad) and `_apply_relocations` — verify each section's
+`sec_loaded_addr[i]` lands in the module window (`≥0xffffffff8c600000`), NOT a
+biased-wrong low kernel `.bss` address.
+
+Net: default lane unchanged (still walls at the kmod/export-table `#GP`; forcing
+`linux_abi_lookup` native advances to the Phase-5j stage-01 SIGSEGV — neither
+reaches pid=7). Native kernel boots fully (control). Native byte-identical (no
+source touched this phase; only this doc). The wild store remains the single
+open blocker; the `_another_task_ready` pid=7 theory is moot until it is fixed.
