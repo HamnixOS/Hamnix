@@ -112,3 +112,7 @@ Re-ranked remaining gaps (round 4):
 2. Explicit-width table target CLAMP (prereq for the auto-column-cap title fix above).
 3. MDN two-column sidebar/main (0.709).
 4. Article-column max-width (Wikipedia).
+
+## Chrome-parity round 4 (main after 0d9256a8)
+CLOSED: HN vertical row-inflation — empty block (`div.votearrow height:10px`) in a `<td>` was adding 2 rows/story via shared `cur_row` (`g_cell_pending` skips the cell's leading soft-newline; empty sub-LINE_H block collapses to 0 rows; both gated to inside-cell so non-table flow byte-identical). **HN page height 2000→1696px (1.39×→1.18× vs Chrome ~1438px)**, isolated repro 233→119px. NOTE: full-frame SSIM harness reads vertical-fidelity gains as WORSE (resize misregistration) — use page-height + side-by-side, not raw resized SSIM, for vertical changes.
+Round-5 lever: cell/row content-line height — a single-line cell occupies ~2 quantized LINE_H(16→18px) rows vs Chrome's ~1 text line (17px); investigate per-row leading/`_bump_row` pitch inside cells.
