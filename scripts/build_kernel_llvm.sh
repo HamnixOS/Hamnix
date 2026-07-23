@@ -81,7 +81,7 @@ echo "[kllvm]    bailed functions:"; grep '; BAILED' "$WORK/kernel_main.ll" | se
 # change). See docs/kernel_llvm_phase5b.md (Phase 5e).
 #
 # KLLVM_FORCE_NATIVE="fn1 fn2 ..." appends extra names (A/B bisection hook).
-KLLVM_DEFAULT_FORCE_NATIVE="do_page_fault"
+KLLVM_DEFAULT_FORCE_NATIVE="${KLLVM_DEFAULT_FORCE_NATIVE-do_page_fault}"
 KLLVM_ALL_FORCE_NATIVE="$KLLVM_DEFAULT_FORCE_NATIVE ${KLLVM_FORCE_NATIVE:-}"
 if [ -n "$(echo "$KLLVM_ALL_FORCE_NATIVE" | tr -d ' ')" ]; then
     echo "[kllvm] 1b) FORCE-NATIVE: $KLLVM_ALL_FORCE_NATIVE"
