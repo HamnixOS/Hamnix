@@ -288,3 +288,95 @@ the EARLIER (pre-stage-01, hamsh `_start` stack) demand fault and dump the phys
 page `vma_demand_fault`/COW writes to, confirming it lands on task_table's
 `0x05122c70` page. A proper `ssa_llvm.ad` fix (gated `ssa_mem_model`) awaits that
 pin. Native kernel byte-identical (no compiler/kernel source change this phase).
+
+## Phase 5g — the do_page_fault codegen theory is DISPROVEN; it is a layout-sensitive latent OOB write on the pre-fault path (evidence-backed, native-safe)
+
+Executed the Phase-5f "next probe" directly (build the lane with `do_page_fault`
+LEFT as LLVM; trap the earlier fault; dump the physical write targets). The
+result **overturns the 5e/5f diagnosis**: `do_page_fault`'s LLVM codegen is NOT
+the cause. task_table is not zeroed by `do_page_fault`'s own demand/COW write
+path (it has none). All probes reverted; native kernel byte-identical; kobjdiff
+PASS (0 divergences / 11061 fns).
+
+### What was built + measured (all instrumentation reverted)
+
+Reproduced the corruption build (`KLLVM_DEFAULT_FORCE_NATIVE=""`, so
+`do_page_fault` is LLVM), BIOS-ISO `-serial file`, `-m 1024M`, own qemu only.
+Added three temporary, reverted probes:
+1. **ZPROBE** in the shared `_vma_zero_phys` (the *actual* demand-zero writer):
+   EMERG if `memset` target `phys < 0x06000000` (the loaded-kernel low-phys band
+   where static globals like task_table live). This is the write 5f fingered.
+2. **VDF** at `vma_demand_fault` entry: print `slot`, `pml4_phys`, `fault_va`.
+3. **DPFENT** as the FIRST statement of `do_page_fault`: snapshot
+   `printk_line_seq` and `task_image_lo(6)` BEFORE the handler body runs.
+
+### Evidence chain — four hard facts
+
+- **do_page_fault passes CORRECT args.** VDF at the stage-01 fault:
+  `slot=6 pml4=0x0e01d000 fault_va=0x0ed1d60` — identical to the native build's
+  values. The demand-call args are not miscompiled (the IR threads
+  `pml4_phys = cr3 & PF_CR3_ADDR_MASK` through clean phis; confirmed statically).
+- **No demand-zero ever hits low phys.** ZPROBE NEVER fired. The shared
+  `_vma_zero_phys`/`memset(phys)` writes only high buddy-pool frames. **5f's
+  central claim — "the demand-zero write lands on task_table's physical page" —
+  is directly refuted.** `do_page_fault`'s own LLVM body contains exactly FIVE
+  stores (enumerated from the emitted `.ll`): an iret_frame param-spill to its
+  own alloca, three named global counters (`pf_spurious_recovered`,
+  `pf_spurious_logs`, `smap_probe_faulted`), and `iret_frame[0]` on the
+  smap-probe path. NONE can reach task_table. All page zeroing/copying is in the
+  SHARED `vma_demand_fault`/`_vma_zero_phys`/`cow_handle_write_fault`, which are
+  LLVM-compiled in BOTH the A and B builds and therefore cannot be the
+  differentiator.
+- **The corruption PRECEDES do_page_fault.** DPFENT, printed on the VERY FIRST
+  `do_page_fault` entry, already reads `seq=0x21 (33)` and `img6=0x0` — i.e.
+  `printk_line_seq` (was ~1030) and `task_table[6].image_lo` are ALREADY zeroed
+  before the handler body runs. Corroborated by the serial: the `[NNNNNN]` line
+  stamp collapses from `[001030]` (execve jump-to-user) to `[000033]` at the
+  first fault, with only unstamped USERSPACE lines (`_start`, `stage-01`) in
+  between. So the zeroing happens on the execve→first-user-fault path, not inside
+  `do_page_fault`.
+- **The A/B differ ONLY by a uniform 0x1000 BSS layout shift.** The two builds
+  are byte-identical except for `do_page_fault`'s body (LLVM vs the appended
+  native object). Symbol addresses:
+  `task_table` 0x8510bbe0 (LLVM) vs 0x8510abe0 (native);
+  `printk_line_seq` 0x8395c280 vs 0x8395b280 — **both shift +0x1000**. Two
+  victims 27 MiB apart move by the same page, i.e. the whole BSS block shifts
+  when `do_page_fault`'s body is present/absent in the LLVM object.
+
+### Conclusion — the native-hybrid "fix" is a LAYOUT ARTIFACT, not a codegen fix
+
+The failure is a **latent, layout-sensitive out-of-bounds write in SHARED code
+executed on the execve→first-user-fault path** (LLVM-compiled in both builds, so
+most likely an LLVM-codegen OOB in one of those shared functions — the defect is
+LLVM-lane-specific). Toggling `do_page_fault` native/LLVM merely shifts BSS by
+one page, moving `task_table`/`printk_line_seq` INTO the wild write's target
+(LLVM `do_page_fault`) or OUT of it (native). That is why "force `do_page_fault`
+native" appears to fix the boot — it relocates the victims, it does not correct
+any miscompile. `do_page_fault` is compiled correctly. There is NO
+`ssa_llvm.ad` "physical-destination address computation" bug to fix in
+`do_page_fault`; the 5e/5f narrative conflated a symptom (task_table reads 0)
+with a mechanism (a do_page_fault write) that the source does not contain.
+
+### Prime suspect + precise next probe
+
+The corrupting write uses a PHYSICAL / low-identity / direct-map alias (that is
+why the ZPROBE-on-`phys` is the right instrument and a gdb watchpoint on the
+higher-half VA `0xffffffff85121c80` misses it). Narrowing: `printk_line_seq`
+lives in `drivers/tty/serial/early_8250.ad`, and the only LLVM-compiled shared
+code that runs between `[001030]` and the fault is the **console/serial output
+path** invoked for hamsh's three unstamped `write(2)` lines (`_start`,
+`stage-01`) — `printk_line_seq` being a co-located victim points squarely at that
+module's line-emit path. Two decisive next steps:
+1. **Physical-page watchpoint** on task_table's phys frame (`~0x05121000`), NOT
+   the higher-half VA — QEMU must watch by physical address (or watch the
+   low-identity alias `0x05121c80`) to catch a write through the boot-cr3 low map.
+2. **Force-native bisection of the console/serial + execve-return path**
+   (`early_8250.ad` emit fns, the execve iret tail) via `KLLVM_FORCE_NATIVE`; the
+   first addition that stops the `seq`/task_table zeroing pins the miscompiled
+   function, after which `clang -S` vs native objdump isolates the OOB construct
+   for an `ssa_llvm.ad` fix (gated `ssa_mem_model`).
+
+Net: default lane unchanged — `do_page_fault` stays native-hybrid, boot still
+reaches `rfork: child created, pid=7`. Native kernel byte-identical (kobjdiff
+PASS, 0/11061). The separate Phase-5d `_another_task_ready` pid=7 wall is
+untouched and remains a distinct issue.
