@@ -222,6 +222,80 @@ HOST_BUFFER_OVERRIDES = {
         ("er_sym_idx: Array[8192, uint32]", "er_sym_idx: Array[262144, uint32]"),
         ("er_type: Array[8192, uint32]", "er_type: Array[262144, uint32]"),
     ],
+    "cfg.ad": [
+        # NM_MAX = max DISTINCT names per function. The on-disk cfg.ad keeps 256
+        # (the on-DEVICE self-hosting cap) so the DEFAULT native codegen stays
+        # byte-identical — codegen.ad never consults NM_MAX; only the SSA
+        # optimizer (cfg.ad/ssa.ad/regalloc.ad, used by ADDER_OPT2 and the LLVM
+        # backend) does. A handful of large user apps (hamsh/hamUId/js/hambrowse)
+        # have functions with >256 distinct names; at 256 nm_intern overflows,
+        # cfg_overflow trips, and the SSA/LLVM path bails to the native lane.
+        # Raise the HOST compiler's cap to 1024 so those functions emit through
+        # LLVM. This is exactly the MAX_GLOBALS host-only bump pattern: EVERY
+        # array/constant sized by NM_MAX MUST scale in lockstep or the
+        # liveness/SSA passes write out of bounds. Derived sizes:
+        #   LV_WORDS   = NM_MAX/32                 (liveness bitset words: 8->32)
+        #   lv_*       = BB_MAX(8192) * LV_WORDS   (65536 -> 262144)
+        #   cfgv_seen  = LV_WORDS                  (8 -> 32)
+        #   lr_hole_*  = NM_MAX * LR_MAX_HOLES(4)  (1024 -> 4096)
+        # (loop_break_bb/loop_cont_bb are LOOP_MAX-sized, NOT NM_MAX — untouched.)
+        ("NM_MAX: uint32 = 256", "NM_MAX: uint32 = 1024"),
+        ("nm_off: Array[256, uint32]", "nm_off: Array[1024, uint32]"),
+        ("nm_len: Array[256, uint32]", "nm_len: Array[1024, uint32]"),
+        ("nm_trunc: Array[256, uint32]", "nm_trunc: Array[1024, uint32]"),
+        ("nm_slotread: Array[256, uint32]", "nm_slotread: Array[1024, uint32]"),
+        ("nm_usecost: Array[256, uint32]", "nm_usecost: Array[1024, uint32]"),
+        ("LV_WORDS: uint32 = 8", "LV_WORDS: uint32 = 32"),
+        ("lv_use: Array[65536, uint32]", "lv_use: Array[262144, uint32]"),
+        ("lv_def: Array[65536, uint32]", "lv_def: Array[262144, uint32]"),
+        ("lv_in: Array[65536, uint32]", "lv_in: Array[262144, uint32]"),
+        ("lv_out: Array[65536, uint32]", "lv_out: Array[262144, uint32]"),
+        ("cfgv_seen: Array[8, uint32]", "cfgv_seen: Array[32, uint32]"),
+        ("lr_start: Array[256, uint32]", "lr_start: Array[1024, uint32]"),
+        ("lr_end: Array[256, uint32]", "lr_end: Array[1024, uint32]"),
+        ("lr_valid: Array[256, uint32]", "lr_valid: Array[1024, uint32]"),
+        ("lr_nhole: Array[256, uint32]", "lr_nhole: Array[1024, uint32]"),
+        ("lr_hole_lo: Array[1024, uint32]", "lr_hole_lo: Array[4096, uint32]"),
+        ("lr_hole_hi: Array[1024, uint32]", "lr_hole_hi: Array[4096, uint32]"),
+        ("lr_hole_depth: Array[1024, uint32]", "lr_hole_depth: Array[4096, uint32]"),
+        ("lr_hole_brdepth: Array[1024, uint32]", "lr_hole_brdepth: Array[4096, uint32]"),
+        ("cl_set: Array[256, uint32]", "cl_set: Array[1024, uint32]"),
+    ],
+    "regalloc.ad": [
+        # Mirror the cfg NM_MAX host bump (256 -> 1024): the linear-scan allocator
+        # indexes ra_* arrays by name id up to RA_MAXNAMES (== cfg NM_MAX). If cfg
+        # NM_MAX grows but these stay 256 the allocator reads/writes past the end.
+        ("RA_MAXNAMES: uint32 = 256", "RA_MAXNAMES: uint32 = 1024"),
+        ("ra_assigned_reg: Array[256, uint32]", "ra_assigned_reg: Array[1024, uint32]"),
+        ("ra_store_elim: Array[256, uint32]", "ra_store_elim: Array[1024, uint32]"),
+        ("ra_order: Array[256, uint32]", "ra_order: Array[1024, uint32]"),
+        ("ra_name_vetoed: Array[256, uint32]", "ra_name_vetoed: Array[1024, uint32]"),
+        ("ra_name_isfloat: Array[256, uint32]", "ra_name_isfloat: Array[1024, uint32]"),
+        ("ra_xmm_assigned: Array[256, uint32]", "ra_xmm_assigned: Array[1024, uint32]"),
+        ("ra_xmm_order: Array[256, uint32]", "ra_xmm_order: Array[1024, uint32]"),
+    ],
+    "ssa.ad": [
+        # Mirror the cfg NM_MAX host bump (256 -> 1024). ssa_curdef/ssa_incphi are
+        # indexed [block * NM_MAX + name] => SSA_BB_MAX(1024) * NM_MAX, so they
+        # scale to 1024*1024 = 1048576. The per-name ssa_* attribute arrays are
+        # indexed by name id and scale 256 -> 1024. (sv_*/sb_* arrays are
+        # value-/block-indexed, NOT name-indexed — untouched.)
+        ("ssa_curdef: Array[262144, uint32]", "ssa_curdef: Array[1048576, uint32]"),
+        ("ssa_incphi: Array[262144, uint32]", "ssa_incphi: Array[1048576, uint32]"),
+        ("ssa_islocal: Array[256, uint32]", "ssa_islocal: Array[1024, uint32]"),
+        ("ssa_local_sgn: Array[256, uint32]", "ssa_local_sgn: Array[1024, uint32]"),
+        ("ssa_local_size: Array[256, uint32]", "ssa_local_size: Array[1024, uint32]"),
+        ("ssa_ismem: Array[256, uint32]", "ssa_ismem: Array[1024, uint32]"),
+        ("ssa_mem_addr: Array[256, uint32]", "ssa_mem_addr: Array[1024, uint32]"),
+        ("ssa_mem_esz: Array[256, uint32]", "ssa_mem_esz: Array[1024, uint32]"),
+        ("ssa_mem_esgn: Array[256, uint32]", "ssa_mem_esgn: Array[1024, uint32]"),
+        ("ssa_mem_isarr: Array[256, uint32]", "ssa_mem_isarr: Array[1024, uint32]"),
+        ("ssa_ptr_esz: Array[256, uint32]", "ssa_ptr_esz: Array[1024, uint32]"),
+        ("ssa_ptr_esgn: Array[256, uint32]", "ssa_ptr_esgn: Array[1024, uint32]"),
+        ("ssa_local_struct: Array[256, uint32]", "ssa_local_struct: Array[1024, uint32]"),
+        ("ssa_local_struct_is_ptr: Array[256, uint32]", "ssa_local_struct_is_ptr: Array[1024, uint32]"),
+        ("ssa_local_fw: Array[256, uint32]", "ssa_local_fw: Array[1024, uint32]"),
+    ],
     "elf_emit.ad": [
         ("ELF_BUF_CAP: uint32 = 131072", "ELF_BUF_CAP: uint32 = 25165824"),
         ("elf_buf: Array[131072, uint8]", "elf_buf: Array[25165824, uint8]"),
