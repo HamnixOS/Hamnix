@@ -100,11 +100,25 @@ if python3 -m compiler.adder compile --target=x86_64-linux \
     "$BEFORE_BIN" "$FIX" "$OUT/reflow_before.ppm" "$W" >"$OUT/reflow_before_dump.txt" 2>&1
     python3 scripts/ppm_to_png.py "$OUT/reflow_before.ppm" "$OUT/reflow_before.png" >/dev/null 2>&1
     read BPW BMAXX BOVER BTROWS < <(awk '/^REFLOW / {print $3, $5, $7, $9; exit}' "$OUT/reflow_before_dump.txt")
-    echo "[hb-reflow] control (no reflow): maxx=$BMAXX overflow=$BOVER (pw=$BPW)"
-    if [ -n "${BMAXX:-}" ] && [ "$BMAXX" -gt "$BPW" ]; then
-        echo "[hb-reflow] PASS control overruns the viewport (maxx=$BMAXX > pw=$BPW) — fix is real"
+    echo "[hb-reflow] control (no reflow): maxx=$BMAXX overflow=$BOVER textrows=$BTROWS (pw=$BPW)"
+    # NON-VACUITY: the measure hook must CHANGE line breaking, else the reflow-ON
+    # assertions are tautological. Without the hook the breaker wraps on the fixed
+    # 8px CELL_W grid, which mis-measures the proportional TTF paint and so wraps
+    # to a DIFFERENT result than the true-measure reflow-ON render — either the
+    # grid over-packs and a line OVERRUNS the viewport (BOVER>0 / BMAXX>pw), or it
+    # over-estimates width and OVER-WRAPS to more rows than reflow-ON (BTROWS>TROWS).
+    # (Historically this only checked BMAXX>pw, which assumed the DejaVu advance was
+    # WIDER than the 8px grid; once the sans advance was corrected to Chrome's
+    # narrower Liberation metric the grid became the WIDER estimate, so the control
+    # now over-wraps rather than overruns — both prove the hook is load-bearing.)
+    ctrl_differs=0
+    if [ -n "${BMAXX:-}" ] && [ "$BMAXX" -gt "$BPW" ]; then ctrl_differs=1; fi
+    if [ -n "${BOVER:-}" ] && [ "$BOVER" -gt "${OVER:-0}" ]; then ctrl_differs=1; fi
+    if [ -n "${BTROWS:-}" ] && [ -n "${TROWS:-}" ] && [ "$BTROWS" -ne "$TROWS" ]; then ctrl_differs=1; fi
+    if [ "$ctrl_differs" -eq 1 ]; then
+        echo "[hb-reflow] PASS control (grid wrap) differs from reflow-ON (rows $BTROWS vs $TROWS, maxx $BMAXX vs $MAXX, overflow $BOVER vs $OVER) — hook is load-bearing"
     else
-        echo "[hb-reflow] FAIL control did not overrun; gate may be tautological"; fail=1
+        echo "[hb-reflow] FAIL control matches reflow-ON; gate may be tautological"; fail=1
     fi
 else
     echo "[hb-reflow] FAIL control driver did not compile"; cat "$OUT/reflow_before_compile.log"; fail=1

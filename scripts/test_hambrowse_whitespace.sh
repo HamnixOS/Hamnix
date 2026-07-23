@@ -29,7 +29,14 @@ cd "$(dirname "$0")/.." || exit 1
 OUT="build/host"
 BIN="$OUT/hambrowse_gfx"
 FIX="tests/fixtures/hambrowse_whitespace.html"
-W=400
+# Viewport width. At 400px the (now Chrome-matched, ~12% narrower) sans metric
+# packs the long line2 so tightly that `normal` and `pre-wrap` land on the SAME
+# row count, making the "pre-wrap keeps the newline as an extra row" proxy tie by
+# coincidence. 620px restores an unambiguous signal — line1 ("alpha beta gamma")
+# fits on one row so the preserved newline unambiguously adds a row (normal 3 vs
+# pre-wrap 4) — while all four modes still exercise their distinct behaviour
+# (normal wraps multi-row/no-overflow; nowrap/pre overflow; pre-wrap wraps).
+W=620
 mkdir -p "$OUT"
 fail=0
 
