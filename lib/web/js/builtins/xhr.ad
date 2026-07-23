@@ -1,0 +1,489 @@
+# lib/web/js/builtins/xhr.ad — XMLHttpRequest, the legacy async transport that
+# real-site bundles (google, jQuery-era code, analytics beacons) still reference
+# unconditionally. A missing `XMLHttpRequest` global throws ReferenceError and
+# aborts the whole referencing <script>, so it must exist as a real constructor.
+#
+# Behavior-preserving split: Adder is a single-compilation-unit language
+# (merge_programs merges all imported files into one Program), so every public
+# top-level name here resolves globally across the merged engine.
+#
+# TRANSPORT REUSE: send() resolves through the SAME path as fetch() — the
+# registered over-the-wire transport (fetch_transport_*) for an absolute
+# http(s):// url, otherwise the deterministic __setFetchFixture table. XHR and
+# fetch therefore share one request path; a host gate seeds a fixture and the XHR
+# reads it back exactly like fetch does. On-device the browser front-end wires
+# the real kernel http9 client once and both APIs use it.
+#
+# ASYNC MODEL: an async send() enqueues ONE deferred delivery task on the shared
+# #178 timer queue (drained end-of-turn, before render). The task performs the
+# request, advances readyState HEADERS_RECEIVED(2)->LOADING(3)->DONE(4) firing a
+# `readystatechange` at each, then fires `load` + `loadend` (or `error`/`abort`
+# on failure). A synchronous send() (async=false) runs that same delivery inline
+# before returning. NOT wall-clock — the fixture/transport settle is immediate;
+# the timer queue only defers WHEN the events fire, matching browser turn order.
+
+# Scratch buffer for getAllResponseHeaders() serialization (header blocks are
+# short; top-level BSS per the compiler's 4 KiB-stack discipline).
+xhr_hdr_buf: Array[8192, uint8]
+
+# XMLHttpRequest.prototype value handle (set by install_xhr; -1 until then). GC
+# root + re-init reset live in gc.ad / api.ad alongside the other proto globals.
+g_xhr_proto: int32 = -1
+
+
+# ---- state accessors -------------------------------------------------
+# All XHR state lives on the instance object via hidden "__*" slots plus the
+# public spec properties (readyState/status/...). readystatechange listeners are
+# a flat [type, cb, type, cb, ...] pair list on "__listeners"; on<event> handlers
+# are ordinary settable properties read at fire time.
+
+def _xhr_listeners(xo: int32) -> int32:
+    lv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__listeners"))
+    if tag_of(lv) != TAG_OBJ:
+        lv = v_new_array()
+        obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__listeners")), lv)
+    return lv
+
+
+# Fire one event `type` at the XHR: invoke the on<type> handler (name passed
+# explicitly to avoid runtime string concat), then every addEventListener
+# callback registered for that exact type. Each handler receives a minimal event
+# object {type, target, currentTarget} and runs with `this` = the XHR.
+def xhr_fire(xhrv: int32, type_cstr: Ptr[uint8], on_cstr: Ptr[uint8]):
+    xo: int32 = objid_of(xhrv)
+    ev: int32 = v_new_object()
+    eo: int32 = objid_of(ev)
+    obj_set(eo, str_from_cstr(cast[Ptr[uint8]]("type")), v_string_cstr(type_cstr))
+    obj_set(eo, str_from_cstr(cast[Ptr[uint8]]("target")), xhrv)
+    obj_set(eo, str_from_cstr(cast[Ptr[uint8]]("currentTarget")), xhrv)
+    # on<type> handler
+    handler: int32 = obj_get_cstr(xo, on_cstr)
+    if is_callable(handler) != 0:
+        b0: int32 = call_top
+        call_args[call_top] = ev
+        call_top = call_top + 1
+        invoke(handler, xhrv, b0, 1)
+        call_top = b0
+    # addEventListener callbacks for this type
+    lv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__listeners"))
+    if tag_of(lv) != TAG_OBJ:
+        return
+    lo: int32 = objid_of(lv)
+    n: int32 = arr_len[lo]
+    i: int32 = 0
+    while i + 1 < n:
+        tv: int32 = arr_get(lo, i)
+        if tag_of(tv) == TAG_STR and str_eq_cstr(strid_of(tv), type_cstr) != 0:
+            cb: int32 = arr_get(lo, i + 1)
+            if is_callable(cb) != 0:
+                b1: int32 = call_top
+                call_args[call_top] = ev
+                call_top = call_top + 1
+                invoke(cb, xhrv, b1, 1)
+                call_top = b1
+        i = i + 2
+
+
+# Set readyState and fire the readystatechange event.
+def _xhr_set_state(xhrv: int32, st: int32):
+    obj_set(objid_of(xhrv), str_from_cstr(cast[Ptr[uint8]]("readyState")), v_number(cast[float64](st)))
+    xhr_fire(xhrv, cast[Ptr[uint8]]("readystatechange"), cast[Ptr[uint8]]("onreadystatechange"))
+
+
+# Local copies of two fetch.ad helpers (those are module-private there — column-0
+# `_`-prefixed names are mangled per-file, so they cannot be called across files).
+# `_xhr_is_abs`: url string id begins with an absolute http(s):// scheme.
+def _xhr_is_abs(url_sid: int32) -> int32:
+    n: int32 = str_len(url_sid)
+    p: Ptr[uint8] = str_ptr(url_sid)
+    http: Ptr[uint8] = "http://"
+    if n >= 7:
+        ok: int32 = 1
+        i: int32 = 0
+        while i < 7:
+            if p[i] != http[i]:
+                ok = 0
+                i = 7
+            i = i + 1
+        if ok != 0:
+            return 1
+    https: Ptr[uint8] = "https://"
+    if n >= 8:
+        ok2: int32 = 1
+        j: int32 = 0
+        while j < 8:
+            if p[j] != https[j]:
+                ok2 = 0
+                j = 8
+            j = j + 1
+        if ok2 != 0:
+            return 1
+    return 0
+
+
+# Case-insensitive ASCII compare of two (ptr,len) strings.
+def _xhr_ci_eq(p1: Ptr[uint8], n1: int32, p2: Ptr[uint8], n2: int32) -> int32:
+    if n1 != n2:
+        return 0
+    i: int32 = 0
+    while i < n1:
+        a: uint8 = p1[i]
+        b: uint8 = p2[i]
+        if a >= cast[uint8](65) and a <= cast[uint8](90):
+            a = a + cast[uint8](32)
+        if b >= cast[uint8](65) and b <= cast[uint8](90):
+            b = b + cast[uint8](32)
+        if a != b:
+            return 0
+        i = i + 1
+    return 1
+
+
+# ---- request execution (shared with fetch's transport/fixture path) ----
+# Returns a Response object VALUE (TAG_OBJ) on success, or v_undef() on a network
+# error / unmatched-fixture (XHR surfaces those as an `error` event with status
+# left at 0), exactly mirroring do_fetch's two branches.
+def xhr_do_request(urlsid: int32, method_sid: int32, body_sid: int32, ctype_sid: int32) -> int32:
+    if fetch_transport_set != 0 and _xhr_is_abs(urlsid) != 0:
+        outstatus: int64 = 0
+        outlen: int32 = 0
+        tfn: Fn[Ptr[uint8], int32, Ptr[uint8], int32, Ptr[uint8], int32, Ptr[uint8], int32, Ptr[int64], Ptr[int32], Ptr[uint8]] = \
+            cast[Fn[Ptr[uint8], int32, Ptr[uint8], int32, Ptr[uint8], int32, Ptr[uint8], int32, Ptr[int64], Ptr[int32], Ptr[uint8]]](fetch_transport_addr)
+        rawp: Ptr[uint8] = tfn(str_ptr(urlsid), str_len(urlsid), \
+                               str_ptr(method_sid), str_len(method_sid), \
+                               str_ptr(body_sid), str_len(body_sid), \
+                               str_ptr(ctype_sid), str_len(ctype_sid), \
+                               &outstatus, &outlen)
+        if cast[uint64](rawp) == 0 or outlen <= 0:
+            return v_undef()
+        return make_response_net(rawp, outlen, outstatus, urlsid)
+    i: int32 = 0
+    while i < fx_n:
+        if str_eq(fx_url[i], urlsid) != 0:
+            if fx_status[i] == 0:
+                return v_undef()                    # status-0 row = network error
+            return make_response(fx_status[i], fx_stext[i], fx_body[i], fx_ctype[i], urlsid)
+        i = i + 1
+    return v_undef()                                # no fixture registered
+
+
+# Scan the request-header pair list for a Content-Type (case-insensitive); return
+# its string id, or an empty string id if the caller set none.
+def _xhr_req_ctype(xo: int32) -> int32:
+    empty: int32 = str_from_cstr(cast[Ptr[uint8]](""))
+    rv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__reqheaders"))
+    if tag_of(rv) != TAG_OBJ:
+        return empty
+    ro: int32 = objid_of(rv)
+    n: int32 = arr_len[ro]
+    i: int32 = 0
+    while i + 1 < n:
+        nv: int32 = arr_get(ro, i)
+        if tag_of(nv) == TAG_STR:
+            sid: int32 = strid_of(nv)
+            ct: Ptr[uint8] = "content-type"
+            if _xhr_ci_eq(str_ptr(sid), str_len(sid), ct, 12) != 0:
+                vv: int32 = arr_get(ro, i + 1)
+                if tag_of(vv) == TAG_STR:
+                    return strid_of(vv)
+        i = i + 2
+    return empty
+
+
+# Perform the request and drive the readyState progression + events. Shared by
+# the deferred async task (xhr_deliver) and the inline synchronous send().
+def xhr_run(xhrv: int32):
+    xo: int32 = objid_of(xhrv)
+    # a send()-then-abort() (or a repeated open) cancels an in-flight delivery
+    if to_bool(obj_get_cstr(xo, cast[Ptr[uint8]]("__aborted"))) != 0:
+        return
+    if to_bool(obj_get_cstr(xo, cast[Ptr[uint8]]("__sent"))) == 0:
+        return
+    urlv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__url"))
+    methv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__method"))
+    bodyv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__body"))
+    urlsid: int32 = strid_of(to_string_val(urlv))
+    method_sid: int32 = strid_of(to_string_val(methv))
+    body_sid: int32 = str_from_cstr(cast[Ptr[uint8]](""))
+    if tag_of(bodyv) == TAG_STR:
+        body_sid = strid_of(bodyv)
+    ctype_sid: int32 = _xhr_req_ctype(xo)
+
+    resp: int32 = xhr_do_request(urlsid, method_sid, body_sid, ctype_sid)
+    if tag_of(resp) != TAG_OBJ:
+        # network error / no fixture: DONE with status 0, then error + loadend
+        obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("status")), v_number(0.0))
+        _xhr_set_state(xhrv, 4)
+        xhr_fire(xhrv, cast[Ptr[uint8]]("error"), cast[Ptr[uint8]]("onerror"))
+        xhr_fire(xhrv, cast[Ptr[uint8]]("loadend"), cast[Ptr[uint8]]("onloadend"))
+        return
+    ro: int32 = objid_of(resp)
+    statusn: int32 = cast[int32](to_number(obj_get_cstr(ro, cast[Ptr[uint8]]("status"))))
+    bodys: int32 = obj_get_cstr(ro, cast[Ptr[uint8]]("__body"))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("status")), v_number(cast[float64](statusn)))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("statusText")), obj_get_cstr(ro, cast[Ptr[uint8]]("statusText")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("responseText")), bodys)
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__respheaders")), obj_get_cstr(ro, cast[Ptr[uint8]]("headers")))
+
+    # `response` depends on responseType: '' / 'text' -> the text; 'json' -> the
+    # parsed value (a parse error yields null, per the XHR spec's JSON handling).
+    rtv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("responseType"))
+    respval: int32 = bodys
+    if tag_of(rtv) == TAG_STR and str_eq_cstr(strid_of(rtv), cast[Ptr[uint8]]("json")) != 0:
+        parsed: int32 = json_parse_val(bodys, v_undef())
+        if ctl == CTL_THROW:
+            ctl = CTL_NONE
+            parsed = v_null()
+        respval = parsed
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("response")), respval)
+
+    # readyState HEADERS_RECEIVED -> LOADING -> DONE, a readystatechange each.
+    _xhr_set_state(xhrv, 2)
+    _xhr_set_state(xhrv, 3)
+    _xhr_set_state(xhrv, 4)
+    xhr_fire(xhrv, cast[Ptr[uint8]]("load"), cast[Ptr[uint8]]("onload"))
+    xhr_fire(xhrv, cast[Ptr[uint8]]("loadend"), cast[Ptr[uint8]]("onloadend"))
+
+
+# The deferred async delivery task: a native fn value bound (obj_p_a) to its XHR
+# instance, scheduled on the timer queue by send(). Invoked with native_self =
+# the fn object id, from which we recover the XHR object id.
+def xhr_deliver(fo: int32):
+    xhr_run(obj_p_a[fo])                             # obj_p_a holds the XHR value
+
+
+# ---- constructor + methods -------------------------------------------
+def _xhr_construct(thisv: int32) -> int32:
+    xo: int32 = objid_of(thisv)
+    if tag_of(thisv) != TAG_OBJ:
+        thisv = v_new_object()
+        xo = objid_of(thisv)
+        if g_xhr_proto >= 0:
+            obj_proto[xo] = objid_of(g_xhr_proto)
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("readyState")), v_number(0.0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("status")), v_number(0.0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("statusText")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("responseText")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("response")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("responseType")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("responseURL")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("withCredentials")), v_boolv(0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("timeout")), v_number(0.0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__reqheaders")), v_new_array())
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__listeners")), v_new_array())
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__sent")), v_boolv(0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__aborted")), v_boolv(0))
+    return v_undef()
+
+
+def _xhr_open(thisv: int32, base: int32, argc: int32) -> int32:
+    xo: int32 = objid_of(thisv)
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__method")), to_string_val(arg_or(base, argc, 0)))
+    urlv: int32 = to_string_val(arg_or(base, argc, 1))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__url")), urlv)
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("responseURL")), urlv)
+    # async defaults to true; only an explicit `false` selects synchronous.
+    async_flag: int32 = 1
+    av: int32 = arg_or(base, argc, 2)
+    if argc >= 3 and to_bool(av) == 0:
+        async_flag = 0
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__async")), v_boolv(async_flag))
+    # a re-open resets transient state
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__sent")), v_boolv(0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__aborted")), v_boolv(0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("status")), v_number(0.0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__reqheaders")), v_new_array())
+    _xhr_set_state(thisv, 1)                         # OPENED
+    return v_undef()
+
+
+def _xhr_send(thisv: int32, base: int32, argc: int32) -> int32:
+    xo: int32 = objid_of(thisv)
+    # store the request body (if any)
+    bv: int32 = arg_or(base, argc, 0)
+    if argc >= 1 and tag_of(bv) != TAG_UNDEF and tag_of(bv) != TAG_NULL:
+        obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__body")), to_string_val(bv))
+    else:
+        obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__body")), v_string_cstr(cast[Ptr[uint8]]("")))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__sent")), v_boolv(1))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__aborted")), v_boolv(0))
+    if to_bool(obj_get_cstr(xo, cast[Ptr[uint8]]("__async"))) == 0:
+        xhr_run(thisv)                              # synchronous: run inline
+        return v_undef()
+    # async: schedule ONE deferred delivery task on the shared timer queue.
+    deliverfn: int32 = v_new_native(NAT_XHR_DELIVER)
+    obj_p_a[objid_of(deliverfn)] = thisv            # bind the XHR value handle
+    b: int32 = call_top
+    call_args[call_top] = deliverfn
+    call_top = call_top + 1
+    timer_schedule(b, 1, 0, 0)                       # fn only, delay 0, macrotask
+    call_top = b
+    return v_undef()
+
+
+def _xhr_set_req_header(thisv: int32, base: int32, argc: int32) -> int32:
+    xo: int32 = objid_of(thisv)
+    rv: int32 = obj_get_cstr(xo, cast[Ptr[uint8]]("__reqheaders"))
+    if tag_of(rv) != TAG_OBJ:
+        rv = v_new_array()
+        obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__reqheaders")), rv)
+    ro: int32 = objid_of(rv)
+    arr_push(ro, to_string_val(arg_or(base, argc, 0)))
+    arr_push(ro, to_string_val(arg_or(base, argc, 1)))
+    return v_undef()
+
+
+def _xhr_get_resp_header(thisv: int32, base: int32, argc: int32) -> int32:
+    hv: int32 = obj_get_cstr(objid_of(thisv), cast[Ptr[uint8]]("__respheaders"))
+    if tag_of(hv) != TAG_OBJ:
+        return v_null()
+    return headers_get(hv, strid_of(to_string_val(arg_or(base, argc, 0))))
+
+
+# getAllResponseHeaders() -> the "name: value\r\n" block over every parsed
+# response header, in the Headers' stored (lowercased) order.
+def _xhr_get_all_resp_headers(thisv: int32) -> int32:
+    hv: int32 = obj_get_cstr(objid_of(thisv), cast[Ptr[uint8]]("__respheaders"))
+    if tag_of(hv) != TAG_OBJ:
+        return v_string_cstr(cast[Ptr[uint8]](""))
+    ho: int32 = objid_of(hv)
+    hn: int32 = obj_get_cstr(ho, cast[Ptr[uint8]]("__hn"))
+    hvv: int32 = obj_get_cstr(ho, cast[Ptr[uint8]]("__hv"))
+    if tag_of(hn) != TAG_OBJ:
+        return v_string_cstr(cast[Ptr[uint8]](""))
+    hno: int32 = objid_of(hn)
+    hvo: int32 = objid_of(hvv)
+    n: int32 = arr_len[hno]
+    m: int32 = 0
+    i: int32 = 0
+    while i < n:
+        nv: int32 = arr_get(hno, i)
+        vv: int32 = arr_get(hvo, i)
+        if tag_of(nv) == TAG_STR:
+            m = _xhr_buf_append_str(m, strid_of(nv))
+            m = _xhr_buf_append_c(m, cast[uint8](58))    # ':'
+            m = _xhr_buf_append_c(m, cast[uint8](32))    # ' '
+        if tag_of(vv) == TAG_STR:
+            m = _xhr_buf_append_str(m, strid_of(vv))
+        m = _xhr_buf_append_c(m, cast[uint8](13))        # CR
+        m = _xhr_buf_append_c(m, cast[uint8](10))        # LF
+        i = i + 1
+    return v_string_id(str_new(&xhr_hdr_buf[0], m))
+
+
+def _xhr_buf_append_c(m: int32, c: uint8) -> int32:
+    if m < 8191:
+        xhr_hdr_buf[m] = c
+        return m + 1
+    return m
+
+
+def _xhr_buf_append_str(m: int32, sid: int32) -> int32:
+    p: Ptr[uint8] = str_ptr(sid)
+    n: int32 = str_len(sid)
+    i: int32 = 0
+    while i < n and m < 8191:
+        xhr_hdr_buf[m] = p[i]
+        m = m + 1
+        i = i + 1
+    return m
+
+
+def _xhr_abort(thisv: int32) -> int32:
+    xo: int32 = objid_of(thisv)
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__aborted")), v_boolv(1))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("__sent")), v_boolv(0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("readyState")), v_number(0.0))
+    obj_set(xo, str_from_cstr(cast[Ptr[uint8]]("status")), v_number(0.0))
+    xhr_fire(thisv, cast[Ptr[uint8]]("abort"), cast[Ptr[uint8]]("onabort"))
+    xhr_fire(thisv, cast[Ptr[uint8]]("loadend"), cast[Ptr[uint8]]("onloadend"))
+    return v_undef()
+
+
+def _xhr_add_listener(thisv: int32, base: int32, argc: int32) -> int32:
+    lv: int32 = _xhr_listeners(objid_of(thisv))
+    lo: int32 = objid_of(lv)
+    arr_push(lo, to_string_val(arg_or(base, argc, 0)))
+    arr_push(lo, arg_or(base, argc, 1))
+    return v_undef()
+
+
+def _xhr_remove_listener(thisv: int32, base: int32, argc: int32) -> int32:
+    lv: int32 = obj_get_cstr(objid_of(thisv), cast[Ptr[uint8]]("__listeners"))
+    if tag_of(lv) != TAG_OBJ:
+        return v_undef()
+    lo: int32 = objid_of(lv)
+    typ: int32 = strid_of(to_string_val(arg_or(base, argc, 0)))
+    cb: int32 = arg_or(base, argc, 1)
+    n: int32 = arr_len[lo]
+    i: int32 = 0
+    while i + 1 < n:
+        tv: int32 = arr_get(lo, i)
+        if tag_of(tv) == TAG_STR and str_eq(strid_of(tv), typ) != 0 and arr_get(lo, i + 1) == cb:
+            # tombstone the pair (empty type never matches a fire)
+            arr_set(lo, i, v_string_cstr(cast[Ptr[uint8]]("")))
+            arr_set(lo, i + 1, v_undef())
+        i = i + 2
+    return v_undef()
+
+
+# ---- native dispatch (chained from call_native_intl's tail) -----------
+def call_native_xhr(id: int32, thisv: int32, base: int32, argc: int32) -> int32:
+    if id == NAT_XHR_CTOR:
+        return _xhr_construct(thisv)
+    if id == NAT_XHR_OPEN:
+        return _xhr_open(thisv, base, argc)
+    if id == NAT_XHR_SEND:
+        return _xhr_send(thisv, base, argc)
+    if id == NAT_XHR_SETREQHDR:
+        return _xhr_set_req_header(thisv, base, argc)
+    if id == NAT_XHR_GETRESPHDR:
+        return _xhr_get_resp_header(thisv, base, argc)
+    if id == NAT_XHR_GETALLRESPHDRS:
+        return _xhr_get_all_resp_headers(thisv)
+    if id == NAT_XHR_ABORT:
+        return _xhr_abort(thisv)
+    if id == NAT_XHR_ADDLISTENER:
+        return _xhr_add_listener(thisv, base, argc)
+    if id == NAT_XHR_REMOVELISTENER:
+        return _xhr_remove_listener(thisv, base, argc)
+    if id == NAT_XHR_OVERRIDEMIME:
+        return v_undef()                             # no-op (headless)
+    if id == NAT_XHR_DELIVER:
+        xhr_deliver(native_self)
+        return v_undef()
+    return v_undef()
+
+
+# ---- installer: XMLHttpRequest constructor + prototype + constants ----
+# Appended to the globals from install_builtins. The prototype carries every
+# method + the readyState constant block; the constructor mirrors the constants
+# as statics (`XMLHttpRequest.DONE`). Instances link to the prototype via
+# eval_new (which honors the explicitly-set `.prototype`), so `x instanceof
+# XMLHttpRequest`, `x.DONE`, and `x.open` all resolve.
+def install_xhr():
+    proto: int32 = v_new_object()
+    obj_add_native(proto, cast[Ptr[uint8]]("open"), NAT_XHR_OPEN)
+    obj_add_native(proto, cast[Ptr[uint8]]("send"), NAT_XHR_SEND)
+    obj_add_native(proto, cast[Ptr[uint8]]("setRequestHeader"), NAT_XHR_SETREQHDR)
+    obj_add_native(proto, cast[Ptr[uint8]]("getResponseHeader"), NAT_XHR_GETRESPHDR)
+    obj_add_native(proto, cast[Ptr[uint8]]("getAllResponseHeaders"), NAT_XHR_GETALLRESPHDRS)
+    obj_add_native(proto, cast[Ptr[uint8]]("abort"), NAT_XHR_ABORT)
+    obj_add_native(proto, cast[Ptr[uint8]]("addEventListener"), NAT_XHR_ADDLISTENER)
+    obj_add_native(proto, cast[Ptr[uint8]]("removeEventListener"), NAT_XHR_REMOVELISTENER)
+    obj_add_native(proto, cast[Ptr[uint8]]("overrideMimeType"), NAT_XHR_OVERRIDEMIME)
+    _xhr_add_constants(proto)
+    g_xhr_proto = proto
+    g_xhr: int32 = v_new_native(NAT_XHR_CTOR)
+    obj_set(objid_of(g_xhr), str_from_cstr(cast[Ptr[uint8]]("prototype")), proto)
+    obj_set(objid_of(proto), str_from_cstr(cast[Ptr[uint8]]("constructor")), g_xhr)
+    _xhr_add_constants(g_xhr)
+    env_define(g_env, str_from_cstr(cast[Ptr[uint8]]("XMLHttpRequest")), g_xhr, 0)
+
+
+def _xhr_add_constants(v: int32):
+    obj_add_num(v, cast[Ptr[uint8]]("UNSENT"), 0.0)
+    obj_add_num(v, cast[Ptr[uint8]]("OPENED"), 1.0)
+    obj_add_num(v, cast[Ptr[uint8]]("HEADERS_RECEIVED"), 2.0)
+    obj_add_num(v, cast[Ptr[uint8]]("LOADING"), 3.0)
+    obj_add_num(v, cast[Ptr[uint8]]("DONE"), 4.0)
