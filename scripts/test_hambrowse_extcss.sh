@@ -13,7 +13,7 @@
 #   * .sidebar float:right         -> the SIDEBAR paragraph pins right (x>=500);
 #   * .lede font-weight:bold       -> the LEDE paragraph turns bold (b1);
 #   * .warn color:#b00020          -> the WARNBLOCK paragraph turns red.
-# WITHOUT the sheet all four sit at the left margin, unstyled (x=158, b0, black).
+# WITHOUT the sheet all four sit at the left margin, unstyled (x=8, b0, black).
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -66,13 +66,13 @@ refute_in '^SEG 0 (3|4)[0-9][0-9] .*EXTHEAD' "$PRE" \
     "masthead is left-aligned without the external sheet"
 
 # --- .lede font-weight:bold ------------------------------------------
-assert_in '^SEG [0-9]+ 158 #[0-9a-f]+ b1 u0 l-1 bg- .LEDE' "$POST" \
+assert_in '^SEG [0-9]+ 8 #[0-9a-f]+ b1 u0 s0 l-1 bg- .LEDE' "$POST" \
     "linked .lede{font-weight:bold} makes the lede bold"
-refute_in '^SEG [0-9]+ 158 #[0-9a-f]+ b1 u0 l-1 bg- .LEDE' "$PRE" \
+refute_in '^SEG [0-9]+ 8 #[0-9a-f]+ b1 u0 s0 l-1 bg- .LEDE' "$PRE" \
     "lede is not bold without the external sheet"
 
 # --- .warn color:#b00020 ---------------------------------------------
-assert_in '^SEG [0-9]+ 158 #b00020 b1 u0 l-1 bg- .WARNBLOCK' "$POST" \
+assert_in '^SEG [0-9]+ 8 #b00020 b1 u0 s0 l-1 bg- .WARNBLOCK' "$POST" \
     "linked .warn{color:#b00020} colours the warning paragraph red"
 refute_in '#b00020' "$PRE" \
     "warning paragraph is not red without the external sheet"
