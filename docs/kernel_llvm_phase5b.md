@@ -206,3 +206,85 @@ reader is the next probe.
 **Net furthest point (opt-in lane, default build): `rfork: child created,
 pid=7`** — identical to Phase 5d (first cross-task schedule; child READY but not
 dispatched). See the Phase-5d TODO notes for that residual.
+
+## Phase 5f — do_page_fault is NOT a task_table mis-READ; task_table is physically ZEROED (diagnosis, native-safe)
+
+Deep static+dynamic bisection of the Phase-5e `do_page_fault` wall. **The prior
+"do_page_fault's LLVM codegen mis-reads task_table[]" diagnosis is DISPROVEN.**
+Root cause re-localised: the task_table accessor codegen is CORRECT; the physical
+memory backing task_table is **zeroed/corrupted** between execve and the first
+user page-fault when `do_page_fault` is compiled via LLVM. Kept the native-hybrid
+route (default build still boots to pid=7); no compiler/kernel source change, so
+the native kernel stays byte-identical.
+
+### Method — reproduce + A/B + runtime probes (all reverted)
+
+Built the LLVM lane with `do_page_fault` LEFT as LLVM (empty default
+force-native), booted BIOS-ISO `-serial file`, and compared against the default
+(do_page_fault native) build under the SAME cr3. Added temporary EMERG serial
+probes (all reverted; native untouched) at: `do_page_fault` entry, the nxdiag
+dump (10-slot scan), and the WRITER `set_task_image_range`.
+
+### Evidence chain (all reliable field-access reads; & / probe-arithmetic in
+large instrumented fns is itself unreliable and was discarded)
+
+- **Same fault, same cr3, opposite result.** First user fault `va=0x0ed1d60`,
+  `cr3=0x0e01d000`, current-idx=6 in BOTH builds. Native `do_page_fault` reads
+  `task_table[6].image_lo=0x400000` / `vlh=0x0e014020` → demand-faults → advances
+  to `rfork pid=7`. LLVM `do_page_fault` reads `task_table[6].*=0` (ALL 10 slots
+  read 0) → `NO covering VMA` → SIGSEGV at hamsh stage-01.
+- **Accessor codegen is CORRECT.** `objdump` of `task_image_lo`,
+  `set_task_image_range`, `_another_task_ready` all materialise `task_table` via
+  `mov $0xffffffff85..,%rax` with **R_X86_64_32S** (correct sign-extend for the
+  higher-half symbol) + `imul $0x38d0` + displacement. Byte-identical form in the
+  small accessor and the large callers. `do_page_fault` reads task_table only via
+  CALLS to these accessors (no direct task_table reloc). The demand-path IR
+  threads the right args: `vma_demand_fault(slot=current_idx_get(), pml4=cr3&MASK,
+  fault_va)` — all three verified through the phi web.
+- **Not a mapping/coverage issue.** A full 4-level walk of `task_table[6]` VA
+  `0xffffffff851220b0` gives the SAME translation under the WRITER's boot cr3 and
+  the READER's user cr3: `pml4e[511]=0x103023, pdpte[510]=0x800e023 (PDPT[510]
+  post-`module_map`-split, 2-MiB granular), pde[40]=0x050000e3` → same 2-MiB huge
+  leaf → same phys `0x051220b0`. So write and read target the SAME physical page.
+- **Not a stack overflow.** live `rsp=0xffff88800e02ff38` (a healthy direct-map
+  kstack address; kstack is 64 KiB). `do_page_fault`'s -O0 frame is only 0x588.
+- **The physical page is genuinely ZEROED at read time.** In the LLVM build, BOTH
+  the kernel-VA read (`*0xffffffff85122c70`) AND the direct-map alias read
+  (`*0xffff888005122c70`) of `task_table[6].image_lo` return **0** — the phys page
+  contains 0. Yet the WRITER's read-back of the very same field during execve
+  returned `0x400000`. → the physical page was **written correctly then zeroed**
+  between execve and the fault. The `do_page_fault` ENTRY probe (before the
+  handler does anything) already sees 0, and NO earlier USER fault was observed
+  (the first `dpfP` is the stage-01 BSS fault itself), so the corruption happened
+  in an earlier KERNEL-mode `do_page_fault` invocation — most plausibly the
+  demand fault taken by the execve arg-copy / return-to-user uaccess against
+  hamsh's demand stack VMA, whose demand-zero landed on task_table's physical
+  page instead of the stack page.
+
+### Conclusion — shared vs separate
+
+- **`do_page_fault`:** a WRITE-side corruption, not a read miscompile. The LLVM
+  `do_page_fault` demand/COW page path (alloc-page + zero, or a physical
+  destination computation exercised only on the fault path) writes zeros over
+  task_table's own physical page during an earlier demand fault. `vma_demand_fault`
+  and the accessors are shared and work when `do_page_fault` is native, so the
+  defect is inside `do_page_fault`'s own compiled body (matches the Phase-5e A/B:
+  forcing ONLY `do_page_fault` native fixes every demand fault).
+- **`_another_task_ready` (Phase-5d pid=7 wall):** likely a SEPARATE cause, not
+  the same bug — Phase 5e already routes `do_page_fault` native (so task_table is
+  NOT corrupted) yet the boot still walls at pid=7 with `_another_task_ready`
+  returning 0. The unifying SURFACE symptom ("a large LLVM fn sees task_table[]
+  as zero on a rarely-first-hit path") is shared, but the do_page_fault mechanism
+  (physical zeroing by the fault path) does not explain a pid=7 wall that persists
+  with do_page_fault native. The shared-single-root-cause hypothesis is therefore
+  NOT supported by the evidence.
+
+### Fix status / next probe
+
+Not fixed — kept `do_page_fault` on the native-hybrid route (lane still boots to
+pid=7). The exact miscompiled construct is the physical-destination address
+computation on `do_page_fault`'s demand/COW page path; the next probe is to trap
+the EARLIER (pre-stage-01, hamsh `_start` stack) demand fault and dump the phys
+page `vma_demand_fault`/COW writes to, confirming it lands on task_table's
+`0x05122c70` page. A proper `ssa_llvm.ad` fix (gated `ssa_mem_model`) awaits that
+pin. Native kernel byte-identical (no compiler/kernel source change this phase).
