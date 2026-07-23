@@ -380,3 +380,108 @@ Net: default lane unchanged — `do_page_fault` stays native-hybrid, boot still
 reaches `rfork: child created, pid=7`. Native kernel byte-identical (kobjdiff
 PASS, 0/11061). The separate Phase-5d `_another_task_ready` pid=7 wall is
 untouched and remains a distinct issue.
+
+## Phase 5j — the slot-6 zeroing is TIME-BRACKETED to the execve→first-user-fault gap; write-path, timer-IRQ, and _vma_zero_phys all RULED OUT (evidence-backed, native-safe)
+
+Reproduced the Phase-5i wall with `do_page_fault` LEFT as LLVM
+(`KLLVM_DEFAULT_FORCE_NATIVE=""`) and bracketed the slot-6 zeroing in TIME with
+always-printing serial probes (all reverted; native kernel byte-identical, no
+`codegen.ad`/`ssa_llvm.ad` change). The probes read the victims through the SAME
+accessors the kernel uses (`task_image_lo(6)`, `task_vma_list_head(6)`,
+`vma_tree_root[6]`), so the "correct vs 0" verdict is layout-independent.
+
+### Reproduced wall (unchanged)
+First USER fault `va=0x0ed1d60` (hamsh `str_arena_init`'s first BSS store, inside
+the registered demand VMA `[0x479000,0x1110000)`) takes SIGSEGV because
+`tree-find=0` / `image=[0,0]` / no covering VMA — `task_table[6].image_lo`,
+`task_table[6].vma_list_head` AND `vma_tree_root[6]` all read 0, and
+`printk_line_seq` collapsed ~1050→~33.
+
+### Decisive TIME-bracket (reliable always-print probes)
+- `[dbg1]` reg-insert, `[dbg2]` reg-end, `[dbg4]` **immediately before the sysret
+  to userspace** (`do_execve_finish`): ALL show the victims CORRECT
+  (`img=0x400000 vlh=0xe014020 vtree=0xe014020`). The whole execve leaves slot-6
+  state intact.
+- `[dbg5]` at `do_page_fault` ENTRY (first executable line) for the `0xed1d60`
+  fault: ALL THREE read **0**. → the zeroing happens strictly BETWEEN the
+  pre-sysret point and the first user fault.
+- **`current_idx_get()` is a rock-steady `6` at every probe (dbg1..dbg5)** — the
+  running-slot / percpu-`current` value is NOT miscompiled. Kills the
+  "wrong-slot / wrong-index read" class outright.
+
+### What runs in that gap — and every candidate RULED OUT
+hamsh is a **native ELF64** ("native syscall ABI") — its `_start`/`stage-01`
+lines are three `sys_write(fd≤2,…)` syscalls (`do_syscall` → `_sysarm_write` →
+`vfs_write` → console cdev), NOT the Linux-ABI dispatch. Bracketing that path:
+- `_sysarm_write` entry / before `vfs_write` / after `vfs_write` / after
+  `_sysarm_write` (dbg6/8/9/7) — **victims CORRECT across all three writes.** The
+  console write path does NOT corrupt.
+- `do_syscall` entry probe — CORRECT.
+- `timer_interrupt` entry + around `current_task_account_tick`, gated
+  `current_idx_get()==6 && ring-3` (dbg10/11/12) — **NEVER fired**: no timer/
+  scheduler tick lands on slot-6 userland in the gap. Kills the tick/preempt
+  accounting hypothesis.
+- **`_vma_zero_phys` ZPROBE** (EMERG if `phys<0x08000000` OR `n>0x200000`) —
+  **NEVER fired** (re-confirms Phase 5g on the post-5i layout). The anon
+  demand-zero page path is NOT the writer. Victim phys are all `<0x08000000`
+  (`printk_line_seq`~`0x395d280`, `vma_tree_root[6]`~`0x4f14470`,
+  `task_table[6]`~`0x512e760`), so a low-phys `_vma_zero_phys` WOULD have tripped
+  it — it did not.
+- A 5th INDEPENDENT victim: `_dbg_zchk_armed`, a FRESH `mm/vma.ad` BSS global set
+  to 1 during execve, reads **0** at the fault → confirms a genuine multi-global
+  MEMORY zeroing (not a read miscompile) spanning globals in ≥4 modules
+  (`early_8250` `printk_line_seq`, `sched/core` `task_table`, `mm/vma`
+  `vma_tree_root` + `_dbg_zchk_armed`). Final-`.bss` addresses of the victims span
+  ~25 MiB and are NON-contiguous → NOT one contiguous `memset`; either several
+  targeted zeroing stores or a strided/sparse clear.
+
+### The paradox = the finding
+In the gap between the last console write (dbg7, CORRECT) and the BSS fault
+(dbg5, ZEROED) there is **no probed synchronous LLVM kernel function**: only
+`do_execve_finish`/syscall-return ASM (hand-written, native), a few CPL-3
+`str_arena_init` prologue instructions (cannot write kernel BSS), and the `#PF`
+trap-entry ASM. Yet a multi-global BSS zeroing occurs. `str_arena_init`'s FIRST
+store is the one that faults, so its arena-`memset` has not run — the "user zeroes
+mismapped pages into kernel BSS" theory is excluded (nothing user-side wrote yet).
+
+### Prime remaining suspects (for the next agent) + exact next probes
+1. **The syscall-return / `#PF` trap-entry ASM consuming an LLVM-miscompiled
+   per-CPU / KPTI / GS value** (wrong trap-stack or CR3 on the way in). Caveat:
+   an errant frame push would leave register DATA (nonzero) in the victims — but
+   dbg5 reads exactly `0`, which argues for a memset, not a frame overwrite.
+2. **An asynchronous DMA write** to a mis-programmed descriptor (console/serial
+   or block/initramfs device) completing in the gap and landing on kernel BSS.
+3. **A fault at a `va` OUTSIDE `[0x400000,0x2^33)` that dbg5's gate hid**, whose
+   handler does the zeroing. NEXT: re-run dbg5 with the gate replaced by a
+   NON-corruptible signal (`current_idx_get()==6`, NOT the `_dbg_zchk_armed` flag
+   — that flag is itself a victim, which is why an earlier `_dbg_is_armed()`-gated
+   probe silently never fired), capturing EVERY hamsh fault + its `va`.
+
+### Tooling notes (load-bearing; save the next agent the dead-ends)
+- **qemu gdbstub hardware watchpoints WORK and PERSIST** (a single `watch` on
+  `printk_line_seq` fires on every printk, monotonic; DR regs are NOT clobbered by
+  the kernel). Multi-watchpoint (≤4) also works.
+- **But two silent confounders wasted ~6 watchpoint runs:** (a) every probe
+  rebuild SHIFTS `.bss` by ~0x1000, so watchpoint addresses MUST be recomputed
+  from the CURRENT `nm` each build (`task_table`+`slot*0x38d0`+**offset 0xbc0**
+  for `image_lo`, **0xbb8** for `vma_list_head` — the source-comment offsets 1592/
+  1584 are STALE; use `objdump` of `task_image_lo`/`task_vma_list_head`); (b) a
+  stale `-S -gdb` qemu holding `:1234` is trivially reconnected to — kill the qemu
+  CHILD pid (not the `timeout` wrapper) and verify the connect-PC is the reset
+  vector, else you are debugging a halted stale VM.
+- **Watchpoint-armed boot is impractically slow** (TCG deopt: >8 min without
+  reaching the first serial line when watching only late-written addresses). For
+  late-boot events prefer full-speed SOURCE instrumentation (as done here) or arm
+  the watchpoint late via KVM.
+- `_vma_zero_phys` writes via **boot-CR3 low-identity** (`memset(phys,…)`), so its
+  writes hit linear addr `== phys`, NOT the higher-half VA — watch the LOW-
+  identity linear address to catch physical-destination writes.
+
+Net: default lane unchanged (`do_page_fault` native-hybrid → `rfork pid=7`);
+LLVM-`do_page_fault` lane still walls at hamsh stage-01. Native kernel
+byte-identical (no compiler/kernel source change this phase; all probes reverted,
+`git status` clean). Diagnosis advanced from Phase-5i's "broad slot-6 region-
+zeroing (unknown when)" to a hard TIME bracket (execve-sysret → first user fault)
+with the write path, timer IRQ, `_vma_zero_phys`, and the wrong-slot/percpu read
+class all EXCLUDED. The separate `_another_task_ready` pid=7 wall remains
+distinct.
