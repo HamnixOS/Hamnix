@@ -130,10 +130,10 @@ assert_grep2 '^SEG [0-9]+ 32 .*Quoted text that is indented' \
 # Text before/after the blockquote stays at the x=8 body margin.
 assert_grep2 '^SEG [0-9]+ 8 .*Back to the left margin' \
     "post-blockquote text returns to the x=8 margin"
-# <h4>/<h5>/<h6> render as dark-blue bold headings, with NO rule row.
-assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Sub sub heading'  "h4 -> dark-blue bold heading"
-assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smaller heading'  "h5 -> dark-blue bold heading"
-assert_grep2 '^SEG [0-9]+ 8 #14306e b1 .*Smallest heading' "h6 -> dark-blue bold heading"
+# <h4>/<h5>/<h6> render as body-colour bold headings (Chrome UA default: no blue), NO rule row.
+assert_grep2 '^SEG [0-9]+ 8 #101010 b1 .*Sub sub heading'  "h4 -> body-colour bold heading"
+assert_grep2 '^SEG [0-9]+ 8 #101010 b1 .*Smaller heading'  "h5 -> body-colour bold heading"
+assert_grep2 '^SEG [0-9]+ 8 #101010 b1 .*Smallest heading' "h6 -> body-colour bold heading"
 
 # <img> PIXEL rung: an <img> is now a real image BOX on its own block row (the
 # pixel renderer blits the decoded PNG into it — see scripts/test_hambrowse_img.sh).
@@ -859,14 +859,14 @@ assert_grepA() {
 
 # The leading <h1> sits at row 0 (no spurious top-margin at the document start)
 # and still lays its heading rule.
-assert_grepA '^SEG 0 8 #14306e b1 u0 s0 l-1 bg- \|The Hamnix Project\|' \
+assert_grepA '^SEG 0 8 #101010 b1 u0 s0 l-1 bg- \|The Hamnix Project\|' \
     "leading h1 at row 0 (heading top-margin suppressed at document start)"
 assert_grepA '^RULE row 0 type 1$' "leading h1 emits a heading rule"
 # A mid-document heading gets ONE blank section-spacing line above it — and that
 # margin COLLAPSES with the preceding paragraph's bottom margin (Chrome parity),
 # so the h2 "Design goals" lands at row 11 (preceding prose on row 9, the single
 # collapsed margin on the empty row 10), NOT the old double-gap row 12.
-assert_grepA '^SEG 11 8 #14306e b1 u0 s0 l-1 bg- \|Design goals\|' \
+assert_grepA '^SEG 11 8 #101010 b1 u0 s0 l-1 bg- \|Design goals\|' \
     "mid-doc h2 gets a collapsed section top-margin (lands at row 11, one gap not two)"
 if grep -Eq '^SEG 10 ' "$DUMPA"; then
     echo "[hb-host] FAIL heading top-margin row 10 is not blank"; fail=1
@@ -1090,7 +1090,7 @@ assert_grepC() {
 }
 
 # The real, uncommented content all renders (the <!DOCTYPE> did not break parse).
-assert_grepC '^SEG 0 8 #14306e b1 .*\|Comments Fixture\|' "h1 renders (DOCTYPE not mistaken for a comment)"
+assert_grepC '^SEG 0 8 #101010 b1 .*\|Comments Fixture\|' "h1 renders (DOCTYPE not mistaken for a comment)"
 assert_grepC '\|Visible lead paragraph\.\|'  "content before the comment renders"
 assert_grepC '\|Between the two comments\.\|' "content between comments renders"
 assert_grepC '\|Final visible paragraph\.\|'  "content after the comments renders"
