@@ -982,3 +982,90 @@ kobjdiff PASS). The wild store's exact writing instruction remains the single op
 blocker; it is now pinned to the first-`kmod_linux_load`-entry TIME window with a
 fixed absolute `.bss` target and every synchronous-instruction / IRQ / exception /
 read-miscompile / mapping explanation on that path ruled out.
+
+## Phase 5p — THE "WILD .bss STORE" DOES NOT EXIST: root cause is the HYBRID `--allow-multiple-definition` DUPLICATE-GLOBAL split (writer and reader bind DIFFERENT copies of the export table); FIXED by giving every global one definition — default lane now boots PAST the kmod #GP, past pid=7/rfork, to `start_kernel`'s `start_first_task` + `/bin/hamsh` execve (new furthest point)
+
+Phases 5g–5o chased a "layout-sensitive wild `.bss` store" that zeroes the export
+table at the first `kmod_linux_load`. **There is no such store.** Live-target gdb
+(full-speed TCG, `hbreak` — which, unlike KVM hbreak, is NOT DR-clobbered and,
+unlike sw-break, needs no int3 write into an unmapped higher-half VA) captured the
+truth. The prior phases were reading a DEAD DUPLICATE copy of the global that is
+trivially, permanently 0.
+
+### 1. The tooling that finally worked (records for the next agent)
+- `hbreak *<addr>` under **TCG** fires reliably at any VA once execution reaches
+  it (QEMU checks a VA breakpoint list; no guest-DR, no memory write). The
+  5j/5k/5o watchpoint dead-ends were KVM-DR-clobber and int3-into-unmapped, both
+  TCG-`hbreak`-immune. nm's `kmod_linux_load` (`0xffffffff8042eff0` here) IS the
+  live copy — `hbreak` there fired first try.
+- QEMU TCG gdb **watchpoints are VIRTUAL-address** based (a watch on the
+  higher-half VA does NOT catch a store through the low/alias VA of the same
+  physical). This — plus the two-copy split below — is why every 5j–5o watchpoint
+  "failed".
+
+### 2. Disproof of the wild store (this build: NR_EXPORTS native-copy phys layout differs from 5o)
+- `_add_export`/`linux_abi_exports_init` (the WRITERS) populate NR_EXPORTS/
+  export_names at **`0xffffffff896c2002`/`0x896c200a`** (RIP-relative `lea`,
+  disassembled from the live `_add_export`).
+- A `watch *(int*)0xffffffff896c2002 if …==0` under TCG trips exactly ONCE — the
+  legitimate early-boot `.bss` clear (`rep stos`, `rdi=__bss_start..__bss_end`,
+  `rax=0`, RIP `0xffffffff80114018`) — and NEVER again through boot:35. i.e. the
+  populated copy is written to 2756 and **is never zeroed**.
+- At the `kmod_linux_load` entry `hbreak`: NR_EXPORTS **LLVM-copy `0x896c2002` =
+  2756 (INTACT)**, native-copy `0x8510dc40` = 0. The "genuine physical zero" of
+  5n/5o was a CR3-independent read of the *native* copy, which is 0 because it was
+  never populated — not because anything wrote 0 to it.
+
+### 3. Actual root cause — inconsistent binding of DUPLICATED globals
+Both `kernel_main_llvm.o` (whole-kernel LLVM) and `native_main.o` (hybrid
+fallback for the ~5 bailed fns) **define every module global** (NR_EXPORTS,
+export_names, task_table, …) as a strong `dso_local` symbol. `ld
+--allow-multiple-definition` resolves **each relocation independently**, so two
+references to the *same* `@NR_EXPORTS` — even within the same LLVM object — bind
+to DIFFERENT copies (`objdump` proof, this build):
+- `_add_export` (writer): `lea …# 0xffffffff896c2002 <NR_EXPORTS>` → LLVM copy.
+- `linux_abi_lookup` (reader): `mov …# 0xffffffff8510dc40 <NR_EXPORTS>` and
+  `mov $0xffffffff8510dc50,%rax` (export_names) → NATIVE copy.
+
+So `exports_init` fills copy A to 2756 while `linux_abi_lookup` scans copy B
+(empty). Every Linux-ABI symbol resolves to 0 → 3290 relocations skipped →
+usbcore `init_module` calls an unrelocated site → `#GP rip=0xffffffff8c61a956`.
+The `.ll` IR for both references is byte-identical (`ptrtoint [N x i8]*
+@NR_EXPORTS to i64`) — the emitter is CORRECT; the defect is purely the hybrid
+link. This also explains every 5m/5n/5o "force fn native RELOCATES the victim":
+forcing a fn native re-shuffles which copy each surviving reference binds to.
+
+### 4. The fix — one definition per global (opt-in lane only)
+`scripts/kllvm_externalize_dupglobals.py` (wired into `build_kernel_llvm.sh`
+steps 1c/1d): after building `native_main.o`, rewrite the LLVM object's
+DEFINITION of every global that `native_main.o` ALSO defines into an `external`
+DECLARATION (`@g = external dso_local global [N x i8]`). native_main.o becomes
+the SOLE definer, so every reference (LLVM- and native-compiled alike) binds to
+that one copy. Globals defined ONLY in the LLVM object (`__stack_chk_guard`,
+`_l_PCI_CAP_ID_MSIX`, …) stay defined; `.Lstr*` literals are `internal` and never
+match. `dso_local` is kept so addressing stays direct (no GOT). 10076 duplicated
+globals collapse to external. **No compiler (`adder/compiler/*`) or kernel `.ad`
+source is touched** — the change is the opt-in build script + a generated-`.ll`
+rewrite, so the native kernel is byte-identical by construction (kobjdiff PASS,
+`git diff` = `scripts/build_kernel_llvm.sh` + new helper only).
+
+### 5. Result — new furthest point (verified by `grep -a` on the serial log)
+Default lane (`memblock_alloc` native, KVM `-cpu host`, BIOS-GRUB-ISO, `-m 1024M`):
+`_add_export` and `linux_abi_lookup` now both reference the single
+`NR_EXPORTS @0xffffffff85146002`. Boot:
+`kmod_linux: relocations applied=14183 **skipped=0**` (usbcore) — and skipped=0
+for all four loaded modules (14183/11867/340/12247), `init_module` called and
+returns, **the kmod/export-table `#GP` is GONE**. Boot then advances through
+`[boot:37] rfork` (past the Phase-5d/5k pid=7 wall — it dispatches), the trap
+installers, `[boot:41.5] himem_late_report`, **`[boot:42] start_first_task`**,
+and `execve`s **`/bin/hamsh`** (`jumping to 0x0000000000400012`). It then hits a
+NEW, unrelated wall: `Kernel panic: schedule: dispatch into task with
+uninitialized sp` — the next blocker (first-task/scheduler sp init), well past
+everything 5b–5o reached. The `memblock_alloc`/`linux_abi_lookup`/`kmod_linux_load`
+force-native defaults are now moot layout-artifacts and can be revisited.
+
+Net: the single open blocker of 5b–5o (export table empty → kmod `#GP`) is FIXED
+at root; it was a hybrid-link duplicate-global binding bug, NOT a codegen wild
+store. Native kernel byte-identical (opt-in build-script + generated-`.ll` rewrite
+only; no compiler/kernel source; kobjdiff PASS). New furthest point: `boot:42
+start_first_task` + `/bin/hamsh` execve, walling at scheduler `uninitialized sp`.

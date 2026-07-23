@@ -115,21 +115,42 @@ if [ -n "$(echo "$KLLVM_ALL_FORCE_NATIVE" | tr -d ' ')" ]; then
     mv "$WORK/kernel_main.ll.tmp" "$WORK/kernel_main.ll"
 fi
 
+# HYBRID native fallback object for the LLVM bails. Built BEFORE the .ll->.o
+# compile because Phase-5p externalizes the LLVM object's duplicated globals
+# against native_main.o's symbol set (see below).
+NATIVE_MAIN=""
+if [ "${KLLVM_NO_HYBRID:-0}" != "1" ]; then
+    echo "[kllvm] 1c) build native main.o (hybrid fallback for the LLVM bails)"
+    "$HOST_AC" --target=x86_64-bare-metal init/main.ad "$WORK/native_main.o" \
+        || { echo "[kllvm] ERROR: native main.o emit failed" >&2; exit 1; }
+    NATIVE_MAIN="$WORK/native_main.o"
+
+    # Phase-5p HYBRID-LINK CORRECTNESS FIX (docs/kernel_llvm_phase5b.md §5p).
+    # Both kernel_main_llvm.o and native_main.o define EVERY module global, and
+    # `ld --allow-multiple-definition` binds each relocation to a duplicated
+    # global INDEPENDENTLY — so `exports_init`/`_add_export` can populate one
+    # copy of NR_EXPORTS/export_names while `linux_abi_lookup` reads the OTHER
+    # (unpopulated) copy: every Linux-ABI lookup fails, usbcore init_module
+    # skips 3290 relocations and #GPs. (Phases 5g-5o mis-read that empty second
+    # copy as a "wild .bss store".) Fix: give every global ONE definition by
+    # rewriting the LLVM object's DEFINITION of each global native_main.o also
+    # defines into an `external` DECLARATION, so native_main.o is the sole
+    # definer and every reference binds to that one copy. LLVM-only globals stay
+    # defined. Opt-in-lane-only: rewrites the GENERATED .ll, no compiler/kernel
+    # source change => native kernel byte-identical.
+    echo "[kllvm] 1d) externalize duplicated globals (single-definition hybrid)"
+    python3 "$PROJ_ROOT/scripts/kllvm_externalize_dupglobals.py" \
+        "$WORK/kernel_main.ll" "$WORK/kernel_main.ll.ext" "$NATIVE_MAIN" \
+        || { echo "[kllvm] ERROR: externalize-dupglobals rewrite failed" >&2; exit 1; }
+    mv "$WORK/kernel_main.ll.ext" "$WORK/kernel_main.ll"
+fi
+
 echo "[kllvm] 2) clang -c ($LLVM_CLANG_OPT, -mcmodel=kernel) -> ELF64 relocatable"
 "$CLANG" "$LLVM_CLANG_OPT" -c -ffreestanding -fno-pic -fno-unwind-tables \
     -fno-stack-protector -fcf-protection=none -mno-red-zone -fno-addrsig \
     -mcmodel=kernel "$WORK/kernel_main.ll" -o "$WORK/kernel_main_llvm.o" \
     || { echo "[kllvm] ERROR: clang compile of kernel .ll failed" >&2; exit 1; }
 file "$WORK/kernel_main_llvm.o" | sed 's/^/[kllvm]    /'
-
-# HYBRID native fallback object for the LLVM bails.
-NATIVE_MAIN=""
-if [ "${KLLVM_NO_HYBRID:-0}" != "1" ]; then
-    echo "[kllvm] 2b) build native main.o (hybrid fallback for the 7 LLVM bails)"
-    "$HOST_AC" --target=x86_64-bare-metal init/main.ad "$WORK/native_main.o" \
-        || { echo "[kllvm] ERROR: native main.o emit failed" >&2; exit 1; }
-    NATIVE_MAIN="$WORK/native_main.o"
-fi
 
 echo "[kllvm] 3) assemble boot stubs + all hand-written .S under arch/x86, fs, drivers"
 "$AS_CMD" --64 -o "$WORK/header.o" "$BOOT_S" || { echo "[kllvm] ERROR: as header.S" >&2; exit 1; }
