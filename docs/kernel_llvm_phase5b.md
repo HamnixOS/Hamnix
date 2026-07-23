@@ -846,3 +846,139 @@ Net: default lane unchanged (still walls at the kmod/export-table `#GP`; forcing
 reaches pid=7). Native kernel boots fully (control). Native byte-identical (no
 source touched this phase; only this doc). The wild store remains the single
 open blocker; the `_another_task_ready` pid=7 theory is moot until it is fixed.
+
+## Phase 5o — the export-table zero is PINNED IN TIME to the FIRST `kmod_linux_load` entry transition (boot:35.X); genuine physical zero with NO store on the synchronous path; watchpoint approach exhausted (three independent gdb failure modes) — writer narrowed but exact RIP not captured (evidence-backed, native-safe)
+
+Executed the brief's Phase-5o plan (arm a HW watchpoint on the fixed export-table
+phys addr after boot:34). The watchpoint approach is **not viable here** for three
+compounding, independently-verified reasons (below). Pivoted to **layout-safe
+`printk`-only source probes** (no new `.bss` global ⇒ `.bss` byte-identical ⇒ the
+fixed-address victim does not move, verified: `bss=145864056` unchanged across
+every probe build) and TIME-bracketed the zero to a single instruction transition
+— a large advance over 5b–5n, which never localised it below "somewhere on the
+execve/kmod path". All probes reverted; `git status` clean bar this doc; no
+`codegen.ad`/`ssa*.ad`/kernel-`.ad`/`build_kernel_llvm.sh` change ⇒ native kernel
+byte-identical by construction (kobjdiff PASS).
+
+### 1. Reproduced the DEFAULT lane wall (KVM `-cpu host`, BIOS-GRUB-ISO, `-m 1024M`)
+`[boot:35] linux_abi_exports_init` → later at `[boot:35.X]
+modules_dep_load_with_deps("xhci_pci")` (which pulls **usbcore**, the FIRST
+`kmod_linux_load`), `#GP` `rip=0xffffffff8c61a956`, `relocations applied=10893
+skipped=3290`, export table physically empty. Boot ordering confirmed: the module
+load is IN `start_kernel` (boot:35), BEFORE userspace (boot:37) — so this `#GP` is
+NOT "past pid=7" (re-confirms 5n vs 5m).
+
+### 2. The zero is bracketed to ONE instruction transition
+Reading `NR_EXPORTS` (via a fixed accessor) at successive checkpoints:
+- `linux_abi_exports_init` populates the table monotonically: after the 10 manual
+  exports `NR=10`, after kthread `53`, after drm `2648`, **at exports_init END
+  `NR=2756`.**
+- `NR=2756` survives INTACT through `loader_init()`, the run-selftests scan, the
+  cpio registrations, `modules_dep_init()`, the 4-deep `_md_walk_deps` recursion,
+  `_md_find_ko`, and right up to and INCLUDING `_md_load_single`'s **`before-hook`
+  / `after-cli` / `after-hookprint`** probes — the last statements before the
+  loader-hook indirect call. `NR=2756` there.
+- **At `kmod_linux_load`'s VERY FIRST source line, `NR=0`.** The line-stamp
+  `printk_line_seq` (a co-located `.bss` global in `early_8250.ad`) simultaneously
+  collapses `~434 → ~6`.
+
+So the multi-global `.bss` zero happens in the window **{ `call *%rax`
+(loader-hook dispatch in `_md_load_single`) → `kmod_linux_load` prologue → its
+first `linux_abi_export_count()` }** — nothing else executes there.
+
+### 3. Ruled OUT, decisively (each a separate probe/experiment)
+- **Read-miscompile:** at `kmod_linux_load` entry the value is `0` read THREE
+  ways — `linux_abi_export_count()`, a raw literal higher-half pointer
+  `*(uint64*)0xffffffff85109c40`, AND the **direct-map alias**
+  `*(uint64*)0xffff888005109c40`. All `0`. → genuine PHYSICAL zero, not a
+  per-context read divergence and NOT a page-table/CR3 remap (the low-identity/
+  direct-map alias reads 0 too).
+- **Maskable IRQ:** wrapping the hook call in `local_irq_disable()` does NOT
+  prevent it (`after-cli NR=2756`, entry `NR=0`). → synchronous or a
+  non-maskable/exception source.
+- **`do_page_fault`:** forcing it native (the 5e/5f suspect) does NOT help —
+  entry `NR=0`, `skipped=3290`, same `#GP`. And `-d int` (TCG) shows the WHOLE
+  boot takes essentially no exceptions in this window (`v=0e` page-fault count = 0;
+  only one timer + the final wall `#GP`). → NOT `#PF`-triggered, NOT any exception.
+- **The loader hook is correct:** printed at runtime, `kmod_linux_load_hook ==
+  &kmod_linux_load` exactly (no trampoline / wrong-copy). `call *%rax` goes
+  straight to `kmod_linux_load`, whose `-O0` prologue disassembles CLEAN
+  (`sub $0x698,%rsp` + stack-only spills + `call export_count`) — **no store to
+  `.bss`, no `rep stos`, no absolute-address store** before the `NR==0` read.
+- **`module_map_alloc`/`memblock_alloc` base:** the usbcore module maps at the
+  CORRECT high window (`virt=0xffffffff8c600000`, sections at `0x8c6…`), so the
+  `memset(base,0,span)` targets the module, NOT the export table. Not the writer.
+
+The paradox — a genuine physical multi-global `.bss` zero across a `call` to a
+clean-prologue function, IRQs off, single CPU, no exception, no visible store —
+is the finding: the writer is NOT any synchronous instruction on the pinned path
+that static analysis or `-O0` disassembly can see. Reproduces identically under
+**both KVM and TCG** (deterministic, not an accel quirk).
+
+### 4. `kmod_linux_load` native = the export table SURVIVES → boot advances to the stage-01 residual
+`KLLVM_FORCE_NATIVE="kmod_linux_load"`: entry `NR=2756`, **`relocations
+applied=14183 skipped=0`**, usbcore + several further `.ko`s all resolve
+`skipped=0`, the `#GP` is GONE, boot advances INTO userspace and dies at the
+**exact Phase-5j/5n stage-01 SIGSEGV** (`[pf] user fault on unmapped va=0x0ed1da0
+-> SIGSEGV`, `no live tasks; halting`). Contrast: `do_page_fault` native does
+NOT move the wall at all. So `kmod_linux_load`-native produces the SPECIFIC
+`.bss` layout delta that shifts the export table off the wild-store's FIXED target
+(which then lands on `task_table`/`vma_tree_root` → stage-01) — the same
+layout-shift signature 5m/5n documented for `memblock_alloc`/`linux_abi_lookup`.
+i.e. the store's TARGET is a fixed (mis-computed) absolute address that fires at
+the first-`kmod_linux_load`-entry TIME; whichever `.bss` global occupies that
+address for the current layout is the victim. The store PERSISTS; forcing a
+function native only relocates the victim (does NOT reach pid=7).
+
+### 5. Why the watchpoint could not capture the RIP (all three verified)
+- **KVM hardware breakpoints/watchpoints are DR-clobbered in early boot** (5j/5k):
+  a SINGLE hbreak at `kmod_linux_load` fired ONCE (probe 1); every armed-at-reset
+  hbreak/watch since (incl. multi-bp) was silently wiped before boot:35.
+- **Software breakpoints cannot be inserted at the `-S` reset vector:** the
+  higher-half target VA is unmapped before paging, so gdb's deferred int3 insert
+  never takes — the bp never fires though the code runs (boot proceeds to the
+  wall). Confirmed under both KVM and TCG.
+- **Hybrid-link dead/live symbol-copy ambiguity:** `--allow-multiple-definition`
+  resolves many globals to the NATIVE (never-executed) copy while the LIVE LLVM
+  copy runs at a different, un-symboled address (verified: `nm`'s
+  `linux_abi_exports_init`/`loader_init`/`_md_load_single` are DEAD copies — bps
+  there never fire though the functions demonstrably run; only `kmod_linux_load`'s
+  `nm` address is live, hook-confirmed). So even TCG `hbreak` on the `call *%rax`
+  anchor never fired: that anchor is in the dead `_md_load_single` copy.
+  A reliable LIVE anchor between "table populated" and the zero could not be
+  obtained through the symbol table.
+
+### 6. Force-native bisection of the pinned window + best next probe
+Force-native results on the pinned window (all layout-invariant `skipped=`
+readouts):
+- `kmod_linux_load` native → **`skipped=0`**, export table survives, boot advances
+  to the stage-01 SIGSEGV (§4) — but its own body disassembles clean, so this is
+  the layout-shift that moves the export table off the fixed target, NOT a fix.
+- `kernel_modules_dep__md_load_single` (the hook CALLER) native → **`skipped=3290`,
+  same `#GP`** — NO change. → the writer is NOT in `_md_load_single`'s LLVM body /
+  hook-call setup.
+- `do_page_fault` native → **`skipped=3290`, same `#GP`** — NO change.
+
+So the writer is NOT `_md_load_single`, NOT `do_page_fault`, NOT `kmod_linux_load`'s
+body: it is confined to the `call *%rax`→`kmod_linux_load`-prologue transition (or
+an off-path mechanism firing at that TIME) with a fixed absolute `.bss` target.
+To get the RIP without the broken bp path: (a) full-speed TCG to the LIVE `kmod_linux_load`
+entry (hbreak on the hook-confirmed `0x8042f0d0`, which DOES fire), then
+`stepi`-scan the ~40 instrs of `_md_load_single`'s tail found by unwinding one
+frame — TCG single-step at that point is cheap and DR-clobber-free. (b) OR a
+QEMU record/replay (`-icount`, `rr`) to place a reverse-watchpoint on
+`0x05109c40` and reverse-continue to the writing insn. The writer target is a
+fixed absolute `.bss` address (`~0x05109c40` phys for the current default layout);
+the `ssa_llvm.ad` construct to fix is whatever emits a store/clear to that fixed
+address around the first `kmod_linux_load` call — NOT `do_page_fault`,
+`memblock_alloc`, or `kmod_linux_load`'s own body (all cleared here).
+
+Net: default lane unchanged (still walls at the kmod/export-table `#GP`; forcing
+`kmod_linux_load` native — like `linux_abi_lookup`/`memblock_alloc` — advances to
+the Phase-5j stage-01 SIGSEGV via a layout shift, not a fix; neither reaches
+pid=7). Native kernel byte-identical (no compiler/kernel/build-script source
+touched this phase; all probes reverted; `git status` clean bar this doc;
+kobjdiff PASS). The wild store's exact writing instruction remains the single open
+blocker; it is now pinned to the first-`kmod_linux_load`-entry TIME window with a
+fixed absolute `.bss` target and every synchronous-instruction / IRQ / exception /
+read-miscompile / mapping explanation on that path ruled out.
