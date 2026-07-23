@@ -577,3 +577,86 @@ shared LLVM code, genuine physical zeroing, NOT DMA and NOT do_page_fault-specif
 Native kernel byte-identical (no compiler/kernel source change; probe reverted;
 `git status` clean bar the new `scripts/scan_oob.py`, `scripts/kllvm_repro_bss_zero.sh`,
 and this doc). The separate `_another_task_ready` pid=7 wall remains distinct.
+
+## Phase 5l — the WRONG-STRIDE store hypothesis is REFUTED: the emitter's array-of-struct / nested strides are CORRECT (static scan + emit differential, native-safe)
+
+Executed the Phase-5k "hunt the variable-stride store statically" plan:
+extended `scripts/scan_oob.py` to model VARIABLE-index addressing and ran it on
+a clean whole-kernel `.ll`, plus a positive/negative emit differential. **Result:
+there is NO wrong-element-stride array-of-struct store in the kernel; the Adder
+LLVM emitter computes `g[i].field` / `g[i].arr[j]` element strides correctly.**
+Only `scripts/scan_oob.py` changed — a host analysis tool, NOT compiler/kernel
+source — so the native kernel is byte-identical by construction and no
+native-safety gate is at risk (no `codegen.ad`/`ssa*.ad`/kernel `.ad` change).
+
+### Scanner extension (committed)
+`scan_oob.py` now tracks, per SSA value, an address model `@sym[+const]
+[+ i*STRIDE ...]` by parsing `ptrtoint [N x i8]* @sym`, `mul i64 %i, STRIDE`,
+`shl`, `add`, `inttoptr`, and `store/load` chains (the exact pure-pointer
+arithmetic the emitter produces). Beyond the Phase-5i constant-offset OOB it
+flags:
+- **TILE** — the LARGEST (outer array-of-struct element) stride does not divide
+  the global size N. A correct element stride must tile the array exactly; a
+  stride set to the innermost element width instead of `st_total` fails this.
+  Only the max stride is checked — inner strides are bounded within the element
+  and legitimately do not divide N (checking them false-positived on every
+  nested `g[i].inner[j]`).
+- **FIELDOVF** — a constant field offset + access width that spills past the
+  element the outer stride tiles (a too-small element stride).
+- **INCONSIST** (informational) — a global indexed with >1 distinct stride
+  (expected and benign for nested array-of-struct; NOT a defect by itself).
+- A `mul CONST, CONST` (a constant-folded `[0]` index, e.g. `mul i64 0, 8` from
+  `cast[Ptr[uint64]](&g[0])[0]`) is folded into `off`, NOT recorded as a stride —
+  without this every constant-index cast-pointer store false-positived.
+
+### Validation (positive + negative control)
+- On a synthetic `Array[7, Elem]` with `Elem{ id; arr: Array[5,Inner]; tag }`
+  (`st_total(Inner)=24`, `st_total(Elem)=136`), the emitter produced
+  `@gtab = [952 x i8]` (7×136) and addressed `gtab[i].id` = `base + i*136`,
+  `gtab[i].tag` = `base + i*136 + 128`, `gtab[i].arr[j].a` =
+  `base + i*136 + 8 + j*24`, `gtab[i].arr[j].c` = `+ j*24 + 16` — **every stride
+  equals the true `st_total`.** Scanner: 0 TILE / 0 FIELDOVF (positive proof the
+  emitter is correct AND that the scanner is clean on correct nested code).
+- Injecting the exact suspected bug (outer stride 136→24, i.e. the inner element
+  size) makes the scanner fire TILE (`952 % 24 = 16`) on both `gtab[i]` stores —
+  the scanner detects the bug class it was built for.
+
+### Whole-kernel scan result — CLEAN
+`funcs=11064 emitted=11059`; **constant-offset OOB = 0, genuine wrong-stride = 0.**
+`task_table` (`[7446528 x i8]`) is indexed with outer stride **14544**, and
+7446528 / 14544 = **512 exactly** — the correct element stride and count. The
+seccomp / fpu / per-slot suspects likewise tile cleanly. The scanner's raw TILE
+list reduced to two hits, BOTH reviewed and refuted as false positives inherent
+to not distinguishing a single-struct-with-inner-array from an array-of-struct
+purely from the `.ll`:
+- `@blk_plug_g` (`blk_plug_g: BlkPlug`, a SINGLE struct) — stride 32 is its
+  `reqs: Array[32, BlkReq]` inner-array stride; bounded within the 1040-byte
+  struct (`16 + 31*32 + 32 = 1040`), not OOB.
+- `@https_gzip_body` (`Array[4096, uint8]`, a FLAT byte buffer) — stride 28 is a
+  manual 28-byte record layout; all offsets < 4096.
+
+### Conclusion + redirect for the next agent
+The Phase-5k "variable-index/stride miscompile" framing is **disproven for the
+element-stride case**: `ssa_global_indexed_struct_base`, the recursive lvalue
+walker (`ssa_region_base`/`ssa_struct_base_rec`/`ssa_addr_index`), and the
+array-size reservation (`llvm_glob_bytes` → `type_size_of` = `count*st_total`)
+all agree on `st_total`, so `g[i]` never overruns via a wrong stride. The wild
+store that physically zeroes `task_table` is therefore NOT a statically-visible
+global-rooted variable-index overrun. The two remaining classes static analysis
+canNOT see, and which the next agent should pursue:
+1. **Right stride, index EXCEEDS element count** — a runaway/mis-bounded loop or
+   slot index (`table[j]` with `j` past the count). Not visible without loop-bound
+   analysis; hunt by capping/asserting the index at each `task_table[...]` /
+   per-slot zeroing writer, or a physical-`.bss` diff at pid=7 vs native.
+2. **A store through a pointer NOT rooted at `ptrtoint @global`** — notably the
+   PHYSICAL / direct-map alias writes Phase 5j/5k already fingered (`phys =
+   va - 0xffffffff80000000` / `va & MASK`), which write to linear addr == phys and
+   are invisible to a global-rooted scanner. This matches the 5j/5k finding that
+   the write hits the LOW-identity address, not the higher-half VA. This is now
+   the prime suspect: back-map the zeroed `.bss` hole to the SHARED function whose
+   physical-destination pointer arithmetic is wrong, then `clang -S` vs native.
+
+Net: default lane unchanged (`do_page_fault` native-hybrid → `rfork pid=7`).
+Native kernel byte-identical (only `scripts/scan_oob.py` + this doc changed; no
+compiler/kernel source touched). The separate `_another_task_ready` pid=7
+scheduler wall remains the actual boot blocker once the wild store is found.
