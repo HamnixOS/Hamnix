@@ -112,7 +112,15 @@ def build_llvm(name, body):
     if "define i64 @main(" not in cp.stdout:
         return None, None, stat or "no-main"
     elf = WORK / f"{name}_llvm"
-    ce = subprocess.run([CLANG, "-O2", str(ll), str(RUNTIME_C), "-o", str(elf)],
+    # Since __syscallN inline-asm passthrough landed, print_u64 (which does a raw
+    # write(2) via __syscall) now EMITS as a `define` in the .ll itself instead of
+    # bailing, so also linking the C runtime stub would be a duplicate definition.
+    # Only supply the C stub when the .ll does NOT already define print_u64.
+    ll_defines_print = any(
+        l.lstrip().startswith("define") and "@print_u64(" in l
+        for l in cp.stdout.splitlines())
+    link_srcs = [str(ll)] if ll_defines_print else [str(ll), str(RUNTIME_C)]
+    ce = subprocess.run([CLANG, "-O2", *link_srcs, "-o", str(elf)],
                         capture_output=True, text=True)
     if ce.returncode != 0 or not elf.exists():
         return None, None, (stat + " CLANGFAIL:" +
