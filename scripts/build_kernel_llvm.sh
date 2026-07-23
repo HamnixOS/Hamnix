@@ -64,13 +64,29 @@ STAT="$(grep '; ADDER_STAT' "$WORK/kernel_main.ll" || true)"
 echo "[kllvm]    $STAT"
 echo "[kllvm]    bailed functions:"; grep '; BAILED' "$WORK/kernel_main.ll" | sed 's/^/[kllvm]      /'
 
-# Phase-5d A/B native-substitution: KLLVM_FORCE_NATIVE="fn1 fn2 ..." rewrites
-# those defines into declares so the hybrid link resolves them to native main.o.
-# Debug-only bisection hook; leaves native build path untouched.
-if [ -n "${KLLVM_FORCE_NATIVE:-}" ]; then
-    echo "[kllvm] 1b) FORCE-NATIVE: $KLLVM_FORCE_NATIVE"
+# Phase-5e native-hybrid routing for KNOWN-MISCOMPILED functions.
+#
+# do_page_fault: its LLVM-backend codegen mis-resolves the running task's
+# task_table[] fields DURING fault handling — a plain `task_image_lo(6)`
+# (LITERAL index) inside do_page_fault reads 0 where the SAME accessor reads
+# the correct value (0x400000) from every other caller, so the first user
+# demand-fault (hamsh's str_arena_init BSS touch at stage-01) finds NO covering
+# VMA and takes a spurious SIGSEGV — the LLVM kernel died before it even reached
+# the fork wall. Proven by A/B: forcing ONLY do_page_fault native makes every
+# demand fault resolve and the boot advances through rc.boot to `rfork: child
+# created, pid=7` (the Phase-5d cross-task-schedule wall). The native backend
+# compiles do_page_fault correctly (it is the default kernel's #PF handler), so
+# route it to the native-hybrid fallback here. This is opt-in-lane-only: the
+# default native kernel build is byte-identical (no codegen.ad / kernel source
+# change). See docs/kernel_llvm_phase5b.md (Phase 5e).
+#
+# KLLVM_FORCE_NATIVE="fn1 fn2 ..." appends extra names (A/B bisection hook).
+KLLVM_DEFAULT_FORCE_NATIVE="do_page_fault"
+KLLVM_ALL_FORCE_NATIVE="$KLLVM_DEFAULT_FORCE_NATIVE ${KLLVM_FORCE_NATIVE:-}"
+if [ -n "$(echo "$KLLVM_ALL_FORCE_NATIVE" | tr -d ' ')" ]; then
+    echo "[kllvm] 1b) FORCE-NATIVE: $KLLVM_ALL_FORCE_NATIVE"
     python3 "$PROJ_ROOT/scripts/kllvm_force_native.py" \
-        "$WORK/kernel_main.ll" "$WORK/kernel_main.ll.tmp" $KLLVM_FORCE_NATIVE \
+        "$WORK/kernel_main.ll" "$WORK/kernel_main.ll.tmp" $KLLVM_ALL_FORCE_NATIVE \
         || { echo "[kllvm] ERROR: force_native rewrite failed" >&2; exit 1; }
     mv "$WORK/kernel_main.ll.tmp" "$WORK/kernel_main.ll"
 fi

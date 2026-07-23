@@ -144,3 +144,65 @@ HAMNIX_INITRAMFS_BLOB="$PWD/fs/initramfs_blob.S" \
 qemu-system-x86_64 -cdrom "$(kernel_iso build/kllvm/hamnix_kernel_llvm.elf)" \
   -smp 1 -nographic -no-reboot -m 1024M -monitor none -serial stdio
 ```
+
+## Phase 5e — build-blocker + a NEW pre-fork regression fixed; back at the pid=7 wall
+
+Re-running the lane on a FRESH host_ac (built from committed source, no stale
+cache) surfaced two problems the earlier Phase-5b/5c/5d runs' stale/smaller
+`.ll` had masked, then pinpointed and fixed both. The lane again reaches the
+Phase-5d fork wall.
+
+### (1) `LL_OUT_CAP` truncation — the lane no longer built at all
+
+The emission-broadening work landed since Phase-5a (SVO_FUNCADDR, recursive
+lvalue-address, array-of-struct globals — Ph4b/5a) grew the emitted whole-kernel
+`.ll` PAST the 32 MiB `LL_OUT_CAP` in `adder/compiler/ssa_llvm.ad`. `ll_putc`
+silently stops at the cap, so the tail of the unit was truncated MID-FUNCTION —
+a cut-off `phi` (`%v3048 = phi i64 [ `) → clang `error: expected value token`.
+The `.ll` was EXACTLY 33554432 bytes (== the cap), the tell-tale of a hard
+truncation. **Fix: `LL_OUT_CAP` 32→64 MiB** (and the backing `llvm_out`
+array). Host-only BSS buffer used ONLY on `--backend=llvm`; the native
+`codegen.ad` path never touches it, so the native kernel build stays
+byte-identical (kobjdiff 0). Rebuild host_ac after this change
+(`_adder_cc.sh adder_cc_bootstrap`) — `build_kernel_llvm.sh` consumes the
+prebuilt `build/cutover/host_ac.elf`.
+
+### (2) `do_page_fault` LLVM-codegen miscompile — spurious SIGSEGV before the fork
+
+With the full unit now emitting, the LLVM kernel died EARLIER than the Phase-5d
+run: hamsh took a SIGSEGV at **stage-01** (`str_arena_init`'s first BSS write at
+va `0xed1d60`) with `[nxdiag] NO covering VMA / tree-find=0`, even though the BSS
+demand VMA `[0x479000,0x1110000)` covering that address had just been registered.
+
+Root cause, established by a temporary-probe bisection (all reverted):
+- `vma_register_bss_demand` set `task_table[6].vma_list_head = 0x0e014020`; a raw
+  read-back at registration, and `task_image_lo(6)`/`img_lo(6)` reads from EVERY
+  execve-tail setter, from `do_syscall` (native), and right up to and INCLUDING
+  the last user `write(2)` before the fault, ALL returned the CORRECT values.
+- But at `do_page_fault` entry the SAME accessors — including a `task_image_lo(6)`
+  with a LITERAL index — returned **0** (`image_lo`, `vma_list_head`, even `pid`),
+  so the covering-VMA lookup missed → spurious SIGSEGV. `task_table` is
+  higher-half (`0xffffffff8510cbd0`, mapped in every PML4) and `cr3` is identical
+  at both reads, so it is NOT a CR3/mapping issue; and the native `do_page_fault`
+  reads the correct `0x400000` for the very same fault, so memory is NOT actually
+  corrupted — **`do_page_fault`'s LLVM codegen mis-resolves the running task's
+  `task_table[]` reads during fault handling.**
+- **A/B proof:** `KLLVM_FORCE_NATIVE="do_page_fault"` → every demand fault
+  resolves, hamsh runs, `/etc/rc.boot` completes (`device binds applied`), and the
+  boot advances to **`rfork: child created, pid=7`** — the Phase-5d wall.
+
+**Fix (correctness-first, native-safe): route `do_page_fault` to the
+native-hybrid fallback by default** in `build_kernel_llvm.sh`
+(`KLLVM_DEFAULT_FORCE_NATIVE="do_page_fault"`, still appendable via
+`KLLVM_FORCE_NATIVE`). Opt-in-lane-only: no kernel source / `codegen.ad`
+change, so the default native kernel is byte-identical. The exact miscompiled
+construct inside `do_page_fault` is not yet isolated (the emitted prologue IR is
+clean; the misread is delegated to leaf accessors that read correctly from every
+other caller) — a proper `ssa_llvm.ad` fix, gated on `ssa_mem_model`, remains
+open. Suspect: a large-function codegen edge or a call/return register-clobber
+specific to this translation unit; `clang -S` on `@do_page_fault` vs a working
+reader is the next probe.
+
+**Net furthest point (opt-in lane, default build): `rfork: child created,
+pid=7`** — identical to Phase 5d (first cross-task schedule; child READY but not
+dispatched). See the Phase-5d TODO notes for that residual.
