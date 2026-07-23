@@ -64,6 +64,17 @@ STAT="$(grep '; ADDER_STAT' "$WORK/kernel_main.ll" || true)"
 echo "[kllvm]    $STAT"
 echo "[kllvm]    bailed functions:"; grep '; BAILED' "$WORK/kernel_main.ll" | sed 's/^/[kllvm]      /'
 
+# Phase-5d A/B native-substitution: KLLVM_FORCE_NATIVE="fn1 fn2 ..." rewrites
+# those defines into declares so the hybrid link resolves them to native main.o.
+# Debug-only bisection hook; leaves native build path untouched.
+if [ -n "${KLLVM_FORCE_NATIVE:-}" ]; then
+    echo "[kllvm] 1b) FORCE-NATIVE: $KLLVM_FORCE_NATIVE"
+    python3 "$PROJ_ROOT/scripts/kllvm_force_native.py" \
+        "$WORK/kernel_main.ll" "$WORK/kernel_main.ll.tmp" $KLLVM_FORCE_NATIVE \
+        || { echo "[kllvm] ERROR: force_native rewrite failed" >&2; exit 1; }
+    mv "$WORK/kernel_main.ll.tmp" "$WORK/kernel_main.ll"
+fi
+
 echo "[kllvm] 2) clang -c ($LLVM_CLANG_OPT, -mcmodel=kernel) -> ELF64 relocatable"
 "$CLANG" "$LLVM_CLANG_OPT" -c -ffreestanding -fno-pic -fno-unwind-tables \
     -fno-stack-protector -fcf-protection=none -mno-red-zone -fno-addrsig \
