@@ -57,3 +57,13 @@ these are pre-existing bugs, not opt-cutover regressions.
 
 ## CI hygiene
 - [x] Foundational `test_hambrowse_host.sh` 15 FAIL→0 (stale snapshot from landed proportional-column + border-model improvements; gate updated to match real Chrome-close output, no engine change).
+
+## Chrome-parity roadmap (measured 2026-07-23, main 94c9c97f — SSIM/brmse vs chromium)
+Ranked hambrowse-vs-Chrome gaps by cross-site impact (agent acdff02e):
+1. **Text too wide → early wrap → ~2× inflated page height** (TOP impact; every text page; HN SSIM 0.402, titles wrap to 2 lines). Cause: hambrowse glyph-advance metrics (DejaVu Sans) wider than Chrome's default face. Fixing lifts every real-page score. ← NEXT.
+2. flex-direction:column blockification — **FIXED 94c9c97f** (flexbox SSIM 0.663→0.729).
+3. `font-family: serif`/`monospace` generic-family selection (serif pages render sans).
+4. Header/nav table-cell sizing so single-line headers don't wrap (compounds #1).
+5. Default vertical rhythm (line-height, heading/paragraph margins).
+6. justify-content spacing nuances; flex/block background-bar FILL emission (dispflex/flexnav fails).
+Tooling: `chromium` @ /usr/bin (Chrome ref); `framediff_gfx_*` SSIM harness; self-contained inline-CSS pages give clean comparisons.
