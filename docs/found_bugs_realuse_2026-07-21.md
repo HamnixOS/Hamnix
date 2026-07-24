@@ -313,3 +313,31 @@ media/matchmedia/stylemedia PASS. New gate `test_hambrowse_stylemedia_host.sh`.
    residual on every multi-line box; HIGH reach, HIGH risk (BODY_H/LINE_H quantization +
    grid-auto-rows invariants; needs a per-row variable-pitch pass).
 4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
+
+## Chrome-parity progress (round 15, main d73f4593)
+Measure-first FINDING: the assigned target ("DejaVu space glyph too wide in all prose") was
+STALE — the isolated proportional space is already Chrome-correct (`"a a"−"aa"`=4px hb vs
+Chrome 4.5px; hb actually narrower). CLOSED the real gap: **table-cell inline runs fell back
+to the 8px CELL_W monospace grid** — `_run_px`/`_space_px` (box.ad) used the monospace grid
+whenever `table_active`, while the pixel paint drew the narrower proportional advances, so
+layout reserved 8px/char but paint drew fewer → a phantom gap before every following inline
+segment (the round-12 HN sitebit `(domain)` over-spacing). Fix: drop the `table_active` guard
+so table-cell inline runs route through the same proportional measure hook the paint uses
+(matches the already-proportional `tables.ad` `_adv8`/`_measure_table` column model); the
+`he_meas_set==0` fallback keeps SEG-dump/text harnesses byte-identical. Measured: in-cell
+inter-word space **25px → 5px** (Chrome ~4.5); sitebit `(github.com)` run x 292→268 (Chrome
+~260; residual ~8px is the separate non-space 877-hscale glyph metric). Churn: of 229 fixtures
+only 3 shift (span, tblcenter, tblcolcap — all multi-word cells wrapping less = Chrome-correct),
+0 newly-failing. New gate `test_hambrowse_wordspace_host.sh`. DE-UNCHANGED verified: font_ttf.ad
+untouched + no DE binary imports lib/web (grep-confirmed by orchestrator) → cannot reach the DE.
+
+### Ranked roadmap for round 16+
+1. **Non-space glyph advance residual** — the ~8px sitebit offset from the accumulated 877-hscale
+   DejaVu→Liberation approximation (~0.25px/char, compounds on long lines). A hambrowse-side
+   per-glyph advance refinement (NOT font_ttf, DE-shared) would close it.
+2. **Global 1px-per-line line-box over-height** (row pitch 19 vs Chrome ~18.4) — dominant
+   VERTICAL residual on every multi-line box; HIGH reach, HIGH risk (BODY_H/LINE_H quantization +
+   grid-auto-rows invariants; needs a per-row variable-pitch pass).
+3. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's
+   `<style media>` fix; on-device fetch, synthetic gate needed.
+4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
