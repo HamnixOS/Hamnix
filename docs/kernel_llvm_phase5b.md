@@ -1173,3 +1173,142 @@ native-safety gates green. New furthest point: **interactive `hamsh$` prompt
 (stage-08), full userspace with pids 7–26** — the LLVM-compiled kernel now boots
 to the shell, on par with native. This is the ARM-unlock milestone: a whole-kernel
 LLVM-compiled Hamnix booting to userspace.
+
+## Phase 5r — the `-O2` lane: label-collision BUILD-BLOCKER ROOT-FIXED in the emitter (`.L` → `${:uid}`); `-O2` now COMPILES + boots; two deeper `-O2`-only codegen blockers pinned (evidence-backed, native-safe)
+
+`-O2` is the point of the LLVM backend (native-SSA ≈5.6× slower than gcc-O2;
+LLVM -O2 ≈ parity). Phases 5b–5q ran the lane at `-O0` (correctness only). This
+phase brings up `-O2`. The documented `-O2` build-blocker — clang's integrated
+assembler rejecting the rdrand/rdseed inline-asm `.L` labels when it inlines the
+same asm template at multiple call sites — is **root-fixed in the Adder LLVM
+emitter** (not worked around in the build script). The `-O2` object now compiles
+and links; the lane boots and, past the label fix, surfaces two SEPARATE
+`-O2`-only codegen defects that `-O0` hides. Only `adder/compiler/ssa_llvm.ad`
+changed (the LLVM emitter's asm-template string writer) — the native `codegen.ad`
+path is untouched, so the native kernel is byte-identical by construction and all
+four native-safety gates are green.
+
+### 1. Reproduced the exact `-O2` collision
+`LLVM_CLANG_OPT=-O2 scripts/build_kernel_llvm.sh` failed in clang's integrated
+assembler:
+```
+<inline asm>:3:5: error: symbol '.Lrdrand_retry' is already defined
+<inline asm>:8:5: error: symbol '.Lrdrand_ok' is already defined
+<inline asm>:11:5: error: symbol '.Lrdrand_done' is already defined
+<inline asm>:3:5: error: symbol '.Lrdseed_retry' is already defined
+```
+Source: `sys/src/9/port/devrandom.ad` `_rdrand64`/`_rdseed64` carry
+`asm_volatile("... .Lrdrand_retry: ... jc .Lrdrand_ok ...")` retry loops with
+FIXED `.L` labels. At `-O0` the two asm-bearing functions are out-of-line (one
+instantiation each → labels unique). At `-O2` clang inlines them into their
+callers, emitting the same template — and hence the same fixed `.L` labels —
+multiple times → "symbol already defined". This is a general emitter-correctness
+bug, not an `-O0`-vs-`-O2` policy: any inline-asm template with a local label is
+unsafe to instantiate more than once.
+
+### 2. Root fix — uniquify local labels with LLVM's `${:uid}` (`ssa_llvm.ad`)
+The emitter renders zero-operand inline asm verbatim through
+`ll_put_asm_string` (the double-quoted template of `call void asm sideeffect`).
+Added a `.L<ident>` recogniser there: every GAS local label (`.L` is the GAS
+local-symbol prefix, so any `.L<ident>` in a body is a local label) is emitted
+verbatim followed by LLVM's `${:uid}` substitution token, which expands to a
+per-asm-instantiation-unique integer. A label's definition and its references
+share the instantiation → same uid → still matched; distinct inlined copies get
+distinct uids → no collision. The `${:uid}` bytes are emitted RAW (bypassing the
+`'$' → '$$'` literal-doubling) because there `$` IS the operand-substitution
+escape we want. Real globals (e.g. `hwrng_scratch(%rip)`) are never `.L`-prefixed
+and are left untouched. Emitted result:
+```
+.Lrdrand_retry${:uid}:  ...  jc .Lrdrand_ok${:uid}  ...  loop .Lrdrand_retry${:uid}
+```
+This is ARM-relevant too (label uniquification is a general asm-emitter fix, not
+x86-specific). Rebuilt `host_ac` (the `.ll` is baked from `ssa_llvm.ad`), re-emitted:
+`clang-19 -O2 -c -mcmodel=kernel` now produces a valid ELF64 relocatable; a
+control build with the `${:uid}` tokens stripped back to fixed labels reproduces
+the exact 4-error collision. Fix confirmed necessary AND sufficient for the label
+blocker.
+
+### 3. Native-safety gates — ALL PASS (verbatim)
+- `scripts/test_native_vs_seed_kobjdiff.sh`:
+  `[kobjdiff] PASS — zero semantic kernel divergences across 11064 matched
+  functions` / `[kobjdiff] PASS — native kernel codegen matches the seed
+  (semantic).` (`git diff --stat` = `adder/compiler/ssa_llvm.ad | 36 +++…` ONLY —
+  `codegen.ad` does NOT appear in the native diff.)
+- `scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS` (`MISCOMPILED: 0`,
+  `python-backend miscompiles: 0`, `tooling/run errors: 0`).
+- `ADDER_OPT2=1 scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS`
+  (`codegen.ad accepted: 500 (100.0%)`, `of accepted, CORRECT: 500 (100.0%)`,
+  `MISCOMPILED: 0`).
+- `scripts/bench_llvm.sh`: `[bench_llvm] LLVM compiled 8/8 kernels; bailed: [];
+  wrong: []` (all 8 `AGREE`, `LLVM=OK`; geomean 0.88× gcc-O2).
+
+### 4. Boot furthest points (both grep-verified on the serial log)
+- **`-O0` lane (regression check — STILL boots):** default build
+  (`memblock_alloc` native, KVM `-cpu host`, BIOS-GRUB-ISO, `-m 1024M`),
+  `grep -a`: `[hamsh] M16.35 shell ready` → `rfork: child created, pid=7` …
+  through pid=26 → `[hamsh:stage-06] rc-done` → `[hamsh:stage-07] loop-enter` →
+  `hamsh$ [hamsh:stage-08] ed-readline-first`. Identical to Phase 5q. No
+  regression from the emitter change.
+- **`-O2` lane (new):** BUILDS (previously could not compile at all) and boots
+  through the entire kernel init battery to boot-stage 32, walling at the
+  `p9_smoke_test` 9P handshake:
+  ```
+  [000397] [p9smoke] pipes tx=0 rx=1
+  [000399] TRAP: vector 0x0e err=0x10 rip=0xffffffff00000000
+  ```
+  a page fault on an **instruction fetch** (`err` bit 4) at `rip=
+  0xffffffff00000000` — a `call` through a function pointer that `-O2`
+  miscompiles to `0xffffffff00000000` (high dword `0xffffffff`, low dword 0). This
+  is a SECOND, independent `-O2`-only blocker, unrelated to labels.
+
+### 5. The second `-O2` blocker — pinned to the 9P-handshake indirect-call path (NOT p9_smoke_test / _smoke_pump_call)
+`-d int,cpu_reset` at the fault: `IP=0008:ffffffff00000000 pc=ffffffff00000000`,
+`RDI=0xffffffff8557e69b RSI=0xffffffff856044c4 RBX=RCX=RDX=0x13`. `nm` maps
+`RSI` INTO `p9smoke_buf` (`p9smoke_buf + 0x13`) — so the crashing call is a helper
+in the p9 attach/codec path taking a `(ptr, &p9smoke_buf[0x13], len=0x13)`-shaped
+arg set through a function pointer whose value is wrong. Single-variable
+force-native bisection (`KLLVM_FORCE_NATIVE`) RULES OUT the obvious two:
+forcing `p9_smoke_test` native (it computes `&p9smoke_pump` and drives the
+handshake) AND forcing `_smoke_pump_call` native (the `hookfn(slot)` indirect
+trampoline in `9p_client.ad`) EACH still trap identically at
+`rip=0xffffffff00000000`. So the miscompiled instruction is in a deeper LLVM
+callee common to all builds (the p9 codec / attach-run path), not in either the
+funcaddr producer or the trampoline. Signature (`0xffffffff00000000`) points at a
+function-pointer/indirect-call target materialisation where `-O2` drops the low
+32 bits — the exact class the ARM retarget will also depend on. Open
+`ssa_llvm.ad` defect (gate `ssa_mem_model`); the precise construct is not yet
+isolated to one instruction.
+
+### 6. A THIRD `-O2`-only blocker sits behind the second — in the rfork/COW page path
+To measure how far the rest of the `-O2` kernel is clean, a THROWAWAY experiment
+(reverted) stubbed the `p9_smoke_test()` boot-stage-32 call. With p9 out of the
+way the `-O2` kernel advances all the way to userspace: `[hamsh] M16.35 shell
+ready` → `rc.boot: device binds applied` → `rfork: child created, pid=7`. Then a
+DIFFERENT `-O2`-only defect fires: a `[pa-corrupt] free of wild addr
+0x00000000004790XX order=0 — ignoring` storm over the hamsh demand-VMA region
+`[0x479000,…)` (the pages the forked child should COW), ending in a `trap-diag`
+one-shot halt. `-O0` runs this identical rfork/COW/page-free path cleanly to
+stage-08, so this too is `-O2` surfacing a latent codegen divergence (page-alloc
+free-list / COW pointer arithmetic), NOT a logic bug. Two distinct `-O2`-only
+codegen defects (indirect-call target truncation; wild page-free in rfork/COW)
+therefore remain between the label fix and a full `-O2` boot.
+
+### 7. Size/perf signal
+`-O2` kernel `.text` = 54,321,544 B vs `-O0` = 57,419,016 B — **3.1 MiB (~5.4%)
+smaller** even with the two force-native hybrid bodies still `-O0`; the
+whole-kernel `-O2` compile is ~2 min. (No boot-to-steady-state `-O2` runtime
+number yet — the lane does not reach userspace until the §5/§6 defects are
+fixed.)
+
+### Net
+The documented `-O2` label-collision BUILD-BLOCKER is ROOT-FIXED in the emitter
+(`.L` → `.L…${:uid}`), general and ARM-relevant; the `-O2` lane now compiles,
+links, and boots (furthest `-O2` point: boot-stage-32 p9_smoke handshake; with p9
+stubbed, `-O2` reaches `M16.35 shell ready` + `rfork pid=7`). `-O0` still boots to
+the full interactive `hamsh$` stage-08 prompt (no regression). Native kernel
+byte-identical (kobjdiff PASS 0/11064, diff = `ssa_llvm.ad` only; `codegen.ad`
+NOT in the native diff); all four native-safety gates green. Two deeper
+`-O2`-only codegen defects are pinned for the next agent: (a) an indirect-call
+target truncated to `0xffffffff00000000` in the 9P codec/attach path (not
+`p9_smoke_test`/`_smoke_pump_call` — bisection-excluded), and (b) a wild
+page-free storm over the COW demand-VMA on the rfork path.

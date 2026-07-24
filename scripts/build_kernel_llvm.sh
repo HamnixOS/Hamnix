@@ -28,12 +28,18 @@
 #   KLLVM_NO_HYBRID=1  skip the native fallback object (link fails on the 7 bails;
 #                      useful to measure the pure-LLVM unresolved set)
 #
-# NOTE on -O0: clang -O2 INLINES the asm-passthrough functions carrying the
-# rdrand/rdseed retry loops, whose inline-asm bodies contain FIXED `.L` labels
-# (.Lrdrand_retry etc.). Inlining duplicates those labels across call sites and
-# the integrated assembler rejects "symbol already defined". -O0 does not inline,
-# so the labels stay unique. A future -O2 lane needs the emitter to uniquify
-# those labels (LLVM `${:uid}` inline-asm token).
+# NOTE on -O2 (Phase 5r): the historical -O0-only label blocker is FIXED. clang
+# -O2 inlines the rdrand/rdseed asm-passthrough retry loops, and their FIXED `.L`
+# labels (.Lrdrand_retry etc.) collided ("symbol already defined") across the
+# duplicated instantiations. The Adder LLVM emitter (ssa_llvm.ad
+# ll_put_asm_string) now uniquifies every `.L<name>` local label with LLVM's
+# `${:uid}` token, so -O2 compiles + links. TWO deeper -O2-only codegen defects
+# still wall the -O2 boot (LLVM_CLANG_OPT=-O2): (1) an indirect-call target
+# truncated to 0xffffffff00000000 in the 9P codec/attach path (walls at
+# boot-stage-32 p9_smoke_test; NOT p9_smoke_test/_smoke_pump_call themselves —
+# force-native-bisected), and (2) a wild page-free storm over the COW demand-VMA
+# on the rfork path (reached only with p9_smoke stubbed). Default remains -O0
+# until those are fixed. See docs/kernel_llvm_phase5b.md (Phase 5r).
 set -uo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
