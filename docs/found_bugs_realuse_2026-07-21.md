@@ -481,3 +481,58 @@ Residual ~2px is the font_adv TABLE PRECISION floor (model-independent) → roun
 2. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's `<style media>`.
 3. **Heading vertical rhythm** — em-based h1-h6 top/bottom margins.
 4. `font-family: serif`/`monospace` generic-family metrics.
+
+## Chrome-parity progress (round 19 — DIMINISHING-RETURNS readout, docs-only, no code change)
+MEASURE-FIRST re-audit of the assigned #1 lever (**font_adv per-glyph table precision**). Three
+independent measurements — all on this host's `/usr/bin/chromium` and the Liberation TTFs —
+**disprove the round-18 hypothesis** that the ~1.56px residual is table imprecision. The table is
+already at the precision floor; the true residual is **kerning**, a different (and out-of-scope)
+lever. **No `font_adv.ad`/htmlpaint change landed** — per the round-15..18 discipline, an honest
+diminishing-returns readout is the correct outcome here.
+
+**Measurement 1 — direct hmtx cross-check (fontTools on the actual `LiberationSans-Regular.ttf` /
+`-Bold.ttf`, upm 2048):** the committed table matches the font's raw `hmtx` advance for 92/95 sans
+and 94/95 bold cells. The 3 that differ are `'1'` (table 990 vs hmtx **1139**), `'f'` (533 vs 569),
+bold `'1'` (1028 vs **1139**). **KEY FINDING that forecloses the roadmap's "read hmtx directly"
+idea:** Chrome does NOT render Liberation's raw hmtx for these — Chrome's `measureText` for `'1'` at
+16px is **7.717px = 988fu**, NOT the tabular hmtx 1139. So the table (measured from Chrome, not the
+font) is CORRECT and reading hmtx would REGRESS `'1'` by +9px per glyph. `fc-match sans-serif` here
+is DejaVu, `Arial`→Liberation; but `measureText("16px sans-serif")==("16px Arial")==("16px
+Liberation Sans")` for every ASCII cp — Chrome resolves all three to the same face, so Chrome's
+`measureText` is the sole ground truth (as round 16 already used).
+
+**Measurement 2 — higher-precision table re-measure (run/200 vs round-16's run/50):** re-measured
+Chrome `measureText` for cp32..126 at 16px. Vs the committed table the **mean |per-glyph err| is
+0.04fu sans / 0.02fu bold ≈ 0.0003px**, **max 2.2fu = 0.017px** (the `'1'` cell). Only 3 cells would
+round differently — `'1'` 990→988, `'f'` 533→532, bold `'1'` 1028→1027 — each a **sub-0.02px**
+nudge. Applying them re-rounds every sans line containing `'1'`/`'f'` (broad fixture churn) for an
+un-measurable ≤0.02px/glyph gain → **not worth the churn** (the directive's explicit STOP condition).
+
+**Measurement 3 — real hb-vs-Chrome line residual, and its TRUE source (15 diverse 40-60char 16px
+lines, hb `dumpops` end-x vs Chrome):** the pure advance model (sum the committed table fu, no
+kerning) already has **mean |err| = 0.582px** vs Chrome `measureText` — **already below the 1px
+target.** The residual is dominated by ONE effect: **hambrowse does not apply kerning.** Proven:
+`measureText` (and rendered `getBoundingClientRect`, which equals it) applies kern pairs — AV −1.19px,
+To/Te −1.77, Yo −1.47, WATTAGE −2.97 — while hb sums per-glyph advances flat. The table matches
+Chrome's per-glyph `measureText` EXACTLY (0 cells >0.6fu off), but the per-glyph SUM exceeds Chrome's
+whole-line `measureText` by the kern total: worst line "WWMM…KANGAROO WATTAGE" **+3.26px**,
+"Association of Widely Available…" +0.90px, plain prose ≈0 (mean missing-kern over-width −0.023px,
+range [−1.44,+3.26]). **A kern-pair subset would cut mean |err| 0.58→~0.26px (pure rounding floor)
+and worst-case ~3.3px→~0.**
+
+**Conclusion:** the per-glyph advance table is OPTIMAL at integer-fu resolution (≤0.017px/glyph vs
+Chrome; mean line advance err 0.58px < 1px target). Further table precision is un-measurable and
+not worth the broad re-round churn. DE-UNCHANGED is trivially satisfied — **no file changed except
+this doc** (`font_adv.ad`/`font_ttf.ad`/`htmlpaint.ad` all byte-identical; no engine/gate touched).
+
+### Ranked roadmap for round 20+
+1. **Kerning (pair adjustment)** — the now-quantified real #1 horizontal lever. Chrome's rendered
+   text applies Liberation/Arial kern pairs (AV, To, WA, Ta, Ya, …); hb sums flat advances, running
+   up to ~3px wide on caps/pairs-heavy lines and ~0.9px on mixed prose. A hambrowse-side kern-pair
+   subtraction (a small pair→delta table alongside `font_adv.ad`, applied once in the
+   `lib/htmlpaint.ad` fu-accumulation path — same measure==paint discipline) would drop mean advance
+   |err| 0.58→~0.26px and kill the caps worst-case. Higher churn/wrap-regression risk than a data
+   table → gate carefully (fixtures with/without kern pairs; prove wrap changes Chrome-correct).
+2. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's `<style media>`.
+3. **Heading vertical rhythm** — em-based h1-h6 top/bottom margins.
+4. `font-family: serif`/`monospace` generic-family metrics (own advance + kern tables).
