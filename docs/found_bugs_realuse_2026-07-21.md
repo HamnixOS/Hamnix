@@ -195,3 +195,42 @@ Re-ranked remaining gaps (round 9):
 4. Prose paragraph rhythm / heading margins on long-form articles (next general lever
    after list rhythm).
 5. `<tr height:5px>` spacer honoring (still deferred; opposing sign to any height fix).
+
+## Chrome-parity progress (rounds 9–11 + heading colour, main 8cf14fd7)
+CLOSED, each measured vs `/usr/bin/chromium`, orchestrator-verified 0-newly-failing:
+- **Round 9 (77374a7c): prose paragraph rhythm** — `<p>`/`<figure>` inter-paragraph gap
+  was drawn at the full ~19px BODY_H row; now tagged at the real UA 16px via `row_mgap`
+  (`g_para_mgap`). p→p gap 19→**16px (exact Chrome)**; paragraph pitch 38→35 (Chrome 34).
+  Margin collapse preserved (a `</p><h2>` boundary keeps the taller heading margin).
+- **Round 10 (33d54238): grid/flex inter-row gap over-height** — a `display:grid;gap:16px`
+  of padded/bordered cards stranded a phantom LINE_H row between grid rows (`_flex_item_close`
+  measured the row bottom from `cur_row`, overshooting the item border-box). Now measured
+  from the item's own outer box. Inter-card-row gap 37→**18px** (Chrome 16); SSIM 0.745→0.814.
+  ALSO: **disproved the ranked-#1 Wikipedia article-max-width lever** — the saved fixture's
+  container max-width lives in external CSS the offline harness can't fetch, so offline Chrome
+  also renders full-width; narrowing hb would DIVERGE from the reference. Dropped from roadmap.
+- **Round 11 (0abcbf41): borderless-box vertical padding baked at real px** — bordered
+  cards/cells were already within 0–4px (rounds 4–10 via `bbox_padv`); the residual ~10–15%
+  over-height was plain BORDERLESS padded bands (padding quantised to whole LINE_H rows, fill
+  only covering the content row). Extended the real-px padding bbox to borderless blocks+floats
+  (no-stroke kind-3 bbox; flex/grid items excluded — they inset via `cur_row` rewind). Fill
+  height now within **2px of Chrome** across 4/8/10/12/16px padding. 9/225 fixtures shift, all
+  improvements.
+- **Heading colour (8cf14fd7): UA-default h1–h6 = body black `#101010`, not `#14306e` blue.**
+  USER flagged the Wikipedia render's blue headings as the last major visible diff vs Chrome.
+  Chrome's UA stylesheet gives headings no colour (inherit black); hambrowse hardcoded a
+  "heading dark blue" in the role palette (`_palette`/`_palette_rgb` idx 2). Set to body text.
+  Explicit author `color:` still wins via the cascade (impliedtags fixture's `h2{color:#14306e}`
+  unchanged). Gates: host (h1/h2/h4/h5/h6 UA-default assertions → #101010), impliedtags,
+  headmargin, google, realsite, realarticle all PASS. Wiki render confirmed black headings.
+
+### Ranked roadmap for round 12+ (in flight: round 12 = HN residual, agent aa4cd81c)
+1. **HN residual column geometry** — rank/vote column wider than Chrome (title starts ~150 vs
+   ~100px); inline sitebit `(domain)` extra leading whitespace. General table-column lever.
+2. **MDN responsive mega-menu collapse** — desktop nav is a click-dropdown Chrome hides; hb
+   renders it expanded (media-query `display:none` / CSSOM). Big MDN lever, complex.
+3. **Global 1px-per-line line-box over-height** (row pitch 19 vs Chrome ~18.4) — now the
+   dominant residual on every multi-line box; HIGH reach but HIGH risk (the BODY_H/LINE_H
+   quantisation sticky + grid-auto-rows invariants depend on; needs a per-row variable-pitch
+   pass, not a global floor change).
+4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
