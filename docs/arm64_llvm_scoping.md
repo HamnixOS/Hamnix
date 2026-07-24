@@ -1,11 +1,11 @@
 # ARM64 (AArch64) LLVM Retarget — Scoping Spike
 
-Status: **A1 DONE + A2 percpu/barrier crux DONE** (retarget landed in
-`ssa_llvm.ad` behind a `--target=aarch64` emitter flag; A3 boot layer is the
-remaining phase). The original scoping spike (main @ 731f39b9, no compiler code
-changed) is preserved below as the feasibility evidence; the **phase-status
-delta from the implementation work is recorded in the "Implementation status"
-box immediately below** and inline in §3.
+Status: **A1 DONE + A2 DONE** (whole-kernel `.ll` compiles CLEAN for aarch64 —
+**0** clang errors; retarget landed in `ssa_llvm.ad` behind a `--target=aarch64`
+emitter flag; A3 boot layer is the remaining phase). The original scoping spike
+(main @ 731f39b9, no compiler code changed) is preserved below as the feasibility
+evidence; the **phase-status delta from the implementation work is recorded in the
+"Implementation status" box immediately below** and inline in §3.
 
 ---
 
@@ -24,7 +24,46 @@ emitted with `--target=aarch64` (no sed), `clang --target=aarch64` +
 `qemu-aarch64`, output byte-identical to the x86_64 native run (`16834`,
 sha256[:16] `702b7185d5376ccf`).
 
-**A2 — kernel percpu crux + barriers: DONE (remainder documented).**
+**A2 — freestanding kernel `.ll` compiles CLEAN for aarch64: DONE (0 clang
+errors).** Update (2026-07-23, second increment): the A2-remainder inline-asm
+classes below are now all remapped, driving the uncapped
+`clang --target=aarch64-none-elf -ferror-limit=0 -c kernel_arm64.ll` error count
+**272 → 0** (clang rc=0; emits a valid `ELF 64-bit LSB relocatable, ARM aarch64`
+object, 10.9 MB). All remaps are gated behind `cg_llvm_target` in the SVO_INLINEASM
+path (new `ll_emit_aarch64_asm`, replacing `ll_emit_aarch64_barrier`); the x86
+lane is byte-identical (x86 `.ll` still 236 `addrspace(256)` / 0 `tpidr` / 17
+`hlt` / 0 `br xN`).
+- **14 indirect tail-call (retpoline) trampolines → `br xN`.** The Linux x86
+  `__x86_indirect_thunk_r*` shims (`popq %rbp; jmpq *%rN`, plus the `%rbp` variant
+  `movq %rbp,%r11; popq %rbp; jmpq *%r11` → `mov x9, x29; br x9`) emit the aarch64
+  branch-to-register form under an x86-GPR→aarch64-GPR map (rax→x0 … r15→x13).
+  These are x86-only `.ko` shims — dead on aarch64 (the caller-side retpoline
+  convention that pre-loads the target in rN does not exist on ARM) — so `br xN`
+  keeps the branch-to-register shape and assembles cleanly. Disassembly proof:
+  `d61f0000 br x0`, `d61f0120 br x9`, … (14 sites).
+- **mul128 (`tls_mul128`) → FAITHFUL `mul`+`umulh`.** Reads `tls_mul128_{a,b}`,
+  writes `tls_mul128_{lo,hi}` via `adrp`/`:lo12:` addressing — a real working
+  128-bit widening multiply. Disassembles to `mul`/`umulh x12, x9, x10`.
+- **rdrand/rdseed → ARMv8.5-RNG `mrs RNDR`/`RNDRRS`.** `rdrand`→`mrs x9,
+  s3_3_c2_c4_0` (disassembles to `mrs x9, rndr`), `rdseed`→`s3_3_c2_c4_1`
+  (`rndrrs`); result stored to `hwrng_scratch`, success flagged in `hwrng_cf`.
+  Needs FEAT_RNG — A3 should add an `ID_AA64ISAR0_EL1.RNDR` gate + software
+  fallback for pre-8.5 cores (e.g. QEMU `-M virt` default).
+- **cpuid (2), s3_save (ACPI S3), lidt/int3 (reset) → documented aarch64 stubs
+  (`nop`).** These mechanisms are x86-platform-specific: aarch64 CPU
+  identification is `mrs MIDR_EL1`/`ID_AA64*`, suspend is PSCI `CPU_SUSPEND`, and
+  reset is PSCI `SYSTEM_RESET` — all wired in the A3 boot layer. The `nop` stubs
+  leave the `cpuid_*` output globals at their prior value (no false x86 feature
+  claims on paths not reached on aarch64).
+- **aarch64 clobber list widened** to `~{x9}..~{x13},~{memory},~{cc}` (covers the
+  mul128/rng scratch regs; barriers touch no GPRs so this is harmless for them).
+- **aarch64 link probe:** `aarch64-linux-gnu-ld -r` merges the object cleanly. A
+  full executable link needs **131** undefined symbols (`atomic_*`, `ap_*`,
+  `cea_*`, `cpuid_get`, `arch_get_random_u64`, …) supplied by a not-yet-existing
+  `arch/arm64/` boot layer + a native fallback for the 5 LLVM bails — exactly the
+  Phase A3 work (EL1 entry, `VBAR_EL1` vectors, atomics, MMU/TTBR, GIC, PSCI).
+
+**A2 (first increment) — kernel percpu crux + barriers: DONE.**
 - **`%gs`/`addrspace(256)` percpu → `TPIDR_EL1` (the silent-miscompile crux):
   FIXED.** Each of the 236 addrspace(256) occurrences (= 118 percpu accesses) now
   emits, on aarch64, `%b = call i64 @llvm.read_register.i64(metadata !0)` (a
