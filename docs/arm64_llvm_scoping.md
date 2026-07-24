@@ -1,11 +1,108 @@
 # ARM64 (AArch64) LLVM Retarget — Scoping Spike
 
-Status: **A1 DONE + A2 DONE** (whole-kernel `.ll` compiles CLEAN for aarch64 —
-**0** clang errors; retarget landed in `ssa_llvm.ad` behind a `--target=aarch64`
-emitter flag; A3 boot layer is the remaining phase). The original scoping spike
+Status: **A1 DONE + A2 DONE + A3 boots** (whole-kernel `.ll` compiles CLEAN,
+LINKS to a bootable aarch64 ELF with **0 undefined symbols**, and BOOTS on
+`qemu-system-aarch64 -M virt`: PL011 early console + MMU/caches on + **emitted
+Adder LLVM code proven executing on aarch64**). The original scoping spike
 (main @ 731f39b9, no compiler code changed) is preserved below as the feasibility
 evidence; the **phase-status delta from the implementation work is recorded in the
 "Implementation status" box immediately below** and inline in §3.
+
+---
+
+## Implementation status (2026-07-24) — A3 boot layer
+
+**A3 — `arch/arm64/llvm/` boot layer + link + boot: DONE for the entry/console/
+MMU/execution-proof milestone.** The whole-kernel aarch64 `.ll` (11064 funcs,
+11059 emitted, 5 bails) now LINKS into a bootable `ELF 64-bit LSB executable, ARM
+aarch64` with **0 undefined symbols** and boots on `qemu-system-aarch64 -M virt
+-cpu cortex-a72 -m 2G`. Gate `scripts/test_arm64_llvm_kernel.sh` (NEW): **PASS**.
+
+Verified PL011 serial (grep-a'd from the actual qemu-system-aarch64 run — the
+furthest point; kernel then halts in a `wfi` park loop, qemu killed by timeout):
+```
+HAMNIX aarch64 LLVM-kernel: EL1 entry OK (PL011 early console)
+MMU: identity map enabled (device 0-1G, RAM 1-2G Normal-WB, caches on)
+LLVM-ADDER fmt_is_flag[+,A,0,#,sp,z]=101110
+LLVM-ADDER-OK: emitted Adder code executed on aarch64
+```
+The `101110` is the input-dependent, branch-heavy return of the PURE emitted
+Adder leaf `kernel_printk_printk__fmt_is_flag` from the LLVM kernel object, called
+from `head.S` over the vector `['+','A','0','#',' ','z']` (flag chars →
+`1,0,1,1,1,0`). Matching bit-exactly proves the Adder LLVM backend's output
+**runs correctly on real aarch64** — the A3 "enters and runs Adder code" goal.
+
+**The 131 undefined symbols, categorized + resolved** (`nm -u` on the aarch64
+`.o`; enumerated in the build):
+- **(a) 5 LLVM bails** (`start_kernel` reason=0 [7674-line fn > cfg NM_MAX],
+  `do_syscall`, `linux_abi_api_snd_pcm__snd_pcm_new`, `tests_core_smoke__list_walk_and_sum`,
+  `init_main__try_parse_hamnix_roots`) → **return-0 stubs** in
+  `arch/arm64/llvm/stubs.c`. NOTE: `start_kernel` ITSELF is a bail, so full kernel
+  init is not yet reachable through the LLVM object — the A3 proof deliberately
+  calls a small pure emitted leaf instead. (The x86 lane supplies these 5 from a
+  native hybrid `main.o`; an aarch64 native-fallback object is the A4 analogue.)
+- **(b) ~100 x86 arch/boot shims** (CR/MSR/EFER `read_cr*/write_msr/set_efer_*`,
+  FPU `fpu_fx*/xsave`, IDT/TSS/CEA `idt_load/tss_*/cea_*`, AP/SMP `ap_*`, EFI
+  `get_efi_*/efi_ms_call*`, multiboot `get_mb_*`, image bounds `kernel_text_*`,
+  per-CPU `get_per_cpu_*`, `cpuid_get`, `syscall_entry`, `__switch_to_asm`, …) →
+  **return-0/nop stubs** (`stubs.c`). None are reached by the boot proof; they
+  exist to LINK. Real aarch64 mechanisms (PSCI reset/suspend, GICv2 already-proven
+  in the standalone `kmain.ad`, `MIDR_EL1` cpuid, EL0 `svc` entry) are A4+.
+- **(c) atomics/mem/arch intrinsics** (`atomic_{add,cas}{32,64}`, `spinlock_*`,
+  `mem{cpy,move,set}`, `local_irq_*`, `cpu_relax`, `safe_halt`, `invlpg_one`,
+  `read_tsc`, `arch_get_random_u64`, port-I/O `in*/out*`) → **real aarch64
+  implementations** in `arch/arm64/llvm/intrinsics.S` (LL/SC `ldaxr`/`stlxr`
+  atomics + spinlocks, `DAIF` masking, `TLBI VAE1`, `CNTVCT_EL0` timing; port I/O
+  is a nop/0 — no port space on ARM). ABI mirrors `scripts/kllvm_io_intrinsics.S`.
+
+**Boot layer authored** (`arch/arm64/llvm/`, mirroring `arch/x86/`; kept SEPARATE
+from the standalone hand-written aarch64 kernel in `arch/arm64/{boot,kmain,
+vectors,kernel.lds}` that independently reached Phase 49):
+- `head.S` — reset entry at QEMU virt's `0x40080000`: secondary-CPU park, **EL2→EL1
+  drop** (`HCR_EL2.RW`, `SPSR_EL2`, `eret`), boot stack, **.bss zero**, `TPIDR_EL1`
+  per-CPU base (the A2 percpu emission reads it), `VBAR_EL1` install, PL011 early
+  console (`uart_putc/puts/puthex`), **MMU bringup** (identity 1 GiB L1 blocks:
+  device 0-1G + Normal-WB RAM 1-2G, `MAIR=0xff04`/`TCR=0x1_0000_3519`/`SCTLR.M|C|I`,
+  constants shared with the proven `kmain.ad`), and the fmt_is_flag execution proof.
+- `vectors.S` — 16-slot `0x800`-aligned `VBAR_EL1` table; every slot → a diagnostic
+  that dumps `ESR_EL1`+`ELR_EL1` over PL011 and halts (so any fault yields exact
+  serial evidence instead of a silent hang).
+- `intrinsics.S`, `stubs.c` — the (c) and (a)+(b) symbol resolutions above.
+- `kernel.lds` — `OUTPUT_ARCH(aarch64)`, identity link at `0x40080000` (no VMA/LMA
+  split; the aarch64 high-half TTBR1 kernel VA is A4+, and no absolute kernel VA is
+  baked in the IR so it is purely a linker/MMU concern per §2c). Keeps `.got*`
+  mapped (discarding a non-empty `.got.plt` is a fatal ld error).
+- `scripts/build_kernel_llvm_arm64.sh` — the aarch64 build lane (drops
+  `-mcmodel=kernel`; uses `--target=aarch64-none-elf -mcmodel=small` + aarch64
+  binutils). Includes a **build-lane-only** `.ll` post-process that over-aligns
+  globals to `>=8` (the A2 rdrand/rdseed/mul128 inline-asm does 64-bit
+  `str x,[..,:lo12:sym]` on `align 1` `[8 x i8]` scratch globals →
+  `R_AARCH64_LDST64_ABS_LO12_NC relocation truncated`; over-alignment is always
+  safe and rewrites only the GENERATED file — no compiler-source change, x86 lane
+  byte-identical).
+
+**HARD-RULE compliance:** A3 is boot-layer (`arch/arm64/llvm/`) + a new script
+lane ONLY — **no `ssa_llvm.ad`/`ssa.ad`/`codegen.ad` change**, so the x86 native
+path is byte-identical by construction and the compiler native-safety gates
+(kobjdiff/fuzz/OPT2/bench) do not apply to this change.
+
+**A4+ next phases (ranked):**
+1. **Reach real kernel init.** `start_kernel` is an LLVM bail — either raise the
+   cfg `NM_MAX` cap / split the function so it emits, or build an **aarch64 native
+   fallback object** (the x86-hybrid analogue) so the 5 bails get real bodies, then
+   call `start_kernel` and walk the early-init sequence (printk over a PL011-routed
+   `outb`, memory init, scheduler).
+2. **PL011-route the kernel's own console.** Point the emitted `early_8250`
+   `outb`/`inb` at the PL011 (make `inb` of the LSR return THRE-ready, `outb` of
+   the THR write the PL011 DR) so the kernel's OWN Adder `printk`/`early_putc`
+   emits over aarch64 serial — a stronger end-to-end proof than the leaf call.
+3. **Real exception handling + GICv2 + generic timer tick** (port the proven
+   `kmain.ad` GICv2/`CNTV_*` bringup into this lane) → preemptive scheduling.
+4. **virtio-mmio console/blk + initramfs** (`-M virt` is all-virtio) → boot to a
+   shell, mirroring the standalone track's Phase 30+.
+5. **Compiler follow-ups (gated, A4 `ssa_llvm.ad`):** `align 8` on the
+   rdrand/mul128 scratch globals (removes the build-lane sed); `FEAT_RNG` gate +
+   software fallback for `arch_get_random_u64`; higher-half TTBR1 kernel VA.
 
 ---
 
