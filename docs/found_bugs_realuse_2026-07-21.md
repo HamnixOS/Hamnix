@@ -283,3 +283,33 @@ align=center likewise; plain table x0=35 unchanged; width:100%+margin:auto still
    residual on every multi-line box; HIGH reach, HIGH risk (BODY_H/LINE_H quantization +
    grid-auto-rows invariants; needs a per-row variable-pitch pass).
 4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
+
+## Chrome-parity progress (round 14, main 911815f8)
+Measure-first FINDING: the assigned target (`@media` `display:none` collapse) was ALREADY
+working — `lib/web/css/cascade.ad` has a full CSS Media Queries L4 subset (`_media_matches`/
+`_mq_query`/`_mq_feature`: min/max-width+height, orientation, prefers-color-scheme, and/comma/
+not/only) threaded to the LIVE viewport (`bw`×`bh`); `_parse_at_rule` recurses matching `@media`,
+skips non-matching. Verified both directions (desktop nav @1000px, mobile @640px). Roadmap
+entry was stale. CLOSED instead the genuine narrower gap: **the `media` ATTRIBUTE on a
+`<style media="(max-width:799px)">` element was ignored** — `_collect_css` never read `media=`,
+so a responsive `<style media>` block cascaded unconditionally (hiding a desktop nav even wide).
+Fix (~8 lines): `_collect_css` reads the `media` attr via `_hx_find_attr` and gates the block
+through the same `_media_matches` (live viewport); non-matching skipped, matching applies,
+no-media/`all` unchanged. Measured (`hambrowse_stylemedia.html`): wide 1000px article-start-y
+78→**135px** (desktop nav restored); narrow 640px collapses correctly. Churn: of 229 fixtures
+ONLY the new `hambrowse_stylemedia` shifts (228 byte-identical), 0 newly-failing, all required +
+media/matchmedia/stylemedia PASS. New gate `test_hambrowse_stylemedia_host.sh`.
+
+### Ranked roadmap for round 15+
+1. **Sitebit / inline space-glyph width** (space+`(` ~16px vs Chrome ~9px) — the DejaVu-wide
+   space advance; general font-metric lever affecting ALL prose horizontal spacing. Needs a
+   hambrowse-side advance override (`lib/font_ttf.ad` is DE-shared / off-limits). Moderate churn
+   risk — gate carefully.
+2. **`<link media="…">` external-sheet gating** — the external-stylesheet sibling of round 14's
+   `<style media>` fix; a fetched `<link media>` sheet is not yet media-gated. Lower host-
+   testability (external fetch is on-device); gate via a synthetic `he_css_append`-with-media
+   harness.
+3. **Global 1px-per-line line-box over-height** (row pitch 19 vs Chrome ~18.4) — dominant
+   residual on every multi-line box; HIGH reach, HIGH risk (BODY_H/LINE_H quantization +
+   grid-auto-rows invariants; needs a per-row variable-pitch pass).
+4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
