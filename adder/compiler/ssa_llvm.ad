@@ -209,6 +209,26 @@ llvm_stat_funcs: uint32 = 0
 llvm_stat_emitted: uint32 = 0
 llvm_stat_bailed: uint32 = 0
 
+# LLVM emitter TARGET-ARCH selector (ARM64 retarget, docs/arm64_llvm_scoping.md).
+#   0 = x86_64  (DEFAULT — the whole emitter path is byte-identical to the
+#                pre-ARM64 compiler when this stays 0; the driver only sets it
+#                to 1 for an explicit `--target=aarch64*` on the --backend=llvm
+#                lane, so the native ELF path and every prior LLVM emission are
+#                unaffected)
+#   1 = aarch64 (svc/x8 syscall ABI + aarch64 Linux syscall-number table, and
+#                for the KERNEL lane: TPIDR_EL1 percpu base + aarch64 barrier
+#                mnemonics in place of the x86 %gs/addrspace(256) + hlt/cli/...)
+# Read by: the module triple, the SVO_SYSCALL emitter, the addrspace(256)
+# percpu load/store path, and the SVO_INLINEASM barrier remap.
+cg_llvm_target: uint32 = 0
+
+# Whether the current module has already emitted the aarch64 percpu-base
+# read-register plumbing (`declare @llvm.read_register.i64` + the
+# `!llvm.named.register.tpidr_el1` named metadata).  Emitted lazily on the first
+# TPIDR_EL1 percpu access so a module with no percpu use stays clean; reset per
+# program in llvm_emit_program.
+llvm_tpidr_meta_done: uint32 = 0
+
 
 # =======================================================================
 # low-level text emit
@@ -300,6 +320,46 @@ def ll_put_asm_string(off: uint32, len_: uint32):
         else:
             ll_putc(c)
         i = i + 1
+
+
+# Compare the asm-body bytes strbuf[off..off+len_) against a NUL-terminated
+# literal.  Returns 1 on an exact (whole-string) match.
+def ll_asm_body_eq(off: uint32, len_: uint32, lit: Ptr[uint8]) -> uint32:
+    i: uint32 = 0
+    while i < len_:
+        if lit[i] == 0:
+            return 0                      # literal shorter than the body
+        if cast[uint32](strbuf[off + i]) != cast[uint32](lit[i]):
+            return 0
+        i = i + 1
+    if lit[len_] != 0:
+        return 0                          # literal longer than the body
+    return 1
+
+
+# AArch64 barrier remap for the 5 trivial x86 barrier/wait mnemonics that appear
+# as zero-operand `asm_volatile("<mnem>")` in kernel .ad source (hlt/cli/sti/
+# pause/mfence).  Emits the aarch64 equivalent asm body and returns 1; returns 0
+# for any other body (the caller then emits the verbatim x86 text, which will
+# fail the aarch64 assembler — a remaining A2 error class, quantified in the
+# scoping doc).  Consulted only when cg_llvm_target != 0.
+def ll_emit_aarch64_barrier(off: uint32, len_: uint32) -> uint32:
+    if ll_asm_body_eq(off, len_, "hlt") != 0:
+        ll_puts("wfi")                    # halt -> wait-for-interrupt
+        return 1
+    if ll_asm_body_eq(off, len_, "cli") != 0:
+        ll_puts("msr daifset, #2")        # mask IRQ (DAIF.I)
+        return 1
+    if ll_asm_body_eq(off, len_, "sti") != 0:
+        ll_puts("msr daifclr, #2")        # unmask IRQ
+        return 1
+    if ll_asm_body_eq(off, len_, "pause") != 0:
+        ll_puts("yield")                  # spin-wait hint
+        return 1
+    if ll_asm_body_eq(off, len_, "mfence") != 0:
+        ll_puts("dmb ish")                # full inner-shareable data barrier
+        return 1
+    return 0
 
 
 def ll_put_u64_dec(v: uint64):
@@ -419,7 +479,25 @@ def ll_new_tmp() -> uint32:
 # x86-64 SysV syscall input register for operand index i of `__syscallN`:
 #   0 -> rax (syscall number), 1 -> rdi, 2 -> rsi, 3 -> rdx, 4 -> r10,
 #   5 -> r8, 6 -> r9.  Emits the bare register name (no braces).
+# AArch64 (cg_llvm_target==1) Linux SVC ABI: number -> x8, args a1..a6 ->
+# x0,x1,x2,x3,x4,x5; result -> x0.  Same operand-index order.
 def ll_put_syscall_reg(i: uint32):
+    if cg_llvm_target != 0:
+        if i == 0:
+            ll_puts("x8")                 # aarch64 syscall number register
+        elif i == 1:
+            ll_puts("x0")
+        elif i == 2:
+            ll_puts("x1")
+        elif i == 3:
+            ll_puts("x2")
+        elif i == 4:
+            ll_puts("x3")
+        elif i == 5:
+            ll_puts("x4")
+        else:
+            ll_puts("x5")
+        return
     if i == 0:
         ll_puts("rax")
     elif i == 1:
@@ -434,6 +512,45 @@ def ll_put_syscall_reg(i: uint32):
         ll_puts("r8")
     else:
         ll_puts("r9")
+
+
+# Map an x86-64 Linux syscall number to the AArch64 (asm-generic) Linux syscall
+# number.  The Adder `__syscallN(nr, ...)` form bakes the x86-64 Linux number as
+# a compile-time constant; on aarch64 those numbers differ (asm-generic ABI), so
+# when the number operand is a literal we remap it here.  Covers the syscalls the
+# Adder user-mode runtime + host driver actually issue; numbers with the SAME
+# 3-arg-or-fewer signature map 1:1.  `open`(x86 2) has NO aarch64 equivalent (it
+# is openat-only) and cannot be number-remapped safely, so it is passed through
+# unchanged (callers targeting aarch64 must use openat=56 directly).  Any number
+# not in the table passes through unchanged.
+def ll_aarch64_syscall_nr(x86nr: int64) -> int64:
+    if x86nr == 0:                        # read
+        return 63
+    if x86nr == 1:                        # write
+        return 64
+    if x86nr == 3:                        # close
+        return 57
+    if x86nr == 8:                        # lseek
+        return 62
+    if x86nr == 9:                        # mmap
+        return 222
+    if x86nr == 11:                       # munmap
+        return 215
+    if x86nr == 60:                       # exit
+        return 93
+    if x86nr == 231:                      # exit_group
+        return 94
+    if x86nr == 257:                      # openat
+        return 56
+    if x86nr == 62:                       # kill
+        return 129
+    if x86nr == 39:                       # getpid
+        return 172
+    if x86nr == 96:                       # gettimeofday
+        return 169
+    if x86nr == 228:                      # clock_gettime
+        return 113
+    return x86nr
 
 
 def ll_put_tmp(t: uint32):
@@ -459,6 +576,62 @@ def ll_put_ity_ptr(w: uint32, as256: uint32):
     if as256 != 0:
         ll_puts(" addrspace(256)")
     ll_putc(42)                           # '*'
+
+
+# Effective address-space for the actual load/store TYPE at a percpu site.  On
+# x86-64 a percpu access keeps addrspace(256) (the %gs model).  On aarch64 the
+# per-CPU base is folded into the address via TPIDR_EL1 (see ll_emit_pcpu_ptr),
+# so the resulting pointer is an ordinary addrspace(0) pointer -> 0.
+def ll_pcpu_eff_as(las: uint32) -> uint32:
+    if cg_llvm_target != 0:
+        return 0
+    return las
+
+
+# Emit the pointer temp for a memory access whose byte OFFSET operand is
+# `addr_v` and width `w` (bytes).  `las` != 0 marks a per-CPU (%gs) access.
+#
+#  * x86-64, or non-percpu:  `%p = inttoptr i64 <off> to iW[ addrspace(256)]*`.
+#  * aarch64 percpu:         read the per-CPU base from TPIDR_EL1 via
+#      `llvm.read_register.i64(metadata !"tpidr_el1")`, ADD the slot offset, then
+#      `inttoptr` the sum to a plain iW* — aarch64 lowers this to
+#      `mrs xN, TPIDR_EL1` + offset load/store (NOT a bare `ldr`, which would be
+#      the silent miscompile if addrspace(256) were emitted verbatim; aarch64 has
+#      no GS-style address space).
+# Returns the SSA temp id holding the iW* pointer.
+def ll_emit_pcpu_ptr(addr_v: uint32, w: uint32, las: uint32) -> uint32:
+    if cg_llvm_target != 0 and las != 0:
+        llvm_tpidr_meta_done = 1          # request module-level plumbing emission
+        base: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(base)
+        ll_puts(" = call i64 @llvm.read_register.i64(metadata !0)\n")
+        addr: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(addr)
+        ll_puts(" = add i64 ")
+        ll_put_operand(addr_v)
+        ll_puts(", ")
+        ll_put_tmp(base)
+        ll_putc(10)
+        p: uint32 = ll_new_tmp()
+        ll_puts("  ")
+        ll_put_tmp(p)
+        ll_puts(" = inttoptr i64 ")
+        ll_put_tmp(addr)
+        ll_puts(" to ")
+        ll_put_ity_ptr(w, 0)              # plain iW* — base already folded in
+        ll_putc(10)
+        return p
+    p2: uint32 = ll_new_tmp()
+    ll_puts("  ")
+    ll_put_tmp(p2)
+    ll_puts(" = inttoptr i64 ")
+    ll_put_operand(addr_v)
+    ll_puts(" to ")
+    ll_put_ity_ptr(w, las)
+    ll_putc(10)
+    return p2
 
 
 # Print "0x" + 16 UPPERCASE hex digits of `v` — LLVM's textual form for an
@@ -1131,18 +1304,12 @@ def llvm_emit_value(v: uint32):
             return
         w: uint32 = sv_aux[v]
         las: uint32 = sv_as256[v]         # 1 => %gs-relative percpu (addrspace 256)
-        p: uint32 = ll_new_tmp()
-        ll_puts("  ")
-        ll_put_tmp(p)
-        ll_puts(" = inttoptr i64 ")
-        ll_put_operand(sv_a[v])
-        ll_puts(" to ")
-        ll_put_ity_ptr(w, las)
-        ll_putc(10)
+        eff_las: uint32 = ll_pcpu_eff_as(las)
+        p: uint32 = ll_emit_pcpu_ptr(sv_a[v], w, las)
         if w == 8:
             ll_put_result(v)
             ll_puts("load i64, ")
-            ll_put_ity_ptr(8, las)
+            ll_put_ity_ptr(8, eff_las)
             ll_putc(32)
             ll_put_tmp(p)
             ll_putc(10)
@@ -1153,7 +1320,7 @@ def llvm_emit_value(v: uint32):
             ll_puts(" = load ")
             ll_put_ity(w)
             ll_puts(", ")
-            ll_put_ity_ptr(w, las)
+            ll_put_ity_ptr(w, eff_las)
             ll_putc(32)
             ll_put_tmp(p)
             ll_putc(10)
@@ -1195,20 +1362,14 @@ def llvm_emit_value(v: uint32):
             return
         w: uint32 = sv_aux[v]
         sas: uint32 = sv_as256[v]         # 1 => %gs-relative percpu (addrspace 256)
+        eff_sas: uint32 = ll_pcpu_eff_as(sas)
         svt: uint32 = ll_coerce_i64(sv_b[v])
-        p: uint32 = ll_new_tmp()
-        ll_puts("  ")
-        ll_put_tmp(p)
-        ll_puts(" = inttoptr i64 ")
-        ll_put_operand(sv_a[v])
-        ll_puts(" to ")
-        ll_put_ity_ptr(w, sas)
-        ll_putc(10)
+        p: uint32 = ll_emit_pcpu_ptr(sv_a[v], w, sas)
         if w == 8:
             ll_puts("  store i64 ")
             ll_put_operand_ct(sv_b[v], svt)
             ll_puts(", ")
-            ll_put_ity_ptr(8, sas)
+            ll_put_ity_ptr(8, eff_sas)
             ll_putc(32)
             ll_put_tmp(p)
             ll_putc(10)
@@ -1226,7 +1387,7 @@ def llvm_emit_value(v: uint32):
             ll_puts(" ")
             ll_put_tmp(t)
             ll_puts(", ")
-            ll_put_ity_ptr(w, sas)
+            ll_put_ity_ptr(w, eff_sas)
             ll_putc(32)
             ll_put_tmp(p)
             ll_putc(10)
@@ -1244,11 +1405,20 @@ def llvm_emit_value(v: uint32):
         astr: uint32 = nd_b[iasn]
         ll_puts("  call void asm sideeffect ")
         ll_putc(34)                       # opening '"'
-        ll_put_asm_string(nd_name_off[astr], nd_name_len[astr])
+        iaremap: uint32 = 0
+        if cg_llvm_target != 0:
+            iaremap = ll_emit_aarch64_barrier(nd_name_off[astr], nd_name_len[astr])
+        if iaremap == 0:
+            ll_put_asm_string(nd_name_off[astr], nd_name_len[astr])
         ll_putc(34)                       # closing '"'
         ll_puts(", ")
         ll_putc(34)
-        ll_puts("~{rax},~{rbx},~{rcx},~{rdx},~{rsi},~{rdi},~{r8},~{r9},~{r10},~{r11},~{r12},~{r13},~{r14},~{r15},~{memory},~{cc}")
+        if cg_llvm_target != 0:
+            # aarch64 has no rax..r15 GPR names; the barrier bodies touch no GPRs.
+            # Conservative memory + condition-flag clobber suffices.
+            ll_puts("~{memory},~{cc}")
+        else:
+            ll_puts("~{rax},~{rbx},~{rcx},~{rdx},~{rsi},~{rdi},~{r8},~{r9},~{r10},~{r11},~{r12},~{r13},~{r14},~{r15},~{memory},~{cc}")
         ll_putc(34)
         ll_puts("()\n")
         return
@@ -1275,21 +1445,32 @@ def llvm_emit_value(v: uint32):
         while sci < sn:
             scat[sci] = ll_coerce_i64(sca[sci])
             sci = sci + 1
+        # AArch64: `svc #0`, number in x8, result in x0, only memory clobbered.
+        # x86-64: `syscall`, number in rax, result in rax, rcx/r11/memory clobber.
         ll_put_result(v)
         ll_puts("call i64 asm sideeffect ")
         ll_putc(34)                       # '"'
-        ll_puts("syscall")
+        if cg_llvm_target != 0:
+            ll_puts("svc #0")
+        else:
+            ll_puts("syscall")
         ll_putc(34)                       # '"'
         ll_puts(", ")
         ll_putc(34)                       # '"'
-        ll_puts("={rax}")                 # output: syscall return value in rax
+        if cg_llvm_target != 0:
+            ll_puts("={x0}")              # aarch64: result in x0
+        else:
+            ll_puts("={rax}")             # x86-64: result in rax
         sci = 0
         while sci < sn:
             ll_puts(",{")                 # one input register per operand
             ll_put_syscall_reg(sci)
             ll_putc(125)                  # '}'
             sci = sci + 1
-        ll_puts(",~{rcx},~{r11},~{memory}")
+        if cg_llvm_target != 0:
+            ll_puts(",~{memory}")
+        else:
+            ll_puts(",~{rcx},~{r11},~{memory}")
         ll_putc(34)                       # '"'
         ll_putc(40)                       # '('
         sci = 0
@@ -1297,7 +1478,14 @@ def llvm_emit_value(v: uint32):
             if sci > 0:
                 ll_puts(", ")
             ll_puts("i64 ")
-            ll_put_operand_ct(sca[sci], scat[sci])
+            # Operand 0 is the syscall NUMBER.  On aarch64 remap a literal x86-64
+            # Linux number to its asm-generic aarch64 number (write 1->64, etc.);
+            # a non-constant number is passed through as-is (rare — the runtime
+            # always uses a literal nr).
+            if sci == 0 and cg_llvm_target != 0 and sv_op[sca[0]] == SVO_CONST:
+                ll_put_i64(cast[uint64](ll_aarch64_syscall_nr(cast[int64](sv_imm[sca[0]]))))
+            else:
+                ll_put_operand_ct(sca[sci], scat[sci])
             sci = sci + 1
         ll_puts(")\n")
         return
@@ -1512,6 +1700,7 @@ def llvm_emit_program(prog: uint32):
     llvm_stat_funcs = 0
     llvm_stat_emitted = 0
     llvm_stat_bailed = 0
+    llvm_tpidr_meta_done = 0
     if prog == 0:
         return
     # The LLVM backend models LOCAL MEMORY (address-taken scalars, local arrays,
@@ -1543,7 +1732,10 @@ def llvm_emit_program(prog: uint32):
 
     ll_puts("target triple = ")
     ll_putc(34)
-    ll_puts("x86_64-pc-linux-gnu")
+    if cg_llvm_target != 0:
+        ll_puts("aarch64-unknown-linux-gnu")
+    else:
+        ll_puts("x86_64-pc-linux-gnu")
     ll_putc(34)
     ll_puts("\n\n")
 
@@ -1577,6 +1769,22 @@ def llvm_emit_program(prog: uint32):
                 ll_put_u32(ssa_bail_reason)
                 ll_putc(10)
         cur = nd_next[cur]
+
+    # AArch64 per-CPU base plumbing: if any percpu access emitted a
+    # `llvm.read_register.i64(metadata !0)` (TPIDR_EL1 base read), declare the
+    # intrinsic and define the named-register metadata at module scope.  Module-
+    # level declares/metadata after the function bodies are valid LLVM textual IR,
+    # and metadata `!0` is forward-referenced from the function bodies (resolved
+    # after parse).  Emitted only when actually used, so a percpu-free aarch64
+    # module (e.g. a user app) stays clean.
+    if cg_llvm_target != 0 and llvm_tpidr_meta_done != 0:
+        ll_puts("declare i64 @llvm.read_register.i64(metadata)\n")
+        ll_puts("!llvm.named.register.tpidr_el1 = !{!0}\n")
+        ll_puts("!0 = !{!")
+        ll_putc(34)                       # '"'
+        ll_puts("tpidr_el1")
+        ll_putc(34)                       # '"'
+        ll_puts("}\n")
 
     ll_puts("; ADDER_STAT funcs=")
     ll_put_u32(llvm_stat_funcs)

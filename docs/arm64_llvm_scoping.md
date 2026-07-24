@@ -1,7 +1,72 @@
 # ARM64 (AArch64) LLVM Retarget — Scoping Spike
 
-Status: **SCOPING SPIKE / feasibility PoC** (main @ 731f39b9). No compiler code
-changed. This document answers one question for the user: is ARM64 a **near-term
+Status: **A1 DONE + A2 percpu/barrier crux DONE** (retarget landed in
+`ssa_llvm.ad` behind a `--target=aarch64` emitter flag; A3 boot layer is the
+remaining phase). The original scoping spike (main @ 731f39b9, no compiler code
+changed) is preserved below as the feasibility evidence; the **phase-status
+delta from the implementation work is recorded in the "Implementation status"
+box immediately below** and inline in §3.
+
+---
+
+## Implementation status (2026-07-23)
+
+**A1 — user-mode `--target=aarch64` emitter flag: DONE.** `ssa_llvm.ad` gained a
+`cg_llvm_target` selector (0 = x86_64 default → byte-identical to before; 1 =
+aarch64), flipped by `--backend=llvm --target=aarch64*` in the host driver. It
+emits (a) the aarch64 module triple, (b) `svc #0` with the number in `x8`, result
+in `x0`, args in `x0..x5`, `~{memory}` clobber, and (c) an x86→aarch64 Linux
+syscall-number remap for a **literal** number operand (write 1→64, read 0→63,
+exit 60→93, exit_group 231→94, close 3→57, lseek 8→62, mmap/munmap, openat
+257→56, …). The scoping PoC's two `sed` lines are now produced by the compiler
+itself. **Gate `scripts/test_arm64_usermode.sh` (NEW): PASS** — `whole_prog`
+emitted with `--target=aarch64` (no sed), `clang --target=aarch64` +
+`qemu-aarch64`, output byte-identical to the x86_64 native run (`16834`,
+sha256[:16] `702b7185d5376ccf`).
+
+**A2 — kernel percpu crux + barriers: DONE (remainder documented).**
+- **`%gs`/`addrspace(256)` percpu → `TPIDR_EL1` (the silent-miscompile crux):
+  FIXED.** Each of the 236 addrspace(256) occurrences (= 118 percpu accesses) now
+  emits, on aarch64, `%b = call i64 @llvm.read_register.i64(metadata !0)` (a
+  named-register read of `tpidr_el1`) + `add` of the slot offset + a plain
+  `inttoptr`/load-store; module-level `declare` + `!llvm.named.register.tpidr_el1`
+  metadata are emitted once, lazily, only when used. **Disassembly proof** (real
+  emitter output, `clang --target=aarch64-none-elf -O2 -S`): the emitted
+  `current_idx_get()` lowers to `mrs x8, TPIDR_EL1` + `ldr x0, [x8, #64]` — NOT a
+  bare `ldr`. The OLD addrspace(256) emission of the same function lowers to a
+  bare `ldr x0, [x8]` on aarch64 (base dropped) — i.e. the retarget converts a
+  silent miscompile into a correct per-CPU access. aarch64 `.ll` now emits **0**
+  `addrspace(256)` (x86 lane still emits 236 — unchanged).
+- **30 trivial barrier asm sites → aarch64: DONE.** `hlt`→`wfi` (17),
+  `cli`→`msr daifset, #2` (6), `sti`→`msr daifclr, #2` (1), `pause`→`yield` (4),
+  `mfence`→`dmb ish` (2), matched by exact asm-body string in the `SVO_INLINEASM`
+  path and paired with an aarch64-valid `~{memory},~{cc}` clobber (the x86
+  `~{rax}…~{r15}` GPR clobber list is invalid on aarch64). aarch64 `.ll` now has
+  **0** leftover `hlt/cli/sti/pause/mfence` bodies; x86 lane unchanged (17 `hlt`).
+- **Kernel `.ll` clang error count: 332 → 272** (uncapped, `-ferror-limit=0`,
+  `clang --target=aarch64-none-elf -c`; the doc's original "186" was the default
+  `-ferror-limit`-capped count, which is now **156**). The **60**-error drop is
+  entirely the barrier remap; the 236 percpu sites were silent (no error) before
+  and correct now, so they contribute no error delta.
+- **A2 remainder (unchanged from the scoping inventory, now the sole residual
+  error classes):** the 14 indirect tail-call trampolines (`popq %rbp`/`popq
+  %rbx`/`jmpq *rN`/`movq %rbp,%r11`) dominate the residual, plus the 8 "real ARM
+  work" sites — `cpuid` (2), `rdrand`/`rdseed` (2 each), `mul128`
+  (`tls_mul128_*`), `s3_save` (ACPI S3), `lidt;int3` (reset). These are
+  category-(b)-mechanical / (b)-real-work from §2a and are the next A2 increment
+  (trampolines are mechanical; cpuid/rng/suspend/reset are stub-able for a first
+  boot).
+
+**HARD-RULE compliance:** the x86_64 path is byte-identical (all aarch64 emission
+is gated behind `cg_llvm_target`, default 0; `codegen.ad` and the native ELF lane
+are untouched). Native-safety gates + x86 `-O0` boot spot-check were re-run after
+the `ssa_llvm.ad`/driver edits — see the commit message / task report.
+
+---
+
+## Original scoping spike (preserved)
+
+This document answers one question for the user: is ARM64 a **near-term
 LLVM retarget** (mostly free, ride the existing `.ll` emitter) or a **larger
 bringup**? Evidence below.
 
@@ -157,10 +222,13 @@ The x86 LLVM kernel went user-apps → freestanding `.ll` compiles → link with
 `.S` stubs → boot → shell (Phases 5b–5s). ARM64 follows the same ladder, and
 Phase A1 is **already green** (§1).
 
-### Phase A1 — user-mode Adder apps on ARM64 (DONE in this spike)
-- **Deliverable:** `scripts/arm64_llvm_poc.sh` — Adder→`.ll`→`clang --target=aarch64`→`qemu-aarch64`.
-- **Acceptance gate (MET):** `whole_prog` output byte-identical to x86_64 (`16834`, matching sha256).
-- **Next within A1:** teach `ssa_llvm.ad` a `--target=aarch64-*` flag that emits
+### Phase A1 — user-mode Adder apps on ARM64 (✅ DONE — emitter flag landed)
+- **Deliverable:** `scripts/arm64_llvm_poc.sh` (sed spike) **superseded by the real
+  emitter flag** + `scripts/test_arm64_usermode.sh` (Adder→`--target=aarch64`
+  `.ll` with NO sed→`clang --target=aarch64`→`qemu-aarch64`, parity asserted).
+- **Acceptance gate (MET):** `whole_prog` output byte-identical to x86_64
+  (`16834`, matching sha256) from compiler-emitted aarch64 `.ll`.
+- **Was "next within A1", now DONE:** `ssa_llvm.ad` `--target=aarch64-*` flag emits
   (a) the aarch64 triple and (b) `svc #0`/`x8`/`x0..x5` for `__syscallN` with an
   aarch64 Linux syscall-number table (write=64, exit=93, …). Gate additively;
   x86 output must stay byte-identical (`scripts/test_native_vs_seed_kobjdiff.sh`,
@@ -170,6 +238,9 @@ Phase A1 is **already green** (§1).
 - **Risk:** low. Proven. Syscall-number table is bookkeeping.
 
 ### Phase A2 — freestanding kernel `.ll` compiles clean for aarch64 (the compiler retarget)
+- **Status: percpu crux + barriers ✅ DONE** (332→272 clang errors; `mrs
+  TPIDR_EL1` disassembly proven). Remainder = 14 trampolines + cpuid/rng/mul128/
+  s3/reset (next increment). See "Implementation status" box at top.
 - **Work:** in `ssa_llvm.ad`, behind the aarch64 target flag: (1) emit aarch64
   equivalents for the 5 trivial barrier mnemonics + the 14 trampoline stubs;
   (2) replace `addrspace(256)` percpu with a `TPIDR_EL1`-based emission (the 236
