@@ -341,3 +341,31 @@ untouched + no DE binary imports lib/web (grep-confirmed by orchestrator) → ca
 3. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's
    `<style media>` fix; on-device fetch, synthetic gate needed.
 4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
+
+## Chrome-parity progress (round 16, main 994c42fb)
+CLOSED: **per-glyph Liberation Sans advance override** (new `lib/web/font_adv.ad`, 254 lines:
+sans+bold per-glyph advances cp 32-126 in 2048-upm units). font_ttf approximates
+DejaVu→Liberation with ONE per-face scale (877/1000), but the true per-GLYPH advances differ
+from a uniform 0.877× — caps runs too narrow, thin/punctuation too wide, error compounding
+over a line. `lib/htmlpaint.ad` measure AND paint now consult the override (fall back to
+font_ttf when it returns -1), so measure==paint (no phantom gaps). Measured long-run end-x vs
+chromium: 43-char CAPS 386→**432** (Chrome ~433); narrow i/l/1/. 183→164 (Chrome 160); wide
+W/M/G/O 451→480 (Chrome 487). **Mean |error| across 6 diverse strings 19px → 4.5px; worst
+47px → ≤9px.** HIGH-churn (advance changes every sans line): 223/230 fixtures shift, but
+**0 newly-failing** — 25 red-after gates all proven base-red (identical fail on base), new
+`glyphadv` gate base-FAIL/fix-PASS, all required + text/wrap PASS (host, google, realsite,
+realarticle, tblwidth, tblcolcap, nesthdr, cellflow, cellrowh, smallrowh, wordspace, wordwrap,
+textindent, whitespace, reflow, limargin, lineheight). DE-UNCHANGED verified: font_ttf.ad
+untouched + no DE binary imports font_adv/htmlpaint/lib.web (orchestrator grep-confirmed).
+
+### Ranked roadmap for round 17+
+1. **Body-text subpixel advance** — the per-glyph INTEGER override leaves ±3-9px residual on
+   long runs from per-glyph rounding; lowering `FU_ADV_MIN_PX` (20) so 16px body uses
+   fu-accumulation with this table cuts it to ~1px, but re-rounds every body line (broad churn);
+   its own gated round.
+2. **Global 1px-per-line line-box over-height** (row pitch 19 vs Chrome ~18.4) — dominant
+   VERTICAL residual on every multi-line box; HIGH reach/HIGH risk (per-row variable-pitch pass).
+3. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's
+   `<style media>` fix.
+4. `font-family: serif`/`monospace` generic-family selection (would let serif/mono get their own
+   advance metrics too).
