@@ -459,3 +459,25 @@ font_adv/lib.web — grep-confirmed — so the change reaches only the browser-f
    heading margin/leading rhythm (h1/h2 top+bottom margins vs Chrome) is the next vertical lever.
 4. `font-family: serif`/`monospace` generic-family selection (would let serif/mono get their own
    advance + line metrics).
+
+## Chrome-parity progress (round 18, main ed3e58c0)
+CLOSED: **body-text subpixel advance** — `FU_ADV_MIN_PX` 20→16 (lib/htmlpaint.ad) so 16px body
+text accumulates the round-16 per-glyph Liberation table in FONT UNITS (pen rounded once) instead
+of summing per-glyph INTEGER advances. Measure-first correction: Chrome's rendered run width ==
+its subpixel `measureText` (bcr==measureText) — Chrome does NOT grid-hint body advances, so
+subpixel accumulation is the faithful model (the old round-16 "Chrome hints to integer" note
+predated the per-glyph table). Measured (9 diverse 40-60char 16px lines): mean |advance err|
+**2.28px → 1.56px** (~32%); worst 4.53→2.98. Lines that drifted opposite directions under the
+integer model both centre on Chrome ±1. Churn: 210/232 fixtures shift (every 16px line re-rounds),
+0 newly-failing (166-gate battery: 144 PASS, 22 FAIL all proven base-red at FU=20; required +
+text/wrap/row-grid incl. wordwrap/reflow/wordspace/textindent all PASS). New gate
+`test_hambrowse_subadv_host.sh`. DE-unchanged (htmlpaint-only; no DE binary imports it).
+Residual ~2px is the font_adv TABLE PRECISION floor (model-independent) → round 19.
+
+### Ranked roadmap for round 19+ (browser PAUSED here at sub-2px accuracy; DE-under-LLVM is the active priority)
+1. **font_adv per-glyph table precision** — the ~2px residual is now the accumulation-independent
+   floor; re-measure Liberation advances at higher precision (longer sample runs / direct hmtx) to
+   push mean |err| below ~1px.
+2. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's `<style media>`.
+3. **Heading vertical rhythm** — em-based h1-h6 top/bottom margins.
+4. `font-family: serif`/`monospace` generic-family metrics.
