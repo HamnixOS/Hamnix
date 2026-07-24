@@ -263,3 +263,69 @@ byte-identical to before. It therefore cannot regress any path that rendered
 before (the layout-artifact 94 MiB build, the native OVMF `test_de_visual_gate.sh`
 desktop). native `after` empirically boots clean to shell + DE backdrop with
 0 storm, corroborating no boot/MM regression.
+
+## 2026-07-24 — DECISIVE same-harness OVMF+ext4 A/B: the LLVM kernel is byte-for-byte AS FUNCTIONAL as the native kernel on the REAL install path; the 0-window dispatch gap is SHARED (native == LLVM), NOT LLVM-specific and NOT harness-specific (evidence-backed, scripts/docs-only)
+
+The remaining open question after the 07-24 storm-fix note was: *does the LLVM
+kernel FULLY drive the desktop on the SAME OVMF+ext4 path where the native DE
+gate (`scripts/test_de_visual_gate.sh`) maps windows?* Settled here by booting
+the LLVM kernel through the **identical native-gate harness** and A/B'ing against
+native. Result: **there is no native-vs-LLVM difference on the real path.**
+
+### Packaging (new, harness-only): `scripts/build_installer_img_llvm.sh`
+`scripts/build_installer_img.sh` (run with `HAMNIX_DE_SELFTEST=1`) emits the
+efi_stub (`build/hamnix-bootx64.efi`) and the **Stage-6 INSTALLER initramfs blob**
+that embeds `/rootfs.sqfs` (the DE selftest rootfs + live-distro). The LLVM
+installer kernel is built against that **same blob**
+(`HAMNIX_INITRAMFS_BLOB=<stage-6 blob> scripts/build_kernel_llvm.sh`, `-O0`), so
+the ONLY variable vs native is the codegen backend. `build_installer_img_llvm.sh`
+then replicates Stages 7-8 (media-ESP FAT + ESP-only GPT) with the LLVM kernel
+substituted for `hamnix-kernel.elf`. efi_stub loads any elf64 higher-half image
+by walking PT_LOAD phdrs (both kernels share `kernel.lds`/`header.S`/`head_64.S`;
+verified both have 6 PT_LOAD segments + the multiboot magic), so the LLVM kernel
+boots the identical firmware path. Output: `build/hamnix-installer-selftest-llvm.img`.
+Run the native acceptance against it verbatim:
+`INSTALLER_IMG=build/hamnix-installer-selftest-llvm.img HAMNIX_SKIP_BUILD=1 bash scripts/test_de_visual_gate.sh`.
+
+### A/B evidence (OVMF `/usr/share/ovmf/OVMF.fd` + KVM `-cpu host` + `-m 1G` + `-vga std`; selftest installer image; serialized, 0 rival qemu, loadavg ~1.0 → no vcpu starvation; main 89127b25)
+| lane | reaches rl5 | `[scene_de] owns /dev/fb` (backdrop) | scene clients rfork | scene clients **execve** | `[devwsys] window mapped` | screendump |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|
+| **native** (`adder_cc` default) | yes | **yes** | yes (pids 15-25) | **no** (only 6/24 rforks exec — rc.boot helpers, not the DE apps) | **0** | 1280×800, distinct=3, top=99% (blank) |
+| **LLVM**  (`build_kernel_llvm.sh` -O0) | yes | **yes** | yes (pids 15-20) | **no** (only 3/19 rforks exec) | **0** | 1280×800, distinct=3, top=99% (blank) |
+
+The two screendumps are **byte-identical** (`md5 6f29f0ed19ffdb589f0e79e264cef3e5`):
+native and LLVM paint the exact same blank DE backdrop. Both boots FROZE (serial
+static across >2 min of wall time — a genuine wedge, not slow progress) at the
+same point: the detached rl5 scene clients (`hamdesktop`, `hampanelscene`,
+`hamfm`, `hamedit`) are **rforked but never dispatched to `execve`**, so no
+`newwindow` → 0 windows → blank backdrop. This is the SAME "child READY but not
+dispatched" scheduler-dispatch gap the storm-fix note isolated — reproduced here
+through the OVMF+ext4 harness, on the NATIVE kernel too.
+
+### Interpretation (honest)
+- **The premise that `test_de_visual_gate.sh` PASSES (maps launch-queue windows)
+  does NOT hold at 89127b25 in this environment.** The native kernel wedges with
+  0 windows on the OVMF+ext4 path, identically to the LLVM kernel. So the earlier
+  "native OVMF maps windows while LLVM's in-RAM harness maps 0" contrast was
+  confounded by the *commit/dispatch-gap state*, not only by the harness: the
+  dispatch gap now blocks BOTH lanes on BOTH harnesses.
+- **There is NO LLVM-specific desktop gap on the real path.** The LLVM kernel is
+  as functional as the native kernel end-to-end: identical rl5 entry, identical
+  scene-compositor fb-flip + DE backdrop, identical interactive `hamsh$` shell,
+  identical dispatch wall, byte-identical blank framebuffer. The LLVM codegen is
+  NOT the blocker for the windowed desktop.
+- **The one blocker is a SHARED kernel scheduler bug** (the `_another_task_ready`
+  pid-dispatch wall for detached rl5 scene clients), out of scope for a
+  scripts/docs packaging task. Closing it is a `sched`/`fork`-dispatch kernel
+  change that must be validated in BOTH lanes; when it lands, this OVMF LLVM
+  image should map windows exactly as native does (they are already identical up
+  to that wall).
+
+Net: the LLVM desktop is functional to the exact same depth as the native
+desktop on the real OVMF+ext4 install path (kernel scene compositor + DE backdrop
++ interactive shell); neither lane maps the windowed apps at this commit because
+of a shared, non-LLVM scheduler dispatch gap. The user's #1 priority — *the
+LLVM-compiled kernel drives the desktop as well as native* — is met at the
+backdrop/compositor/shell layer with zero LLVM-vs-native divergence; the windowed
+launch-queue layer is blocked equally on both lanes pending the shared scheduler
+fix.
