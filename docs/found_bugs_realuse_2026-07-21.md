@@ -257,3 +257,29 @@ inline flow, the DejaVu space+`(` glyph advance (font-metric lever), NOT a paddi
 3. **Sitebit / inline space-glyph width** (space+`(` 16px vs Chrome ~9px) — the DejaVu-wide
    space advance; ties into the general font-metric lever affecting all prose.
 4. Wikipedia article-column max-width (SSIM 0.826, closest).
+
+## Chrome-parity progress (round 13, main 8e92c4ad)
+Measure-first FINDING: the assigned target (HN `<center><table width=85%>` gutter) was
+ALREADY working on main (commits 7783e76a/5815a119, pre-round-12) — a `<center>`ed 85% table
+already centers with ~75px gutters matching Chrome. The round-13 roadmap entry was STALE.
+CLOSED instead (adjacent self-centering idioms that were genuinely broken): **`<table style="margin:0 auto">` and `<table align="center">` now center themselves** (previously
+hugged left at x0=35). New `g_tbl_center` (tables.ad) set from `m_center`/`d_center`
+(margin-auto cascade+inline) or the `align="center"` attr (forms.ad); `_compute_cols`
+centers when top-level and `span_w < avail` (so full-width tables never offset; floated
+tables exempt). Measured @1000px: margin:auto 85% table x0 35→**109** (Chrome 100);
+align=center likewise; plain table x0=35 unchanged; width:100%+margin:auto still fills
+10→998. Churn: of 228 fixtures ONLY the new `hambrowse_tblcenter` shifts, 227 byte-identical,
+0 newly-failing (tblwidth/tblcolcap full-width fill verified intact). New gate
+`test_hambrowse_tblcenter_host.sh`.
+
+### Ranked roadmap for round 14+
+1. **MDN responsive mega-menu collapse** — desktop nav is a click-dropdown Chrome hides; hb
+   renders it expanded, pushing the article down (media-query `display:none` / CSSOM). Biggest
+   remaining MDN-class lever, complex.
+2. **Sitebit / inline space-glyph width** (space+`(` ~16px vs Chrome ~9px) — the DejaVu-wide
+   space advance; general font-metric lever affecting all prose. Needs a hambrowse-side advance
+   override (`lib/font_ttf.ad` is DE-shared / off-limits).
+3. **Global 1px-per-line line-box over-height** (row pitch 19 vs Chrome ~18.4) — dominant
+   residual on every multi-line box; HIGH reach, HIGH risk (BODY_H/LINE_H quantization +
+   grid-auto-rows invariants; needs a per-row variable-pitch pass).
+4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
