@@ -410,11 +410,49 @@ the full battery: **0 newly-failing gates**; all reds (abswidth, accentind, …)
 (identical fail on the base binary, unrelated pre-existing failures). New gate
 `test_hambrowse_linebox_host.sh` + fixture `hambrowse_linebox.html`; native hambrowse compiles.
 
-### Ranked roadmap for round 18+
-1. **Body-text subpixel advance** — the per-glyph INTEGER advance override (round 16) leaves ±3-9px
-   residual on long runs from per-glyph rounding; lowering `FU_ADV_MIN_PX` (20) so 16px body uses
-   fractional-unit accumulation with the round-16 table cuts it to ~1px (re-rounds every body line
-   → broad churn; its own gated round). Now the dominant HORIZONTAL residual.
+## Chrome-parity progress (round 18, worktree — LANDED the body-subpixel-advance lever)
+CLOSED: **body-text subpixel advance accumulation** (the roadmap's #1 remaining HORIZONTAL
+residual). Round 16 gave hb an accurate per-glyph Liberation advance table (`lib/web/font_adv.ad`)
+but 16px BODY text still summed those advances as per-glyph INTEGER px (`FU_ADV_MIN_PX=20`, above
+body size), so a long line drifted up to N*0.5px from Chrome by accumulating per-glyph rounding.
+Fix = lower the crossover to **16** (`lib/htmlpaint.ad`, one constant + comment) so 16px body
+accumulates in FONT UNITS and rounds the running pen ONCE — the fu path already used for headings.
+
+**MEASURE-FIRST finding (vs `/usr/bin/chromium` at 16px, getBoundingClientRect):** Chrome's
+rendered run width == its subpixel `measureText` (bcr==measureText to ~0.01px) — Chrome does NOT
+grid-hint each body glyph advance to an integer. The old round-16 comment claiming "Chrome hints
+body to integer" predated the per-glyph table and was measured against the uniform 877 face scale;
+with the real per-glyph table (which IS Chrome's measureText), subpixel accumulation is the faithful
+body model. **Measured 9 diverse 40-60char 16px lines: mean |advance err| 2.28px → 1.56px** (~32%);
+worst 4.5px → 2.98px. Residual is font_adv table precision (~2px on some lines, model-independent —
+lines where per-glyph rounding drift is ~0 don't move), NOT the accumulation model. Two example
+lines drift in OPPOSITE directions under the integer model (base 435<Chrome 438; base 470>Chrome
+468) and BOTH centre on Chrome ±1 with fu accumulation.
+
+**Blast radius / gate churn (base FU=20 vs fix FU=16 binaries, ALL 232 fixtures diffed @640px):**
+210/232 fixtures shift (every page with 16px body text re-rounds — broad, as predicted, like round
+16). **Gate churn = 0 newly-failing.** Ran the full 166-gate host battery on fix + the 25 required
+gates (host, google, realsite, realarticle, tblwidth, tblcolcap, nesthdr, cellflow, cellrowh,
+smallrowh, wordspace, wordwrap, glyphadv, textindent, whitespace, reflow, linebox, limargin,
+lineheight, sticky, grid, pmargin, limarginpx, valign, navgap) — all PASS. 144 PASS / 22 FAIL on
+fix; **all 22 FAILs PROVEN base-red** (identical FAIL rebuilt at FU=20): abswidth, accentind, border,
+borderradius, boxr2, boxshadow, boxsizing, calc, checkradio, decimlen, dispflex, fidelity, flexnav,
+flexwrap_qa, gencontent, gridr2, http_features (on-device/QEMU — environmental), infobox, landing,
+sdl (SDL env), uaelems, website — the documented pre-existing reds + environmental gates, none
+caused here. NO wrap/reflow regressions (reflow/wordwrap/wordspace/textindent/whitespace all PASS).
+New gate `test_hambrowse_subadv_host.sh` (fixture `hambrowse_subadv.html`): two 16px nowrap lines,
+base FU=20 fails both windows on opposite sides, fix FU=16 PASSes; native hambrowse compiles.
+**DE-UNCHANGED:** `lib/font_ttf.ad` UNTOUCHED (only `lib/htmlpaint.ad` constant changed; font_adv.ad
+untouched); no DE binary (hamde/hamUI/hampanel/hamdesktop/hamterm) imports htmlpaint/htmlpage/
+font_adv/lib.web — grep-confirmed — so the change reaches only the browser-family binaries.
+
+### Ranked roadmap for round 19+
+1. **font_adv per-glyph table precision** — the residual ~2px on some 16px lines is now the
+   accumulation-model-INDEPENDENT floor: the round-16 Liberation advance table (measured via canvas
+   `measureText`, run/50) is ~0.03-0.05px/glyph off Chrome on some lowercase/mixed runs, compounding
+   to ~2-3px on 50-60char lines. Re-measure the table at higher precision (longer sample runs, or
+   direct hmtx from a Liberation .ttf) to push the mean |err| below ~1px. Low risk (data-only,
+   same measure==paint path), but broad churn (re-rounds every sans line again).
 2. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's
    `<style media>` fix (on-device fetch; synthetic gate needed).
 3. **h1/32px line-box + heading vertical rhythm** — round 17 fixed 32px→37 pitch; the residual
