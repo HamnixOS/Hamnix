@@ -1069,3 +1069,107 @@ at root; it was a hybrid-link duplicate-global binding bug, NOT a codegen wild
 store. Native kernel byte-identical (opt-in build-script + generated-`.ll` rewrite
 only; no compiler/kernel source; kobjdiff PASS). New furthest point: `boot:42
 start_first_task` + `/bin/hamsh` execve, walling at scheduler `uninitialized sp`.
+
+## Phase 5q — ROOT-FIXED: the `uninitialized sp` panic is a SIGNED-vs-UNSIGNED compare miscompile in the SSA/LLVM backend (`ssa_expr_sgn` ignored struct-member `.field` signedness → `icmp slt` where native uses `icmp ult`); fixed IN `ssa.ad` → LLVM kernel now boots to the interactive `hamsh$` prompt (full userspace, pids 7–26), matching native
+
+Phase 5p left the lane walling at `Kernel panic: schedule: dispatch into task
+with uninitialized sp`. This is a GENUINE codegen miscompile in the SSA/LLVM
+backend (NOT another hybrid-link split), root-caused to an instruction and fixed
+in `adder/compiler/ssa.ad`. The LLVM kernel now boots all the way to the
+interactive shell prompt.
+
+### 1. The panic is a FALSE-POSITIVE guard: the sp is valid, the COMPARE is wrong
+`schedule()` guards against a garbage saved sp with
+`if task_table[nxt].sp < cast[uint64](0x100000): panic(...)` (`kernel/sched/core.ad`
+line ~5201). The panic's own diagnostics printed the sp it was rejecting:
+
+```
+SWITCH-BAD-SP: cpu=0 nxt=5
+SWITCH-BAD-SP: sp=0xffff88800a852f48 pid=5
+SWITCH-BAD-SP: nxt.state=2 on_cpu=1
+SWITCH-BAD-SP: rq_cpu=0 kstack_top=0xffff88800a853000
+```
+
+`sp=0xffff88800a852f48` is a perfectly VALID direct-map kstack address
+(`kstack_top - sp = 0xB8` = a legitimate initial iret frame). It is NOT
+`< 0x100000`. Yet the guard fired — because the compare was emitted as a SIGNED
+comparison, and `0xffff88800a852f48` has bit 63 set, so as a signed i64 it is
+NEGATIVE and therefore "< 0x100000". This is the FIRST `schedule()` dispatch
+whose `nxt.sp` is a high-half/direct-map (bit-63-set) address, which is why the
+bug is latent until exactly this point (`start_first_task` hands off via
+`enter_first_task_sysret`, bypassing the guard; the panic is the first real
+cross-task `schedule()`).
+
+### 2. Pinned to the instruction: `icmp slt` vs `icmp ult` in the emitted `.ll`
+In `build/kllvm/kernel_main.ll`, `@schedule`'s guard compare emitted
+`%v492 = icmp slt i64 %v490, 1048576` (1048576 = 0x100000) — **signed**. The
+LLVM emitter (`ssa_llvm.ad` `ll_put_icmp_pred`) faithfully renders `sv_c[v]`,
+the setcc opcode byte carried in the SSA IR; the IR itself held `0x9C` (setl,
+signed) where it should hold `0x92` (setb, unsigned).
+
+### 3. Root cause — `ssa_expr_sgn` has no ND_MEMBER arm
+`ssa.ad` selects the compare's setcc via
+`ssa_cmp_setcc(op, ssa_expr_sgn(lnode), ssa_expr_sgn(rnode))` (line ~3210), and
+`rel_setcc` only switches to the UNSIGNED family when an operand's signedness
+tristate is `1` (unsigned). For `task_table[nxt].sp < 0x100000` the left operand
+is a struct-member access (`.sp`, a `uint64` field) and the right is a literal.
+But `ssa_expr_sgn` (the SSA backend's shallow operand-signedness helper) only
+handled ND_IDENT / ND_CALL / ND_INDEX / ND_UNARY(deref) — it had **no ND_MEMBER
+arm**, so `task_table[nxt].sp` returned `0` (unknown), the literal returned `0`,
+and `rel_setcc(0x9C, 0, 0)` kept the SIGNED default `0x9C`. The native backend
+(`codegen.ad` `expr_signedness`) DOES have an ND_MEMBER arm
+(`member_scalar_signedness` → the field's declared `uint64` signedness = 1 =
+unsigned → `setb`/`ult`), which is exactly why the NATIVE kernel compiles this
+compare correctly and boots fully. Pure SSA/LLVM-path divergence; the native
+`codegen.ad` path was always correct.
+
+### 4. The fix (native-safe by construction)
+Added the missing ND_MEMBER arm to `ssa_expr_sgn` in `ssa.ad`, delegating to the
+SAME `codegen.ad` helper the native path uses:
+
+```
+    if k == ND_MEMBER:
+        return member_scalar_signedness(node)
+```
+
+(plus importing `member_scalar_signedness` from `compiler.codegen`). This makes
+the SSA/LLVM operand-signedness resolution mirror native exactly. The change is
+confined to `ssa.ad`'s LLVM/`--opt` signedness helper — the native `codegen.ad`
+compare-selection path is untouched, so the native kernel is byte-identical.
+
+### 5. Native-safety gates — ALL PASS (verbatim)
+- `scripts/test_native_vs_seed_kobjdiff.sh`:
+  `[kobjdiff] kernel FUNCs compared: 11064` /
+  `[kobjdiff] PASS — zero semantic kernel divergences across 11064 matched functions` /
+  `[kobjdiff] PASS — native kernel codegen matches the seed (semantic).`
+  (`git diff --stat` = `adder/compiler/ssa.ad | 10 ++++++++++` ONLY —
+  `codegen.ad` does NOT appear in the native diff.)
+- `scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS`
+  (`python-backend miscompiles: 0`, `tooling/run errors: 0`).
+- `ADDER_OPT2=1 scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS`
+  (`codegen.ad accepted: 500 (100.0%)`, `of accepted, CORRECT: 500 (100.0%)`,
+  `MISCOMPILED: 0`).
+- `scripts/bench_llvm.sh`: `[bench_llvm] LLVM compiled 8/8 kernels; bailed: [];
+  wrong: []` (all 8 kernels `AGREE`, `LLVM=OK`; geomean 0.88x gcc-O2).
+
+### 6. Result — new furthest point: the interactive `hamsh$` prompt (grep-verified)
+Default lane (`memblock_alloc` native, KVM `-cpu host`, BIOS-GRUB-ISO,
+`-m 1024M`), `grep -a` on the serial log:
+- `@schedule`'s guard now emits `%v492 = icmp ult i64 %v490, 1048576` (unsigned).
+- ZERO `uninitialized sp` / `SWITCH-BAD-SP` lines.
+- Boot advances through `start_first_task`, `/bin/hamsh` execve, hamsh stages
+  01–05, `M16.35 shell ready`, sources `/etc/rc.boot`, `rfork: child created,
+  pid=7` **dispatched**, then pid=8, 9, 10, 11, and pids 12–26, `stage-06 rc-done`,
+  `stage-07 loop-enter`, and reaches the interactive **`hamsh$ [hamsh:stage-08]
+  ed-readline-first`** prompt — the shell is up and blocking for input. This
+  MATCHES the NATIVE kernel's full boot (the Phase-5n control) — the LLVM lane now
+  reaches userspace steady-state.
+
+Net: the `uninitialized sp` blocker is FIXED at root — a signed/unsigned compare
+miscompile in the SSA/LLVM backend's struct-member signedness resolution, fixed in
+`ssa.ad` (10-line ND_MEMBER arm + import). Native kernel byte-identical (kobjdiff
+PASS, diff = `ssa.ad` only; codegen.ad NOT in the native diff). All four
+native-safety gates green. New furthest point: **interactive `hamsh$` prompt
+(stage-08), full userspace with pids 7–26** — the LLVM-compiled kernel now boots
+to the shell, on par with native. This is the ARM-unlock milestone: a whole-kernel
+LLVM-compiled Hamnix booting to userspace.
