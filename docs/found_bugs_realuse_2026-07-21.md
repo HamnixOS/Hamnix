@@ -234,3 +234,26 @@ CLOSED, each measured vs `/usr/bin/chromium`, orchestrator-verified 0-newly-fail
    quantisation sticky + grid-auto-rows invariants depend on; needs a per-row variable-pitch
    pass, not a global floor change).
 4. `font-family: serif`/`monospace` generic-family selection (low cross-site impact).
+
+## Chrome-parity progress (round 12, main 91080d11)
+CLOSED: **`cellpadding="0"` / `cellspacing="0"` honoring** (the HN/forum/aggregator
+presentational-table pattern). hambrowse ignored the attribute — every column carried a
+fixed 16px CELL_PAD + 6px CELL_PADX and empty cells floored to 24px, so HN's rank +
+empty-votelinks columns pushed each story title far right. Now `<table>` open parses
+`cellpadding` (new `g_tbl_cpad`/`g_tbl_padx` + stack slots), the column model uses it, and
+empty cells collapse when cpad=0. Measured vs chromium (no news.css): full HN page
+rank→title **72px → 32px** (Chrome 26); isolated row **56px → 16px** (Chrome 12); empty
+votelinks column collapses; page height unchanged (horizontal fix). Churn: exactly 9
+fixtures shift (the cellpadding=0 ones), 224 byte-identical, 17/17 required gates PASS. New
+gate `test_hambrowse_cellpad0_host.sh` (base title x0=66 FAIL / fix x0=26 PASS, cpad=8
+control stays 66). Sitebit `(domain)` leading-whitespace gap 2 measured 16 vs Chrome ~9px —
+inline flow, the DejaVu space+`(` glyph advance (font-metric lever), NOT a padding bug.
+
+### Ranked roadmap for round 13+ (in flight: round 13 = HN centering gutter)
+1. **HN `<center><table width=85%>` centering gutter** — Chrome indents the whole table
+   ~75px (85% of 1000, centered); hambrowse gives ~8px (rank@8 vs Chrome@90). General
+   `<center>`/`margin:auto` gutter lever for legacy centered-layout sites.
+2. **MDN responsive mega-menu collapse** — media-query `display:none` / CSSOM.
+3. **Sitebit / inline space-glyph width** (space+`(` 16px vs Chrome ~9px) — the DejaVu-wide
+   space advance; ties into the general font-metric lever affecting all prose.
+4. Wikipedia article-column max-width (SSIM 0.826, closest).
