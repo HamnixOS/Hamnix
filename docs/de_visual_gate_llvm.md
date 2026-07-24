@@ -173,3 +173,93 @@ not in `ssa_llvm.ad`/`ssa.ad`, and must be validated in BOTH lanes.** As a gate
 concern, `test_de_visual_gate_llvm.sh` should either boot native through the SAME
 BIOS-ISO harness to keep the comparison honest, or the underlying wild-free must
 be fixed so both lanes render under the in-RAM path.
+
+## 2026-07-24 — the `[pa-corrupt]` storm is FIXED at its root in `_vma_free_cow_range`; but the storm was NOT the sole cause of the 0-window gate FAIL — a SEPARATE, pre-existing scheduler-dispatch gap still blocks window mapping (evidence-backed, native-safe)
+
+Implemented the fix locus the 2026-07-23 note identified (kernel MM teardown
+routing, `mm/vma.ad`) and A/B-verified it in BOTH lanes through the in-RAM
+BIOS-ISO harness. The storm is GONE. But the fix, while correct and complete for
+the storm, is **necessary-not-sufficient** for the gate: with the storm at zero
+the DE scene clients STILL do not map windows, because they never dispatch — a
+distinct scheduler bug the storm was co-occurring with, not causing.
+
+### The fix (`mm/vma.ad`, shared native+LLVM source)
+In `_vma_free_cow_range`, the `if cow_drop_page(phys) != 0: free_page(phys)` arm
+handed region-backed / identity user-image frames (below the buddy floor
+`kernel_image_end()`) to `free_page`. Routed them away using the allocator's OWN
+predicate:
+
+```
+last: int32 = cow_drop_page(phys)
+if last != 0 and _pa_link_ok(phys) != 0:
+    free_page(phys)
+```
+
+`cow_drop_page` still runs unconditionally (refcount stays exact — a genuinely
+shared buddy page is still freed exactly once, a parent's per-PFN count is never
+stranded). `free_page` is now reached ONLY for a frame that is (a) the last
+holder AND (b) a real buddy-managed frame `_pa_link_ok` accepts — i.e. the
+`_cow_release_forked_range` release-only semantics applied per-frame. The owner
+region (`region_free` / `region_free_cow_safe` at the owner's reap) remains the
+sole reclaimer of non-buddy frames. `_pa_link_ok` is exactly the predicate
+`free_pages` uses to reject "wild addr", so the routing tracks precisely what
+`free_page` would have rejected. (One-line import add of `_pa_link_ok` into
+`mm/vma.ad`; no other file touched.)
+
+Why this is a real correctness fix, not just log suppression: the `pa-corrupt`
+guard rejects the wild `cur_addr` only AFTER `_free_pages_raw` has already run
+`page_reset()` + `lru_remove()` on each frame's PageDesc and attempted a
+buddy-merge (`_try_remove_buddy(cur_addr ^ run_size)`) with free-count
+accounting — real side effects on non-buddy frames' descriptors and on the buddy
+pool, ×5655 per boot. Not calling `free_page` at all removes all of it.
+
+### A/B evidence (fresh clean builds; selftest 45 MiB initramfs; KVM `-cpu host`; BIOS-ISO in-RAM)
+| build | `[pa-corrupt]` | rl5 printk line | fb-flip | windows mapped |
+|-------|:---:|:---:|:---:|:---:|
+| LLVM  **before** (main b8013366) | **5655** | 7269 | yes | 0 |
+| native **before** (same source) | **5655** | 7269 | yes | 0 |
+| LLVM  **after** (fix)           | **0**    | 1613 | yes | 0 |
+| native **after** (fix)          | **0**    | 1613 | yes | 0 |
+
+Storm eliminated in BOTH lanes; runlevel-5 restored from printk-line 7269 → 1613.
+The native `before`/`after` pair proves the fix is shared-kernel-correct (not an
+LLVM-lane artifact); native `after` boots clean to `hamsh$ stage-08` + the DE
+backdrop fb-flip, 0 storm, no panic. `kobjdiff` PASS (native compiler and seed
+agree on the new source — codegen consistency preserved; the behavior change is
+the intended one).
+
+### The 0-window FAIL is a SEPARATE, pre-existing dispatch gap — NOT the storm
+The 2026-07-23 note asserted the storm "clears shared low PTEs, starving the DE
+scene clients (0 windows)". Direct measurement refutes that as the whole story:
+- With the storm at **0**, the rl5 scene clients (desktop icons / panel / file
+  manager / editor, pids 18-26) are rforked but **never `execve`** and map **0**
+  windows — `[de_present] live_windows=0`, `[panel] appmenu` never appears,
+  screenshot is the flat 1280×800 backdrop (3 colors / 99%).
+- This is **byte-for-byte the same** as the `before` (storm) build: `execve`
+  jumps after rl5 = 0 and `[devwsys] window … mapped` = 0 in BOTH. The fix
+  changed the storm (5655→0) and the boot line count (7269→1613) but did **not**
+  change the scene-client dispatch outcome at all.
+- The kernel's OWN in-boot devwsys self-test DOES map its 3 windows
+  (`[MULTITASK_BAR] all three live windows listed in /dev/wsys/windows`), so the
+  `newwindow`/devwsys path is healthy; only the **detached rl5 clients** fail to
+  run. This is the "child READY but not dispatched" scheduler gap first noted in
+  this doc's original status section and in `docs/kernel_llvm_phase5b.md` Phase 5d
+  (the `_another_task_ready` pid-dispatch wall), repeatedly flagged there as a
+  **distinct** issue. It reproduces under KVM in the in-RAM harness independent
+  of the storm and independent of the accelerator.
+
+So: the storm was a genuine, now-fixed MM correctness bug (and it did flood
+serial + perturb the buddy pool / PageDesc array), but removing it does **not**
+by itself turn the gate green. The remaining blocker is the scene-client
+dispatch gap, which is a scheduler/fork-dispatch defect, out of scope for an MM
+teardown routing fix and requiring its own investigation. The gate stays RED on
+(b)/(c)/(d) until that dispatch gap is closed; (a) fb-flip PASSES and the storm
+regression lock is now green.
+
+### No-regression argument for the working (94 MiB-rodata) render + native OVMF DE
+The fix only ever REMOVES a `free_page` call that the buddy guard was already
+rejecting; for a genuine buddy frame (`_pa_link_ok` == 1) the behavior is
+byte-identical to before. It therefore cannot regress any path that rendered
+before (the layout-artifact 94 MiB build, the native OVMF `test_de_visual_gate.sh`
+desktop). native `after` empirically boots clean to shell + DE backdrop with
+0 storm, corroborating no boot/MM regression.
