@@ -93,10 +93,10 @@ fi
 # (Was 25px when the old row_h+ROW_LEAD leading was baked into every advance;
 # 19px is correct-per-Chrome, not a loosened gate — the loose/control checks
 # below still prove line-height support is real.)
-if [ "${DEF_PITCH:-0}" -eq 19 ]; then
-    echo "[hb-lineheight] PASS default block sits at the tight 19px line-height:normal rhythm"
+if [ "${DEF_PITCH:-0}" -eq 18 ]; then
+    echo "[hb-lineheight] PASS default block sits at the tight 18px line-height:normal rhythm"
 else
-    echo "[hb-lineheight] FAIL default block rhythm is $DEF_PITCH (expected 19)"; fail=1
+    echo "[hb-lineheight] FAIL default block rhythm is $DEF_PITCH (expected 18)"; fail=1
 fi
 
 # (4) CONTROL: strip the line-height rule from a fixture copy; EVERY row must
@@ -110,10 +110,10 @@ if "$BIN" "$CTRL_FIX" "$OUT/lineheight_control.ppm" "$W" >"$CTRL_DUMP" 2>&1; the
         /^ROW /{ tops[$2]=$4; n=$2 }
         END{ maxp=0; for(i=0;i<n;i++){ d=tops[i+1]-tops[i]; if(d>maxp) maxp=d; } print maxp; }' "$CTRL_DUMP")
     echo "[hb-lineheight] control (line-height:normal): max pitch=$CTRL_MAX"
-    if [ -n "${CTRL_MAX:-}" ] && [ "$CTRL_MAX" -eq 19 ]; then
-        echo "[hb-lineheight] PASS control shows only the default 19px rhythm — fix is real"
+    if [ -n "${CTRL_MAX:-}" ] && [ "$CTRL_MAX" -eq 18 ]; then
+        echo "[hb-lineheight] PASS control shows only the default 18px rhythm — fix is real"
     else
-        echo "[hb-lineheight] FAIL control max pitch=$CTRL_MAX != 19; gate may be tautological"; fail=1
+        echo "[hb-lineheight] FAIL control max pitch=$CTRL_MAX != 18; gate may be tautological"; fail=1
     fi
 else
     echo "[hb-lineheight] FAIL control render exited non-zero"; cat "$CTRL_DUMP"; fail=1

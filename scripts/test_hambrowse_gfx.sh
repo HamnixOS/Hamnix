@@ -76,10 +76,12 @@ assert_grep '^TTF sans_rc=0 bold_rc=0 mono_rc=0 ok=1'  "TrueType faces parsed (s
 # than the engine's 8px grid estimate (canvas grows to avoid clipping glyphs).
 assert_grep '^CANVAS [0-9]{3,} [0-9]{3,}'   "pixel canvas WxN with a tall page"
 
-# PIXEL BOX MODEL, scalable faces: row 0 is the <h1> at 32px bold (38px line box)
+# PIXEL BOX MODEL, scalable faces: row 0 is the <h1> at 32px bold (37px line box
+# = Chrome line-height:normal round(32*1.15); round 17 capped it from the 38px
+# glyph bounding box)
 # — physically TALLER than the 16px body rows (19px line box) stacked below it.
-assert_grep '^ROW 0 top 12 h 38 base 42'  "h1 row is 38px tall (32px bold TrueType)"
-assert_grep '^ROW 1 top 50 h 19 base 65'  "body row is 19px tall (16px TrueType), below h1 (flush at h1 bottom after ROW_LEAD removed for correct 19px line-height:normal pitch; UA h1 bottom-margin is a separate follow-up)"
+assert_grep '^ROW 0 top 12 h 37 base 42'  "h1 row is 37px tall (32px bold TrueType, Chrome line-height:normal; round 17 capped from the 38px glyph box)"
+assert_grep '^ROW 1 top 49 h 18 base 64'  "body row is 18px tall (16px TrueType = Chrome line-height:normal; round 17 lowered from the 19px glyph box), below h1 (flush at h1 bottom; UA h1 bottom-margin is a separate follow-up)"
 
 # PROPORTIONAL TEXT (BDF store): a narrow run (iiii) is NARROWER than a wide run
 # (WWWW) in the sans face; in mono they are EQUAL. Impossible on a fixed grid.

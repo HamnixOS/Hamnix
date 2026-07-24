@@ -71,7 +71,7 @@ for line in open(sys.argv[1]):
 if not heights:
     print("[hb-pmargin] FAIL: no ROW geometry dumped"); sys.exit(1)
 
-BODY_H = 19
+BODY_H = 18   # round 17: 16px body content row = Chrome line-height:normal 18px
 GAP_PX = 16                       # 1em of a 16px font = the UA <p> margin
 body_rows = [h for h in heights if h == BODY_H]
 gap_rows  = [h for h in heights if h == GAP_PX]

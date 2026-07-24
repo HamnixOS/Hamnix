@@ -369,3 +369,55 @@ untouched + no DE binary imports font_adv/htmlpaint/lib.web (orchestrator grep-c
    `<style media>` fix.
 4. `font-family: serif`/`monospace` generic-family selection (would let serif/mono get their own
    advance metrics too).
+
+## Chrome-parity progress (round 17, worktree — LANDED the global vertical lever)
+CLOSED: **the global 1px-per-line line-box over-height** (the roadmap's dominant remaining
+VERTICAL residual). Root cause: `lib/htmlpage.ad` seeded every 16px body content row from the
+font's GLYPH BOUNDING box (`htmlpaint_ttf_height` = ascent+descent = 19px), but Chrome lays a
+`line-height:normal` 16px sans line out at ~1.15em = **18px** — so hb added ~1px PER LINE,
+compounding down every multi-line block. Measured vs `/usr/bin/chromium`: a 20-line 16px
+paragraph is **360px in Chrome (18px/line) vs hb's 380 (19px/line)**.
+
+**Fix (surgical, invariant-preserving):**
+- `BODY_H` 19→18 (the blank/gap-row floor) so blank rows match content rows.
+- New **pass 1a2** (line-height:normal cap): a row with NO explicit CSS line-height whose height
+  came SOLELY from its own text glyphs (`row_h == row_gh`, so no image/taller box) and whose font
+  is ≥16px is clamped to `round(px*1.15) = (px*23+10)/20`, but NEVER grown (`min`). This matches
+  Chrome's line-height:normal EXACTLY (measured: 16→18, 32→37; 18/21/24 already equal the glyph
+  box → byte-identical). Guarded to px≥16 so the sub-16 rows the round-6 small-font pass (1a)
+  already Chrome-matches via the glyph box (8→9, 10→11, 13→15) are untouched.
+
+**Why the sticky / grid-auto-rows invariants survive (the #1 risk):** sticky (`lib/web/layout/
+flow.ad`) and grid-auto-rows compute integer ENGINE row indices (`pos_t/LINE_H`, LINE_H=16, a
+SEPARATE unit htmlpage never changes); htmlpage only maps row-index→pixel FORWARD. The old sticky
+bug was NON-UNIFORMITY (a 16px blank row beside 19px content rows). This change keeps blank rows
+AND 16px content rows UNIFORM at 18, so the row grid stays consistent. PROVEN: **sticky, grid,
+gridautorows, gridrowgap, valign, cellrowh gates all PASS** (they encode exactly those
+row-grid/relative invariants).
+
+**Measured (page/block height vs Chrome):** 10-line 16px block **190→180px (Chrome 180, exact)**;
+20-line **380→360 (Chrome 360, exact)**; per-size row heights now 16→18 and 32→37 (Chrome-exact),
+all other sizes byte-identical.
+
+**Blast radius / gate churn (base vs fix binaries, ALL 231 fixtures diffed @640px):** all 231
+fixture PPMs shift (every page has 16px body text → a uniform 1px/row vertical compaction) — but
+gate churn is contained because only **5 gates structurally parse the pixel `ROW top h` dump with
+absolute-height assertions**: `smallrowh`, `pmargin`, `limarginpx`, `lineheight` (all re-baselined
+19→18, a Chrome-PROVEN correction — 16px body IS 18px in Chrome) + the NEW `linebox` gate
+(base-FAIL @19px/line, fix-PASS @18). EVERY other gate uses the engine-grid SEG dump (row indices
+/ x-positions) or relative geometry, which a pixel-height-only change cannot move — confirmed by
+the full battery: **0 newly-failing gates**; all reds (abswidth, accentind, …) proven base-red
+(identical fail on the base binary, unrelated pre-existing failures). New gate
+`test_hambrowse_linebox_host.sh` + fixture `hambrowse_linebox.html`; native hambrowse compiles.
+
+### Ranked roadmap for round 18+
+1. **Body-text subpixel advance** — the per-glyph INTEGER advance override (round 16) leaves ±3-9px
+   residual on long runs from per-glyph rounding; lowering `FU_ADV_MIN_PX` (20) so 16px body uses
+   fractional-unit accumulation with the round-16 table cuts it to ~1px (re-rounds every body line
+   → broad churn; its own gated round). Now the dominant HORIZONTAL residual.
+2. **`<link media="…">` external-sheet gating** — fetched-stylesheet sibling of round-14's
+   `<style media>` fix (on-device fetch; synthetic gate needed).
+3. **h1/32px line-box + heading vertical rhythm** — round 17 fixed 32px→37 pitch; the residual
+   heading margin/leading rhythm (h1/h2 top+bottom margins vs Chrome) is the next vertical lever.
+4. `font-family: serif`/`monospace` generic-family selection (would let serif/mono get their own
+   advance + line metrics).

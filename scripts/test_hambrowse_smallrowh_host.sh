@@ -55,7 +55,7 @@ for line in open(sys.argv[1]):
 if not heights:
     print("[hb-smallrowh] FAIL: no ROW geometry dumped"); sys.exit(1)
 
-BODY_H = 19
+BODY_H = 18   # round 17: Chrome line-height:normal for a 16px sans line = 18px
 base_rows  = [h for h in heights if h == BODY_H]   # 16px lines (unchanged)
 small_rows = [h for h in heights if h < BODY_H]    # sub-16px lines (shrunk)
 
