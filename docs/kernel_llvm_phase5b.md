@@ -1312,3 +1312,126 @@ NOT in the native diff); all four native-safety gates green. Two deeper
 target truncated to `0xffffffff00000000` in the 9P codec/attach path (not
 `p9_smoke_test`/`_smoke_pump_call` — bisection-excluded), and (b) a wild
 page-free storm over the COW demand-VMA on the rfork path.
+
+## Phase 5s — the `-O2` lane BOOTS TO USERSPACE: both pinned `-O2`-only blockers ROOT-FIXED in the emitter (struct-local alloca under-size; over-promised global `align 16`); `-O2` now reaches the interactive `hamsh$` stage-08 prompt, FULL parity with `-O0` (evidence-backed, native-safe)
+
+Phase 5r pinned two `-O2`-only codegen defects between the label fix and a full
+`-O2` boot. Phase 5s ROOT-FIXES BOTH in the Adder LLVM lane — one in the SSA
+layer (`ssa.ad`), one in the LLVM emitter (`ssa_llvm.ad` + the externalize
+helper). The `-O2` kernel now boots the whole init battery → `[p9smoke] PASS` →
+`[hamsh] M16.35 shell ready` → `rfork` pids 7–26 → `[hamsh:stage-06] rc-done` →
+`[hamsh:stage-07] loop-enter` → `hamsh$ [hamsh:stage-08] ed-readline-first`,
+byte-for-byte the same furthest point the `-O0` lane reaches (Ph5q). Native
+codegen is untouched (both fixes are LLVM-path-only), so the native kernel is
+byte-identical (kobjdiff PASS 0/11064) and all four native-safety gates are
+green.
+
+### 1. Blocker #1 was NOT an indirect-call miscompile — it is a STRUCT-LOCAL STACK OVERFLOW that corrupts a saved return address
+Phase 5r's framing (an indirect-call target materialised with its low 32 bits
+dropped) is DISPROVEN. Full instrumentation of the `0xffffffff00000000` #PF:
+- A temporary richer `do_trap` (idt_asm.S passes the exception frame base; the
+  handler dumps the saved GPRs + a 16-deep stack walk) showed the crashing frame
+  is the LLVM 9P **responder** (`p9smoke_pump → _serve_one → _serve_tversion`),
+  reached from the NATIVE `_rpc_exchange → _smoke_pump_call` smoke pump. Saved
+  `rsi = &p9smoke_buf+0x13`, `rdx=rcx=0x13` (the 19-byte Tversion), `rax=0`.
+- The QEMU monitor read of the smoke-pump hook at the fault
+  (`xp /2gx &p9c_smoke_pump_hook`) returned `0xffffffff80320120` — the CORRECT
+  `&p9smoke_pump`. The hook is intact; the indirect call through it is fine. So
+  the fault is NOT the hook / not an indirect-call target at all.
+- `objdump` of EVERY responder/codec function (`_serve_one`, `_drain_tmsg`,
+  `_serve_tversion`, `_send_rmsg`, `p9_emit_rversion`, `p9_decode_tversion`,
+  `p9_cursor_init`, `pipe_read/write`) shows **zero** indirect `call *`/`jmp *`.
+  The faulting instruction is a `ret` returning to a CORRUPTED saved return
+  address: a real `0xffffffff80xxxxxx` return address with its LOW dword zeroed →
+  `0xffffffff00000000` (#PF, instruction fetch, `err=0x10`).
+
+Root cause, pinned to one instruction. `P9Cursor` = `{buf:Ptr, cap:u64, pos:u64,
+err:i32}` = 32 bytes. In `_serve_tversion` the local `c: P9Cursor` got
+`%t6 = alloca [8 x i8]` — an EIGHT-byte slot for a 32-byte struct. The inlined
+`p9_cursor_init(&c,…)` member stores land at `c+0/+8/+16/+24`; at `-O2` the tight
+frame (`push %rbx; sub $0x10,%rsp`) places that slot flush against the saved
+return address, so `c.pos` at `0x10(%rsp)` clobbers saved `%rbx` and
+`movl $0x0, 0x18(%rsp)` (writing `c.err=0`) zeroes the low dword of the SAVED
+RETURN ADDRESS. `ret` then jumps to `0xffffffff00000000`. At `-O0` LLVM's loose
+frame padding put slack between the slot and the return address, so the same
+over-write landed in dead bytes — which is exactly why `-O0` hid it.
+
+The under-size originates in `ssa.ad::ssa_intern_local`: a struct/class-typed
+local has no dedicated branch and falls through to the scalar path, where
+`sz = prim_type_size(tnode)` returns 8 for a struct-named type and the alloca is
+sized `ssa_ensure_slot(nid, sz)` = 8. Fix: a struct-local branch sizes the slot
+to the full `st_total[struct]` (32 for `P9Cursor`). Native path is byte-
+identical — an address-taken struct local still bails to `codegen.ad` (`if
+ssa_mem_model == 0: ssa_set_bail(SBR_NONPROMOTABLE)`) exactly as the scalar
+non-promotable case did, so `codegen.ad` never sees the new branch. Post-fix the
+IR carries `%t6 = alloca [32 x i8]` and `-O2` prints `[p9smoke] PASS`.
+
+### 2. Blocker #2 is an OVER-PROMISED global ALIGNMENT — `align 16` in the IR vs BYTE-packed native globals → clang `-O2` emits `movaps` on a mis-aligned global → #GP
+With blocker #1 cleared, `-O2` advanced to `M16.35 shell ready` + `rfork pid=7`,
+then a `[trap-diag]` one-shot halt on a **#GP (vector 0x0d)** at
+`rip=…802a32b0`, `code@rip = 0f 29 40 10` = `movaps %xmm0,0x10(%rax)`. The
+function is `umdf_task_cleanup`, zeroing a global buffer at `0xffffffff84e384d4`
+with a `xorps`/`movaps` loop — but `0x…84e384d4 mod 16 = 4`, so the ALIGNED SSE
+store `#GP`s. Root cause: the emitter (`ssa_llvm.ad`) declared EVERY module
+global `, align 16`, and the externalize helper stamped the externalized
+(native-defined) globals `align 16` too. In the native-hybrid link
+`native_main.o` is the SOLE definer of those globals and the native backend packs
+them at BYTE granularity — a global can sit at any address mod 16. `align 16`
+LIES to clang; at `-O2` it vectorises a global-zeroing loop into aligned
+`movaps`, which faults on the real sub-16-aligned address. (`-O0` doesn't
+vectorise → scalar stores → no fault, which is why `-O0` never hit it.) Fix:
+emit `, align 1` in BOTH places (the honest bound for byte-packed native
+globals); clang then uses unaligned (`movups`) / scalar stores that are correct
+at any alignment. Post-fix `-O2` clears the #GP and runs to stage-08.
+
+Note on the `[pa-corrupt] free of wild addr …` storm: this is PRE-EXISTING and
+NON-FATAL, NOT a blocker. A clean `-O0` build (pre- AND post-Phase-5s) emits the
+IDENTICAL storm (5655 `— ignoring` lines) yet still reaches stage-08 — Phase 5r
+§6's "the `-O0` path runs cleanly" was imprecise (the storm was always there, it
+just never halts). The FATAL `-O2` symptom Ph5r attributed to the rfork/COW path
+was the `movaps` #GP of §2, now fixed. (The wild-free storm — the COW forked-
+range release freeing user VAs as if physical frames — remains an open COSMETIC
+item common to both lanes; it does not gate the boot.)
+
+### 3. Native-safety gates — ALL PASS (verbatim)
+- `scripts/test_native_vs_seed_kobjdiff.sh`:
+  `[kobjdiff] kernel FUNCs compared: 11064` /
+  `[kobjdiff] PASS — zero semantic kernel divergences across 11064 matched
+  functions` / `[kobjdiff] PASS — native kernel codegen matches the seed
+  (semantic).` (`git diff` = `ssa.ad`, `ssa_llvm.ad`,
+  `kllvm_externalize_dupglobals.py` — `codegen.ad` is NOT in the native diff.)
+- `scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS` (`MISCOMPILED: 0`,
+  `python-backend miscompiles: 0`, `tooling/run errors: 0`).
+- `ADDER_OPT2=1 scripts/fuzz_adder_diff.sh 7`: `[fuzz_adder_diff] PASS`
+  (`codegen.ad accepted: 500 (100.0%)`, `of accepted, CORRECT: 500 (100.0%)`,
+  `MISCOMPILED: 0`).
+- `scripts/bench_llvm.sh`: `[bench_llvm] LLVM compiled 8/8 kernels; bailed: [];
+  wrong: []` (all 8 `AGREE`, `LLVM=OK`; geomean 0.90× gcc-O2).
+
+### 4. Boot furthest points (both grep-verified on the serial log)
+- **`-O0` lane (regression check — STILL boots):** default build (`memblock_alloc`
+  native, KVM `-cpu host`, BIOS-GRUB-ISO, `-m 1024M`), `grep -a`:
+  `[p9smoke] PASS` → `[hamsh] M16.35 shell ready` → `rfork: child created,
+  pid=7` … pid=26 → `[hamsh:stage-06] rc-done` → `[hamsh:stage-07] loop-enter` →
+  `hamsh$ [hamsh:stage-08] ed-readline-first`. Identical to Phase 5q/5r; the
+  `alloca`/`align` fixes are neutral on `-O0` (identical 5655-line pa-corrupt
+  storm pre/post fix).
+- **`-O2` lane (NEW — full userspace):** same build config, `LLVM_CLANG_OPT=-O2`:
+  `[p9smoke] PASS` → `[hamsh] M16.35 shell ready` → `rfork` pids 7–26 →
+  `[hamsh:stage-06] rc-done` → `[hamsh:stage-07] loop-enter` →
+  `hamsh$ [hamsh:stage-08] ed-readline-first`. FULL parity with `-O0` (Ph5r
+  walled at boot-stage-32 p9_smoke; both `-O2`-only blockers now fixed).
+
+### Net
+Both Phase-5r `-O2`-only blockers are ROOT-FIXED in the Adder LLVM lane:
+(a) struct/class-typed local allocas are now sized to the full struct byte size
+(`ssa.ad`), ending the `P9Cursor` stack overflow that zeroed a saved return
+address (the `0xffffffff00000000` #PF — NOT an indirect-call miscompile as
+Ph5r hypothesised); (b) module globals are declared `align 1` not `align 16`
+(`ssa_llvm.ad` + externalize helper), matching the byte-packed native-hybrid
+layout so clang `-O2` stops emitting `movaps` on mis-aligned globals (the
+`umdf_task_cleanup` #GP). The `-O2` LLVM kernel now boots to the interactive
+`hamsh$` stage-08 prompt, full parity with `-O0`; `-O0` still boots there too (no
+regression); native kernel byte-identical (kobjdiff 0/11064); all four
+native-safety gates green. Both fixes are ARM-relevant (struct frame sizing and
+honest global alignment are target-independent emitter correctness).

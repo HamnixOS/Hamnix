@@ -53,7 +53,13 @@ def main():
         for line in f:
             m = rx.match(line.rstrip("\n"))
             if m and m.group(1) in native:
-                g.write(f"@{m.group(1)} = external dso_local global {m.group(2)}, align 16\n")
+                # align 1, NOT 16: native_main.o is the sole definer and the
+                # native backend packs globals at BYTE granularity, so a global
+                # may sit at any address mod 16. Declaring align 16 lets clang
+                # -O2 emit ALIGNED SSE (movaps) for zeroing/copy loops over the
+                # global -> #GP on the sub-16-aligned real address. align 1 is
+                # the honest bound (matches ssa_llvm.ad's global emission).
+                g.write(f"@{m.group(1)} = external dso_local global {m.group(2)}, align 1\n")
                 n += 1
             else:
                 g.write(line)
