@@ -105,3 +105,71 @@ accelerators; the observed `-cpu host`-vs-TCG difference (KVM starves the
 clients earlier) is consistent with the project's "KVM `-cpu host` exposes
 TCG-masked codegen bugs" note. Neither accelerator produced the "6-7 windows"
 render at 8e191678 in this reproduction.
+
+## 2026-07-23 re-investigation — the "0 windows" gate FAIL is NOT an LLVM codegen bug; it is a layout-sensitive fork/exec wild-free storm that reproduces IDENTICALLY in the NATIVE kernel booted through this same BIOS-ISO/in-RAM-initramfs harness (evidence-backed)
+
+A deep root-cause pass at `fd2776ef` **overturns the "LLVM scheduler-dispatch
+miscompile" framing.** The DE-under-LLVM gate FAILs because of a
+**layout-sensitive `[pa-corrupt] free of wild addr` storm on the fork/exec COW
+teardown path — a KERNEL bug common to BOTH the native and LLVM lanes, not an
+`ssa_llvm.ad`/`ssa.ad` codegen divergence.** All experiments below reverted; no
+source committed except this note; native kernel byte-identical.
+
+### 1. Reproduced both, then A/B'd in the SAME harness
+- Fresh **clean-source LLVM** kernel (`build_kernel_llvm.sh`, `-O0`, selftest
+  initramfs, KVM `-cpu host`, `-m 1024M`, BIOS-GRUB-ISO): gate FAILs — fb-flip
+  OK but `windows mapped=0`, `[panel] appmenu` missing, screenshot blank. Serial
+  is drowned in **5655** `[pa-corrupt] free of wild addr 0x…` lines
+  (addrs `0x475000‥0x1106000`, i.e. the user-image region frames), boot reaches
+  `[init] entering runlevel 5` only at printk-line **7269** (vs ~664 on a healthy
+  boot). The scene clients rfork (pids 18-28) but never map windows; boot idles
+  at the `hamsh$` stage-08 prompt.
+- **NATIVE** kernel (`_adder_cc.sh adder_cc_link_kernel init/main.ad`, the exact
+  default native backend, SAME selftest initramfs + SAME BIOS-ISO harness):
+  **IDENTICAL FAIL — storm=5655, same wild addrs `0x475000‥0x1106000`,
+  windows=0, rl5 at line 7269.** So the native kernel, driven through the LLVM
+  gate's harness, fails exactly the same way. The premise "LLVM maps 0 windows
+  while the native kernel PASSES" holds only because the two gates use DIFFERENT
+  harnesses: `test_de_visual_gate.sh` boots native under **OVMF + a real ext4
+  installer image** (no storm), while `test_de_visual_gate_llvm.sh` boots under
+  **BIOS-ISO + the in-RAM cpio initramfs** (storm). The comparison is
+  harness-confounded; it is NOT native-vs-LLVM.
+
+### 2. Force-native bisection EXCLUDES every candidate — it is not a leaf-fn miscompile
+`KLLVM_FORCE_NATIVE` over seven disjoint clusters — the free path
+(`_vma_free_cow_range`, `_vma_node_free`, `_vma_pte_lookup`), the map/alloc path
+(`alloc_page(s)`, `alloc_pages_raw`, `elf_map_one_page(_locked)`,
+`vma_demand_fault_inner`), the COW/fork-share path (`cow_share_page`,
+`cow_drop_page`, `_cow_share_one_page`, `vma_fork_copy`, `vm_cow_share_*`), the
+page-table crack path (`_cow_resolve_pte_slot_locked`, `_build_pt_from_pd_entry`,
+`_is_boot_identity_stamp`, `elf_install_user_mapping_locked`), and the fork/exec
+orchestration (`do_clone`, `do_rfork`, `do_execve*`, `load_elf64`) — each produced
+a **byte-identical 5655-line storm.** A single miscompiled function would have
+been caught; none was. Runtime stack-walk + PTE probes confirmed the wild frees
+come from `_vma_free_cow_range` freeing `pte & PT_ADDR_MASK` for PTEs whose frame
+bits equal the VA (region-backed / identity user-image frames), which
+`_pa_link_ok` rejects (below the buddy floor).
+
+### 3. The ONE build that passes is a LAYOUT ARTIFACT
+The on-disk `build/kllvm/hamnix_kernel_{llvm,de}.elf` (108 MiB) DOES map 8 windows
+(0 storm) — but it differs from a fresh build ONLY by a **~49 MiB larger
+`.rodata`** (94 MiB vs 45 MiB embedded initramfs); `.text`/`.data`/`.bss` are
+byte-identical. That size delta shifts the memory layout enough that the
+fork/exec teardown no longer wild-frees — exactly the "force-X-native only
+RELOCATES the victim" layout artifact documented in Phases 5g–5o/5m/5n. It is not
+a codegen fix.
+
+### 4. Root cause + correct fix locus
+The defect is the pre-existing, layout-sensitive **wild-free on the fork-child
+image teardown**: a fork child's inherited region-backed ELF image / demand span
+is torn down through `_vma_free_cow_range`'s `cow_drop_page→free_page` arm
+(mm/vma.ad) instead of the release-only `_cow_release_forked_range`/
+`vma_release_forked_range` path, so region-backed (non-buddy) frames are handed to
+the buddy allocator and rejected as "wild". `docs/kernel_llvm_phase5b.md` Phase 5s
+already noted this storm as "PRE-EXISTING and NON-FATAL … common to both lanes"; it
+is in fact FATAL to THIS gate (5655 serial lines + cleared shared low PTEs starve
+the DE clients). **The fix belongs in the kernel MM teardown routing (mm/vma.ad),
+not in `ssa_llvm.ad`/`ssa.ad`, and must be validated in BOTH lanes.** As a gate
+concern, `test_de_visual_gate_llvm.sh` should either boot native through the SAME
+BIOS-ISO harness to keep the comparison honest, or the underlying wild-free must
+be fixed so both lanes render under the in-RAM path.
